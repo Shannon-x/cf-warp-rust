@@ -1,0 +1,155 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '手动发布的标签（仅 workflow_dispatch 用）'
+        required: true
+        default: 'v0.0.0-manual'
+
+permissions:
+  contents: write   # 创建 release / 上传资产
+  packages: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true          # 用 cross 跑，保证 musl 静态链接稳
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13         # Intel runner
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest     # Apple Silicon runner
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build (native)
+        if: matrix.cross != true
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tag 名：tag 推送时取 ref_name，手工触发时取 inputs.tag
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          NAME="warp-rust-${TAG}-${{ matrix.target }}"
+          mkdir -p dist "$NAME"
+          cp "target/${{ matrix.target }}/release/warp-rust" "$NAME/"
+          cp README.md LICENSE SECURITY.md config.toml.example "$NAME/"
+          mkdir -p "$NAME/scripts"
+          cp scripts/*.sh "$NAME/scripts/"
+          chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
+          tar czf "dist/${NAME}.tar.gz" "$NAME"
+          # 计算 SHA256（GNU/BSD 均可）
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          fi
+          ls -la dist/
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (for cross-job aggregation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # 让 release notes 模板可以引用文件
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          body: |
+            ## warp-rust ${{ github.ref_name }}
+
+            通过 Cloudflare WARP 出口的 SOCKS5 + UDP ASSOCIATE 代理。
+
+            ### 一键启动
+
+            ```bash
+            # 解压（以 M1 Mac 为例）
+            tar xzf warp-rust-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            cd warp-rust-${{ github.ref_name }}-aarch64-apple-darwin
+
+            # 本机自用（无密码）
+            ./scripts/run-binary.sh
+
+            # 对外暴露（自动生成强密码）
+            ./scripts/run-binary.sh 1080 --expose
+            ```
+
+            ### 容器镜像
+
+            ```bash
+            docker pull ghcr.io/shannon-x/cf-warp-rust:${{ github.ref_name }}
+            # 或 :latest
+            ```
+
+            详细使用方式：仓库根目录的 [README.md](https://github.com/Shannon-x/cf-warp-rust#readme) 与 [SECURITY.md](https://github.com/Shannon-x/cf-warp-rust/blob/main/SECURITY.md)。
+
+            ### 自动生成的变更摘要
