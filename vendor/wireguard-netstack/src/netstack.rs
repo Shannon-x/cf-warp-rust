@@ -25,11 +25,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// MTU for the virtual interface.
-/// Some networks drop large UDP packets, especially when WireGuard overhead is added.
-/// We use a conservative MTU that results in ~600 byte UDP packets after WireGuard
-/// encapsulation (MTU + 40 IP/TCP headers + 48 WG overhead ≈ 548 byte UDP).
-/// This works around networks that filter large UDP packets.
-pub const DEFAULT_MTU: usize = 460;
+///
+/// v0.1.1（warp-rust fork）：从上游的 460 提升到 1280。
+/// - 1280 是 IPv6 最小 MTU，绝大多数路径上稳定可达
+/// - + 80 字节 WG/UDP/IP 包头 ≈ 1360 字节，远小于以太网 1500 的常见 PMTU 限
+/// - 用户可在 config 里 `[warp].mtu` 覆盖到 1420（标准 WG MTU）追求更高吞吐
+pub const DEFAULT_MTU: usize = 1280;
 
 /// Size of TCP socket buffers.
 const TCP_BUFFER_SIZE: usize = 65535;
@@ -143,6 +144,8 @@ pub struct NetStack {
     wg_tunnel: Arc<WireGuardTunnel>,
     /// Sender to queue packets for transmission through WireGuard.
     wg_tx: mpsc::Sender<BytesMut>,
+    /// PERF-2（warp-rust fork）：事件驱动 poll —— rx/read/write 路径唤醒 poll loop
+    poll_notify: tokio::sync::Notify,
 }
 
 impl NetStack {
@@ -195,7 +198,14 @@ impl NetStack {
             inner: Mutex::new(inner),
             wg_tunnel,
             wg_tx,
+            poll_notify: tokio::sync::Notify::new(),
         })
+    }
+
+    /// 唤醒 poll loop（rx 路径 / read 路径 / write 路径都可以叫）。
+    #[inline]
+    pub fn kick(&self) {
+        self.poll_notify.notify_one();
     }
 
     /// Create a new TCP socket and return its handle.
@@ -417,12 +427,14 @@ impl NetStack {
                 }
             }
 
-            let tx = self.wg_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tx.send(packet).await {
-                    log::error!("Failed to queue packet for WireGuard: {}", e);
-                }
-            });
+            // PERF-1（warp-rust fork）：去掉 per-packet `tokio::spawn`。
+            // 直接 try_send 到 WG 出口通道；满则丢弃这一包（WG 自带重传，
+            // TCP 也有重传），避免：
+            // 1. 任务调度开销（之前每包 spawn 一个 task）
+            // 2. 排队不可控（spawn 出来的任务进调度器，间接打乱顺序）
+            if self.wg_tx.try_send(packet).is_err() {
+                log::trace!("WG outgoing queue full, dropping packet (WG will retransmit)");
+            }
         }
 
         processed
@@ -472,12 +484,21 @@ impl NetStack {
         inner.device.push_rx(packet);
     }
 
-    /// Run the network stack polling loop.
+    /// PERF-2（warp-rust fork）：事件驱动 poll loop。
+    ///
+    /// 上游每 1ms tick 一次（即使没事干也跑），导致：
+    /// - idle 时浪费 CPU（每秒 1000 次锁竞争）
+    /// - 突发流量时引入 0-1ms 抖动
+    ///
+    /// 新版改成「等通知 OR 100µs 兜底 tick」：
+    /// - rx/read/write 唤醒 `kick()` → 立即响应
+    /// - smoltcp 内部计时器（重传等）靠 100µs 兜底 tick 保证不饿死
     pub async fn run_poll_loop(self: &Arc<Self>) -> Result<()> {
-        let mut interval = tokio::time::interval(Duration::from_millis(1));
-
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = self.poll_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_micros(100)) => {}
+            }
             self.poll();
         }
     }
@@ -485,9 +506,12 @@ impl NetStack {
     /// Run the receive loop that takes packets from WireGuard and feeds them to the stack.
     pub async fn run_rx_loop(self: &Arc<Self>, mut rx: mpsc::Receiver<BytesMut>) -> Result<()> {
         while let Some(packet) = rx.recv().await {
-            log::debug!("NetStack received packet ({} bytes)", packet.len());
+            log::trace!("NetStack received packet ({} bytes)", packet.len());
             self.push_rx_packet(packet);
-            self.poll();
+            // 叫 poll loop 立即处理；不在这里直接 poll 是因为 poll 内部要拿
+            // parking_lot::Mutex，如果 rx_loop 和 poll_loop 都频繁抢锁会有
+            // 不必要竞争，让 poll_loop 单线程消费 + 我们 kick 唤醒即可。
+            self.kick();
         }
 
         Ok(())
@@ -507,22 +531,18 @@ impl TcpConnection {
     pub async fn connect(netstack: Arc<NetStack>, addr: SocketAddr) -> Result<Self> {
         let handle = netstack.create_tcp_socket();
         netstack.connect(handle, addr)?;
+        // 立即叫 poll loop 把 SYN 发出去
+        netstack.kick();
 
-        // Poll until connected or timeout
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(30);
 
         loop {
-            netstack.poll();
-
             let state = netstack.socket_state(handle);
-            log::trace!("TCP state: {:?}", state);
-
             if state == TcpState::Established {
-                log::info!("TCP connection established to {}", addr);
+                log::debug!("TCP connection established to {}", addr);
                 return Ok(Self { netstack, handle });
             }
-
             if state == TcpState::Closed || state == TcpState::TimeWait {
                 netstack.remove_socket(handle);
                 return Err(Error::TcpConnect {
@@ -530,24 +550,23 @@ impl TcpConnection {
                     message: format!("Connection failed (state: {:?})", state),
                 });
             }
-
             if start.elapsed() > timeout {
                 netstack.remove_socket(handle);
                 return Err(Error::TcpTimeout);
             }
-
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // 100µs 短 sleep 让 poll loop 推进握手（PERF-2）
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
     }
 
     /// Read data from the connection.
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let timeout = Duration::from_secs(30);
-        let start = std::time::Instant::now();
-
+        // PERF-2（warp-rust fork）：上游用 30s 硬超时 + 1ms 忙轮询；改成无超时
+        // （由上层 idle_timeout 控制）+ 100µs 短 sleep；这条路径每包都跑，
+        // 100µs vs 1ms 直接把读路径理论延迟降 10×。
         loop {
-            self.netstack.poll();
-
+            // 直接读：smoltcp socket 状态由 poll loop 推进，我们这里不 poll
+            // 避免抢锁。第一次循环若没数据则 sleep + 重试。
             if self.netstack.can_recv(self.handle) {
                 match self.netstack.recv(self.handle, buf) {
                     Ok(n) if n > 0 => return Ok(n),
@@ -557,53 +576,39 @@ impl TcpConnection {
             }
 
             if !self.netstack.may_recv(self.handle) {
-                // Connection closed
-                return Ok(0);
+                return Ok(0); // 对端关闭
             }
 
-            if start.elapsed() > timeout {
-                return Err(Error::ReadTimeout);
-            }
-
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
     }
 
     /// Write data to the connection.
     pub async fn write(&self, data: &[u8]) -> Result<usize> {
-        let timeout = Duration::from_secs(30);
-        let start = std::time::Instant::now();
-
         let mut written = 0;
 
         while written < data.len() {
-            self.netstack.poll();
-
             if self.netstack.can_send(self.handle) {
                 match self.netstack.send(self.handle, &data[written..]) {
                     Ok(n) => {
                         written += n;
-                        log::trace!("Wrote {} bytes (total: {})", n, written);
+                        // 写入了数据 → 唤醒 poll loop 让它立刻把包发出去
+                        if n > 0 {
+                            self.netstack.kick();
+                        }
                     }
                     Err(e) => return Err(e),
                 }
             }
 
             if !self.netstack.may_send(self.handle) {
-                // Connection closed
                 return Err(Error::ConnectionClosed);
             }
 
-            if start.elapsed() > timeout {
-                return Err(Error::WriteTimeout);
-            }
-
             if written < data.len() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_micros(100)).await;
             }
         }
-
-        self.netstack.poll();
         Ok(written)
     }
 
@@ -632,9 +637,16 @@ impl TcpConnection {
 
 impl Drop for TcpConnection {
     fn drop(&mut self) {
+        // FIX-1（warp-rust fork）：上游只调 close()，FIN 发出去但 socket（含 64KB
+        // rx + 64KB tx buffer = 128 KB）仍留在 SocketSet 里。每次连接 / 健康探针都
+        // 会泄漏一个 socket，长期跑必然撑爆。
+        //
+        // 修复：close() 标记 FIN → poll() 把 FIN 写到 tx → 立即 remove_socket()
+        // 释放 buffer。本端是 client、远端是 Cloudflare WARP，跳过 TIME-WAIT
+        // 不会引发任何问题（用的是 ephemeral 端口，远端会自行清理对侧 socket）。
         self.netstack.close(self.handle);
-        // Give time for FIN to be sent
         self.netstack.poll();
+        self.netstack.remove_socket(self.handle);
     }
 }
 

@@ -64,6 +64,20 @@ bind = "127.0.0.1:1080"
 - 或者用 nginx / Caddy 在前面做 TLS 终止 + 速率限制 + IP 白名单
 - 容器场景下尽量只把端口 `-p 127.0.0.1:1080:1080` 绑到 loopback，再通过反代/ssh tunnel 出去
 
+## 3.1 v0.1.1 新增的运行时强约束
+
+- **启动前校验 `Config::validate()`**：`server.bind` 是非 loopback（含 `0.0.0.0`）且 `[server.auth]` 为空时**直接拒绝启动**，错误信息会同时打到 stderr 和 systemd journal。要绕过必须 `export WARP_RUST_ALLOW_OPEN_PROXY=1`（高风险，会有 WARN 日志）。
+- **`[limits]` DoS 防护**（默认值，可调）：
+  - `max_concurrent_connections = 1024`：满则新连接立即关闭，记 `warp_rust_conns_rejected_total`
+  - `handshake_timeout = 10s`：SOCKS5 握手+`read_command` 总超时，超时即关
+  - `idle_timeout = 300s`：双向 relay 无数据传输到达即关
+  - `auth_fail_sleep = 1s`：每次鉴权失败强制延迟，缓解暴破
+- **`[dns]` 域名解析隔离**（默认 `mode = "system"`）：
+  - `mode = "tunnel"` 时 Domain ATYP 走隧道内 UDP 拨 `[1.1.1.1:53, 1.0.0.1:53]`
+  - 带 60s LRU 缓存，命中无额外 RTT
+  - 对极度隐私敏感的场景必开
+- **TCP socket 资源泄漏修复**：v0.1.0 在 SOCKS5 / 健康探针每次连接关闭时会把 smoltcp socket（128 KB buffer）留在 SocketSet 永不释放。v0.1.1 起 Drop 强制 `remove_socket`，**RSS 长期稳定**。
+
 ## 4. 凭据与密钥保护
 
 - `data/account.json`（含 WARP private_key 和 access_token）始终写成 **0600**（仅当前用户可读写）

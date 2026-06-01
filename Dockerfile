@@ -36,8 +36,12 @@ VOLUME ["/app/data"]
 EXPOSE 1080 9090
 
 # 1080 = SOCKS5；9090 = Prometheus /metrics
-# 容器内监听 0.0.0.0；宿主机映射端口随意
-ENV WARP_RUST_SERVER__BIND=0.0.0.0:1080 \
-    WARP_RUST_METRICS__BIND=0.0.0.0:9090
+# 默认容器内绑 127.0.0.1（与 install.sh 默认一致，开箱即安全）。
+# 想对外暴露：docker run -e WARP_RUST_SERVER__BIND=0.0.0.0:1080 \
+#                       -e WARP_RUST_SERVER__AUTH__USERNAME=me \
+#                       -e WARP_RUST_SERVER__AUTH__PASSWORD='<强密码>' ...
+# 不设 AUTH 直接改 BIND=0.0.0.0 启动会被 Config::validate 拒绝（安全网）
+ENV WARP_RUST_SERVER__BIND=127.0.0.1:1080 \
+    WARP_RUST_METRICS__BIND=127.0.0.1:9090
 
 ENTRYPOINT ["/usr/local/bin/warp-rust", "--config", "/app/config.toml"]

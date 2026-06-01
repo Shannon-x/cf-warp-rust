@@ -1,7 +1,7 @@
 //! 中央状态机。负责跑恢复阶梯、根据探针失败重建隧道、按周期刷新 WG 配置。
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::health;
 use crate::metrics::{M_REREGISTER, M_ROTATE, M_TUNNEL_REBUILD};
 use crate::tunnel::Tunnel;
@@ -209,19 +209,27 @@ impl Supervisor {
     }
 
     async fn action_reregister(&self) -> Result<()> {
-        // 通过 AccountManager 触发重注册（其内部会校验 register_cooldown）
-        let path = self.cfg.warp.data_dir.join("account.json");
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(Error::Io(e));
+        // FIX-4：调 AccountManager::reregister（它内部校验 register_cooldown）
+        // 之前的实现直接 fs::remove_file + load_or_register，绕过了冷却保护，
+        // 而且若 API 失败旧账号已经删除、不可恢复。
+        // 现在改成：reregister 成功就替换；失败（多半冷却中）回退到 rebuild_config
+        // 而不丢账号。
+        match self.account.reregister().await {
+            Ok(snapshot) => {
+                *self.creds.lock().await = snapshot.credentials.clone();
+                self.tunnel.rebuild(snapshot.wg_config).await?;
+                counter!(M_REREGISTER).increment(1);
+                counter!(M_TUNNEL_REBUILD).increment(1);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "reregister 失败（多半 register_cooldown 未到），fallback 到 rebuild_config"
+                );
+                self.action_rebuild_config().await
             }
         }
-        let snapshot = self.account.load_or_register().await?;
-        *self.creds.lock().await = snapshot.credentials.clone();
-        self.tunnel.rebuild(snapshot.wg_config).await?;
-        counter!(M_REREGISTER).increment(1);
-        counter!(M_TUNNEL_REBUILD).increment(1);
-        Ok(())
     }
 
     async fn action_rotate(&self) -> Result<()> {

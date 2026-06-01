@@ -1,17 +1,19 @@
 //! SOCKS5 服务端：握手 → CONNECT → 通过 Tunnel 拨号 → 双向 relay。
 //!
-//! 用 `fast_socks5::server::Socks5ServerProtocol` 的 typestate 自己完成握手、
-//! 拿到目标地址，然后用 `Tunnel::dial_tcp` 替代默认的 `TcpStream::connect`，
-//! 最后把两端拼起来转发。
+//! v0.1.1 起加入 DoS 防护：
+//! - 全局并发上限（Semaphore）
+//! - 握手 + read_command 超时
+//! - 鉴权失败后强制延迟（防暴破）
+//! - relay 双向 idle 超时
 //!
-//! 因为 `wireguard_netstack::TcpConnection` **没有**实现 `AsyncRead`/
-//! `AsyncWrite`，所以这里不能直接用 `tokio::io::copy_bidirectional`，而是
-//! 用它裸的 `read`/`write` 方法自己写两个方向的 relay。
+//! DNS 通过 `Arc<Resolver>` 统一解析，可在 `[dns]` 配置里切到「隧道内解析」。
 
-use crate::config::{AuthConfig, ServerConfig};
+use crate::config::{AuthConfig, LimitsConfig, ServerConfig};
+use crate::dns::Resolver;
 use crate::error::{Error, Result};
 use crate::metrics::{
-    M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_UDP_ASSOCIATES_ACTIVE,
+    M_AUTH_FAIL, M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_CONNS_REJECTED,
+    M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT, M_UDP_ASSOCIATES_ACTIVE,
 };
 use crate::proxy::udp;
 use crate::tunnel::Tunnel;
@@ -21,21 +23,34 @@ use fast_socks5::{ReplyError, Socks5Command};
 use metrics::{counter, gauge};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use wireguard_netstack::TcpConnection;
 
 pub async fn serve(
     cfg: ServerConfig,
+    limits: LimitsConfig,
+    resolver: Arc<Resolver>,
     tunnel: Arc<Tunnel>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let listener = TcpListener::bind(cfg.bind).await?;
-    info!(addr = %cfg.bind, "SOCKS5 listening");
+    info!(
+        addr = %cfg.bind,
+        max_concurrent = limits.max_concurrent_connections,
+        handshake_timeout = ?limits.handshake_timeout,
+        idle_timeout = ?limits.idle_timeout,
+        "SOCKS5 listening"
+    );
 
+    let semaphore = Arc::new(Semaphore::new(limits.max_concurrent_connections));
     let server_ip = cfg.bind.ip();
+    let limits = Arc::new(limits);
+
     loop {
         tokio::select! {
             biased;
@@ -45,11 +60,31 @@ pub async fn serve(
             }
             accept = listener.accept() => {
                 let (stream, peer) = accept?;
+
+                // FIX-3 并发上限：满即拒（fail-fast）
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        counter!(M_CONNS_REJECTED).increment(1);
+                        warn!(%peer, "连接被拒绝：达到 max_concurrent_connections");
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 let tunnel = tunnel.clone();
+                let resolver = resolver.clone();
                 let auth = cfg.auth.clone();
+                let limits = limits.clone();
                 let parent_cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, peer, server_ip, tunnel, auth, parent_cancel).await {
+                    // permit 在 task 退出时自动 release
+                    let _permit = permit;
+                    if let Err(e) = handle(
+                        stream, peer, server_ip, tunnel, resolver, auth, limits, parent_cancel,
+                    )
+                    .await
+                    {
                         warn!(%peer, error = %e, "socks5 connection failed");
                     }
                 });
@@ -58,40 +93,42 @@ pub async fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     stream: TcpStream,
     peer: SocketAddr,
     server_ip: IpAddr,
     tunnel: Arc<Tunnel>,
+    resolver: Arc<Resolver>,
     auth: Option<AuthConfig>,
+    limits: Arc<LimitsConfig>,
     parent_cancel: CancellationToken,
 ) -> Result<()> {
-    // 1. 握手：无鉴权或用户名/密码鉴权
-    let proto = match auth {
-        None => Socks5ServerProtocol::accept_no_auth(stream).await?,
-        Some(a) => {
-            let (proto, ok) = Socks5ServerProtocol::accept_password_auth(stream, |u, p| {
-                u == a.username && p == a.password
-            })
-            .await?;
-            if !ok {
-                warn!(%peer, "socks5 auth failed");
-                return Ok(());
-            }
-            proto
+    // FIX-3 握手超时
+    let hs = tokio::time::timeout(
+        limits.handshake_timeout,
+        handshake_and_read_command(stream, &auth, &limits, peer),
+    )
+    .await;
+
+    let (proto, cmd, target) = match hs {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            counter!(M_HANDSHAKE_TIMEOUT).increment(1);
+            debug!(%peer, "socks5 握手超时");
+            return Ok(());
         }
     };
 
-    // 2. 读取 SOCKS5 命令与目标地址
-    let (proto, cmd, target) = proto.read_command().await?;
-
-    // 当前支持 CONNECT 与 UDP ASSOCIATE；BIND 拒绝
+    // 支持的命令分发
     match cmd {
         Socks5Command::TCPConnect => {
             // 继续往下走
         }
         Socks5Command::UDPAssociate => {
-            return handle_udp_associate(proto, peer, server_ip, tunnel, parent_cancel).await;
+            return handle_udp_associate(proto, peer, server_ip, tunnel, resolver, parent_cancel)
+                .await;
         }
         Socks5Command::TCPBind => {
             debug!(%peer, "BIND not supported");
@@ -100,8 +137,8 @@ async fn handle(
         }
     }
 
-    // 3. 把目标解析成 IPv4 SocketAddr（netstack 不支持 v6）
-    let upstream_addr = match resolve_v4(&target).await {
+    // 解析目标 → IPv4（走 Resolver，可隧道内或宿主）
+    let upstream_addr = match resolve_target_v4(&resolver, &target).await {
         Ok(a) => a,
         Err(e) => {
             warn!(%peer, %target, error = %e, "address resolution failed");
@@ -110,12 +147,11 @@ async fn handle(
         }
     };
 
-    // 4. 通过 WireGuard 隧道拨号
+    // 通过 WireGuard 隧道拨号
     let upstream = match tunnel.dial_tcp(upstream_addr).await {
         Ok(c) => c,
         Err(e) => {
             warn!(%peer, %upstream_addr, error = %e, "tunnel dial failed");
-            // 给客户端一个稍微有用的回复
             let reply = match &e {
                 Error::TunnelNotReady => ReplyError::GeneralFailure,
                 _ => ReplyError::HostUnreachable,
@@ -125,16 +161,13 @@ async fn handle(
         }
     };
 
-    // 5. 告诉客户端连接已经建好。BND.ADDR 直接用上游目标地址是一种实用做法，
-    //    与多数 SOCKS5 实现一致
     let client = proto.reply_success(upstream_addr).await?;
     counter!(M_CONNS_OPENED).increment(1);
-
     debug!(%peer, %upstream_addr, "socks5 connect established");
 
-    // 6. 双向 relay。因为 TcpConnection 不实现 AsyncRead/Write，无法直接用
-    //    copy_bidirectional，自己开两个 task
-    let (bytes_up, bytes_down) = relay(client, upstream).await?;
+    // FIX-3 idle 超时 + 双向 relay
+    let (bytes_up, bytes_down) =
+        relay_with_idle_timeout(client, upstream, limits.idle_timeout).await?;
     counter!(M_BYTES_UP).increment(bytes_up);
     counter!(M_BYTES_DOWN).increment(bytes_down);
     counter!(M_CONNS_CLOSED).increment(1);
@@ -142,8 +175,38 @@ async fn handle(
     Ok(())
 }
 
-/// 处理 SOCKS5 UDP ASSOCIATE：本地绑定一个 UDP 中继 socket，把地址告诉客户端，
-/// 启动转发 task，然后挂着 TCP 控制流——客户端关 TCP 即视为会话结束，撤下中继。
+async fn handshake_and_read_command(
+    stream: TcpStream,
+    auth: &Option<AuthConfig>,
+    limits: &LimitsConfig,
+    peer: SocketAddr,
+) -> Result<(
+    fast_socks5::server::Socks5ServerProtocol<TcpStream, fast_socks5::server::states::CommandRead>,
+    Socks5Command,
+    TargetAddr,
+)> {
+    let proto = match auth {
+        None => Socks5ServerProtocol::accept_no_auth(stream).await?,
+        Some(a) => {
+            let (proto, ok) = Socks5ServerProtocol::accept_password_auth(stream, |u, p| {
+                u == a.username && p == a.password
+            })
+            .await?;
+            if !ok {
+                // FIX-3 鉴权失败延迟（防暴破）
+                counter!(M_AUTH_FAIL).increment(1);
+                warn!(%peer, "socks5 auth failed; sleeping {:?} before drop", limits.auth_fail_sleep);
+                tokio::time::sleep(limits.auth_fail_sleep).await;
+                return Err(Error::other("auth failed"));
+            }
+            proto
+        }
+    };
+    let (proto, cmd, target) = proto.read_command().await?;
+    Ok((proto, cmd, target))
+}
+
+/// 处理 SOCKS5 UDP ASSOCIATE。
 async fn handle_udp_associate(
     proto: fast_socks5::server::Socks5ServerProtocol<
         TcpStream,
@@ -152,9 +215,9 @@ async fn handle_udp_associate(
     peer: SocketAddr,
     server_ip: IpAddr,
     tunnel: Arc<Tunnel>,
+    resolver: Arc<Resolver>,
     parent_cancel: CancellationToken,
 ) -> Result<()> {
-    // 中继 socket 绑在和 SOCKS5 服务器同一个 IP 上，这样我们告诉客户端的地址对它而言是可达的
     let relay_bind = match UdpSocket::bind(SocketAddr::new(server_ip, 0)).await {
         Ok(s) => s,
         Err(e) => {
@@ -166,57 +229,48 @@ async fn handle_udp_associate(
     let relay_addr = relay_bind.local_addr()?;
     debug!(%peer, %relay_addr, "udp associate: relay bound");
 
-    // 回复中继地址；reply_success 消耗 wrapper，把裸 TCP 控制流交还给我们，
-    // 我们把它当作 UDP 会话的存活标志一直挂着
     let mut control = proto.reply_success(relay_addr).await?;
-
     let relay_token = parent_cancel.child_token();
-
     gauge!(M_UDP_ASSOCIATES_ACTIVE).increment(1.0);
 
     let relay_handle = {
         let tunnel = tunnel.clone();
+        let resolver = resolver.clone();
         let token = relay_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = udp::run_relay(relay_bind, tunnel, token).await {
+            if let Err(e) = udp::run_relay(relay_bind, tunnel, resolver, token).await {
                 warn!(error = %e, "udp relay exited with error");
             }
         })
     };
 
-    // 阻塞在控制 TCP 流上：客户端任何 read（含 EOF）都意味着会话结束。
-    // 按 RFC 1928 §6 的要求，UDP 关联的整个生命周期里 TCP 控制流必须保持
     let mut buf = [0u8; 16];
     let _ = control.read(&mut buf).await;
     debug!(%peer, "udp associate: client closed control stream");
 
     relay_token.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), relay_handle).await;
     gauge!(M_UDP_ASSOCIATES_ACTIVE).decrement(1.0);
     Ok(())
 }
 
-/// 把目标解析成 IPv4 SocketAddr。netstack 不支持 IPv6。
-async fn resolve_v4(target: &TargetAddr) -> Result<SocketAddr> {
+async fn resolve_target_v4(resolver: &Resolver, target: &TargetAddr) -> Result<SocketAddr> {
     match target {
-        TargetAddr::Ip(sa) => {
-            if sa.is_ipv4() {
-                Ok(*sa)
-            } else {
-                Err(Error::DnsNoIpv4(sa.to_string()))
-            }
-        }
+        TargetAddr::Ip(SocketAddr::V4(v4)) => Ok(SocketAddr::V4(*v4)),
+        TargetAddr::Ip(SocketAddr::V6(v6)) => Err(Error::DnsNoIpv4(v6.to_string())),
         TargetAddr::Domain(host, port) => {
-            let host_port = format!("{host}:{port}");
-            let mut iter = lookup_host(&host_port).await?;
-            iter.find(|sa| sa.is_ipv4())
-                .ok_or_else(|| Error::DnsNoIpv4(host.clone()))
+            let sa4 = resolver.resolve_v4(host, *port).await?;
+            Ok(SocketAddr::V4(sa4))
         }
     }
 }
 
-/// 双向 relay：tokio TcpStream ↔ TcpConnection
-async fn relay(client: TcpStream, upstream: TcpConnection) -> Result<(u64, u64)> {
+/// 带 idle 超时的双向 relay。任一方向到达 idle 超时（无字节传输）即中断。
+async fn relay_with_idle_timeout(
+    client: TcpStream,
+    upstream: TcpConnection,
+    idle: Duration,
+) -> Result<(u64, u64)> {
     let (mut client_r, mut client_w) = tokio::io::split(client);
     let upstream = Arc::new(upstream);
     let up_for_send = upstream.clone();
@@ -227,18 +281,23 @@ async fn relay(client: TcpStream, upstream: TcpConnection) -> Result<(u64, u64)>
         let mut buf = vec![0u8; 8192];
         let mut total: u64 = 0;
         loop {
-            let n = client_r.read(&mut buf).await?;
+            let read_fut = client_r.read(&mut buf);
+            let n = match tokio::time::timeout(idle, read_fut).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    counter!(M_IDLE_TIMEOUT).increment(1);
+                    break;
+                }
+            };
             if n == 0 {
                 break;
             }
-            // TcpConnection::write_all 返回的是 netstack 的 Error 类型
             up_for_send
                 .write_all(&buf[..n])
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             total += n as u64;
         }
-        // 半关上游写端，让远端看到 EOF
         up_for_send.shutdown();
         Ok::<u64, std::io::Error>(total)
     });
@@ -248,10 +307,14 @@ async fn relay(client: TcpStream, upstream: TcpConnection) -> Result<(u64, u64)>
         let mut buf = vec![0u8; 8192];
         let mut total: u64 = 0;
         loop {
-            let n = up_for_recv
-                .read(&mut buf)
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let read_fut = up_for_recv.read(&mut buf);
+            let n = match tokio::time::timeout(idle, read_fut).await {
+                Ok(r) => r.map_err(|e| std::io::Error::other(e.to_string()))?,
+                Err(_) => {
+                    counter!(M_IDLE_TIMEOUT).increment(1);
+                    break;
+                }
+            };
             if n == 0 {
                 break;
             }

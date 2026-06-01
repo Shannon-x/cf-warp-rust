@@ -100,8 +100,9 @@ impl WireGuardTunnel {
         // Create channels for packet communication
         // incoming: packets received from the tunnel (decrypted)
         // outgoing: packets to send through the tunnel (to be encrypted)
-        let (incoming_tx, incoming_rx) = mpsc::channel(256);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
+        // PERF-1（warp-rust fork）：从 256 提到 1024 缓解 try_send 满时丢包概率。
+        let (incoming_tx, incoming_rx) = mpsc::channel(1024);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
 
         let tunnel = Arc::new(Self {
             tunn: Mutex::new(tunn),

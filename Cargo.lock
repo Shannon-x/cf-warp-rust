@@ -3242,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "warp-rust"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3255,6 +3255,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "notify",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

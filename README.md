@@ -11,7 +11,10 @@
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
 - **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置热重载** — `config.toml` 改动会被监听并立即解析校验，TOML 语法错或字段错会马上在日志里报告。
-- **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl、Linux aarch64-musl、macOS Intel、macOS Apple Silicon）。
+- **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
+- **开放代理保护**（v0.1.1）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动（需 `WARP_RUST_ALLOW_OPEN_PROXY=1` 才能跳过）
+- **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
+- **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl / Linux aarch64-musl / Windows x86_64 / macOS Apple Silicon）。
 
 ---
 

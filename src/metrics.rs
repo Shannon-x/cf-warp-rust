@@ -22,6 +22,15 @@ pub const M_TUNNEL_REBUILD: &str = "warp_rust_tunnel_rebuild_total";
 pub const M_REREGISTER: &str = "warp_rust_reregister_total";
 pub const M_ROTATE: &str = "warp_rust_rotate_identity_total";
 pub const M_UDP_ASSOCIATES_ACTIVE: &str = "warp_rust_udp_associates_active";
+// v0.1.1：DoS 防护与 DNS 解析相关
+pub const M_CONNS_REJECTED: &str = "warp_rust_conns_rejected_total";
+pub const M_HANDSHAKE_TIMEOUT: &str = "warp_rust_handshake_timeout_total";
+pub const M_IDLE_TIMEOUT: &str = "warp_rust_idle_timeout_total";
+pub const M_AUTH_FAIL: &str = "warp_rust_auth_fail_total";
+pub const M_DNS_CACHE_HIT: &str = "warp_rust_dns_cache_hit_total";
+pub const M_DNS_QUERY: &str = "warp_rust_dns_query_total";
+pub const M_DNS_QUERY_FAIL: &str = "warp_rust_dns_query_failure_total";
+pub const M_WG_DROP: &str = "warp_rust_wg_tx_dropped_total";
 
 /// 装配 Prometheus exporter，在 `cfg.bind` 上启动一个 axum 服务。正常停机时
 /// 返回 Ok(())。

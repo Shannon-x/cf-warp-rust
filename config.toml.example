@@ -28,6 +28,9 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 # 两次重注册之间的最小冷却（防风暴；Cloudflare 注册接口对源 IP 有限流）
 register_cooldown = "10m"
+# WireGuard 接口 MTU。默认 1280（含 80B 安全余量，绝大多数线路稳定）；
+# 大流量场景可调到 1420 试试是否能跑满（PMTU 不够会被分片或丢包）
+mtu = 1280
 
 [health]
 # 健康探针节奏（每多少秒拨号一次 1.1.1.1:443，确认隧道通畅）
@@ -54,3 +57,19 @@ bind = "127.0.0.1:9090"
 # 监听本配置文件的变化。v1 行为：变化时仅重新解析校验，把结果写入日志；
 # 非平凡字段（监听地址、日志级别等）仍需重启才能生效
 enabled = true
+
+[limits]
+# v0.1.1 起内置 DoS 防护，所有字段都可调
+max_concurrent_connections = 1024   # 同时在飞 SOCKS5 连接上限；满即拒
+handshake_timeout = "10s"           # SOCKS5 握手 + read_command 总超时
+idle_timeout = "300s"               # 双向 relay 的 idle 超时
+auth_fail_sleep = "1s"              # 鉴权失败后强制延迟，防暴破
+
+[dns]
+# Domain ATYP 的 DNS 解析策略：
+#   "system" — 走宿主 OS DNS（默认，最快最兼容，但 DNS 查询不走隧道、泄漏域名）
+#   "tunnel" — 通过 WARP 隧道内 UDP 拨 servers 查 A 记录（更隐私，多一跳 RTT）
+mode = "system"
+servers = ["1.1.1.1:53", "1.0.0.1:53"]   # mode = "tunnel" 时使用
+timeout = "3s"
+cache_ttl = "60s"                  # 解析结果缓存 TTL；命中跳过 DNS 查询

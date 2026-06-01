@@ -63,7 +63,8 @@ impl AccountManager {
                 path.display()
             );
             // 刷一次配置：成本很低，但能让长时间离线后的恢复更快
-            let wg_config = get_config(&file.credentials).await?;
+            let mut wg_config = get_config(&file.credentials).await?;
+            wg_config.mtu = Some(self.cfg.mtu);
             return Ok(AccountSnapshot {
                 wg_config,
                 credentials: file.credentials,
@@ -103,7 +104,9 @@ impl AccountManager {
     pub async fn refresh_config(&self, creds: &WarpCredentials) -> Result<WireGuardConfig> {
         let _guard = self.api_lock.lock().await;
         debug!("refreshing WARP WG config");
-        Ok(get_config(creds).await?)
+        let mut wg_config = get_config(creds).await?;
+        wg_config.mtu = Some(self.cfg.mtu);
+        Ok(wg_config)
     }
 
     async fn register_inner(&self) -> Result<AccountSnapshot> {
@@ -113,8 +116,10 @@ impl AccountManager {
             teams: None,
         };
 
-        let (wg_config, credentials) = register(options).await?;
-        info!(device_id = %credentials.device_id, "WARP registration ok");
+        let (mut wg_config, credentials) = register(options).await?;
+        // 注入用户配置的 MTU（覆盖 warp-wireguard-gen 返回的默认值）
+        wg_config.mtu = Some(self.cfg.mtu);
+        info!(device_id = %credentials.device_id, mtu = self.cfg.mtu, "WARP registration ok");
 
         // 配了 license_key 时再单独绑一次（某些端点把 license 绑定放在注册之外的独立调用里）
         if let Some(key) = &self.cfg.license_key {

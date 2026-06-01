@@ -6,6 +6,7 @@
 
 mod config;
 mod config_watch;
+mod dns;
 mod error;
 mod health;
 mod metrics;
@@ -52,6 +53,12 @@ async fn run(cli: Cli) -> Result<()> {
 
     info!(version = env!("CARGO_PKG_VERSION"), config = %cli.config.display(), "warp-rust starting");
 
+    // 启动前安全校验：拒绝公网+无鉴权组合等高危配置
+    if let Err(msg) = cfg.validate() {
+        eprintln!("\n{msg}\n");
+        return Err(crate::error::Error::Config(msg));
+    }
+
     let cancel = CancellationToken::new();
     signals::install(cancel.clone());
 
@@ -71,12 +78,15 @@ async fn run(cli: Cli) -> Result<()> {
     // 3. 加载身份池（为空也允许）
     let identity_pool = IdentityPool::load(&cfg.warp.data_dir)?;
 
-    // 4. 启动 SOCKS5 监听
+    // 4. 启动 SOCKS5 监听（带 DoS 防护 + DNS 解析层）
     let server_cfg = cfg.server.clone();
+    let limits = cfg.limits.clone();
+    let resolver = Arc::new(crate::dns::Resolver::new(&cfg.dns, tunnel.clone()));
     let socks_cancel = cancel.clone();
     let socks_tunnel = tunnel.clone();
     let socks_task = tokio::spawn(async move {
-        if let Err(e) = proxy::serve(server_cfg, socks_tunnel, socks_cancel).await {
+        if let Err(e) = proxy::serve(server_cfg, limits, resolver, socks_tunnel, socks_cancel).await
+        {
             error!(error = %e, "SOCKS5 server exited with error");
         }
     });

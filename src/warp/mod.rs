@@ -4,5 +4,5 @@ pub mod account;
 pub mod identity_pool;
 pub mod persistence;
 
-pub use account::{AccountManager, AccountSnapshot};
+pub use account::AccountManager;
 pub use identity_pool::IdentityPool;
