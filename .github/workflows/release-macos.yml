@@ -57,7 +57,7 @@ jobs:
           cp scripts/*.sh "$NAME/scripts/"
           chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
           tar czf "dist/${NAME}.tar.gz" "$NAME"
-          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           ls -la dist/
 
       - name: Append to GitHub Release

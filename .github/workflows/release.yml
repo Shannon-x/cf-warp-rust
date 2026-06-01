@@ -81,7 +81,8 @@ jobs:
           cp scripts/*.sh "$NAME/scripts/"
           chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
           tar czf "dist/${NAME}.tar.gz" "$NAME"
-          sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+          # 进入 dist/ 再算，让 sha256 文件里的路径不带目录前缀
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           ls -la dist/
 
       - name: Package (Windows)

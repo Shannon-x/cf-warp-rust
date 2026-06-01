@@ -68,28 +68,99 @@ case "$(uname -m)" in
 esac
 
 # ── 解析参数 ─────────────────────────────────────────────────────────────────
-PORT=1080
-EXPOSE=0
-USER_NAME="warp"
+PORT=""
+EXPOSE=""        # 空 = 未指定 → 交互问；0/1 = 已显式给定
+USER_NAME=""
 PASS=""
 VERSION=""
 ACTION="install"
+NONINTERACTIVE=0  # 传任何参数即视为非交互
 
+ARG_COUNT=$#
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port)       PORT="${2:?}"; shift ;;
-    --expose)     EXPOSE=1 ;;
-    --user)       USER_NAME="${2:?}"; shift ;;
-    --pass)       PASS="${2:?}"; shift ;;
-    --version)    VERSION="${2:?}"; shift ;;
-    --uninstall)  ACTION="uninstall" ;;
-    --update)     ACTION="update" ;;
-    --status)     ACTION="status" ;;
-    -h|--help)    sed -n '2,33p' "$0" 2>/dev/null || sed -n '2,33p' /dev/stdin; exit 0 ;;
+    --port)         PORT="${2:?}"; shift; NONINTERACTIVE=1 ;;
+    --expose)       EXPOSE=1; NONINTERACTIVE=1 ;;
+    --no-expose)    EXPOSE=0; NONINTERACTIVE=1 ;;
+    --user)         USER_NAME="${2:?}"; shift; NONINTERACTIVE=1 ;;
+    --pass)         PASS="${2:?}"; shift; NONINTERACTIVE=1 ;;
+    --version)      VERSION="${2:?}"; shift ;;
+    --yes|-y)       NONINTERACTIVE=1 ;;  # 用所有默认值跳过交互
+    --uninstall)    ACTION="uninstall" ;;
+    --update)       ACTION="update" ;;
+    --status)       ACTION="status" ;;
+    -h|--help)      sed -n '2,40p' "$0" 2>/dev/null || sed -n '2,40p' /dev/stdin; exit 0 ;;
     *) die "未知参数：$1（用 --help 看帮助）" ;;
   esac
   shift
 done
+
+# ── 交互模式（无任何安装参数 + /dev/tty 可用）─────────────────────────────
+# 通过 `curl ... | sudo bash` 跑时，stdin 是脚本本身，但 /dev/tty 仍指向终端，
+# 显式从 /dev/tty 读就能实现交互。
+if [ "$ACTION" = "install" ] && [ "$NONINTERACTIVE" = 0 ] && [ -e /dev/tty ]; then
+  exec </dev/tty
+  echo
+  echo "${BOLD}════════════════════════════════════════════════════════${RESET}"
+  echo "${BOLD}  warp-rust 安装向导${RESET}"
+  echo "${BOLD}════════════════════════════════════════════════════════${RESET}"
+  echo
+  echo "  通过 Cloudflare WARP 出口的 SOCKS5 + UDP 代理"
+  echo "  · 仅本机访问（127.0.0.1）${BOLD}不需要${RESET}密码"
+  echo "  · 对外暴露（0.0.0.0）会${BOLD}强制${RESET}启用强密码鉴权"
+  echo "  · 全程用户态，${BOLD}不动${RESET}宿主路由 / iptables / TUN"
+  echo
+
+  # ── 端口 ──
+  while :; do
+    read -r -p "  SOCKS5 监听端口 [1080]: " ans
+    PORT="${ans:-1080}"
+    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] && break
+    warn "端口非法，请输入 1-65535 之间的整数"
+  done
+
+  # ── 暴露范围 ──
+  while :; do
+    echo
+    echo "  绑定范围："
+    echo "    L = 仅本机 127.0.0.1（推荐，最安全）"
+    echo "    E = 对外 0.0.0.0（自动启用密码鉴权）"
+    read -r -p "  选择 [L/e]: " ans
+    case "${ans:-L}" in
+      L|l|local|"") EXPOSE=0; break ;;
+      E|e|external) EXPOSE=1; break ;;
+      *) warn "请输入 L 或 E" ;;
+    esac
+  done
+
+  # ── 鉴权（仅 expose 时）──
+  if [ "$EXPOSE" = 1 ]; then
+    echo
+    read -r -p "  SOCKS5 用户名 [warp]: " ans
+    USER_NAME="${ans:-warp}"
+
+    while :; do
+      echo "  密码：直接回车 = 自动生成 24 位强密码；或手输 ≥16 位含大小写+数字"
+      read -r -s -p "  密码: " pw
+      echo
+      if [ -z "$pw" ]; then
+        PASS=""   # 后面会走自动生成分支
+        break
+      fi
+      if [ "${#pw}" -ge 16 ] && [[ "$pw" =~ [A-Z] ]] && [[ "$pw" =~ [a-z] ]] && [[ "$pw" =~ [0-9] ]]; then
+        PASS="$pw"
+        break
+      fi
+      warn "密码强度不够（需 ≥16 位 + 大小写 + 数字），重输"
+    done
+  fi
+  echo
+fi
+
+# 非交互模式补默认
+[ -z "$PORT" ] && PORT=1080
+[ -z "$EXPOSE" ] && EXPOSE=0
+[ -z "$USER_NAME" ] && USER_NAME="warp"
 
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
   || die "端口非法：$PORT"
@@ -107,10 +178,15 @@ ok_pw() {
   [ "${#p}" -ge 16 ] && [[ "$p" =~ [A-Z] ]] && [[ "$p" =~ [a-z] ]] && [[ "$p" =~ [0-9] ]]
 }
 verify_sha256() {
-  if command -v sha256sum >/dev/null; then sha256sum -c "$1"
+  # release.yml 在某些版本里 sha256sum 是在 dist/ 外面跑的，文件名带 dist/ 前缀。
+  # 这里把前缀都剥掉再用当前目录校验，兼容两种格式。
+  local sha_file="$1"
+  local cleaned
+  cleaned="$(sed 's|^\([0-9a-fA-F]\{64\}\)  .*/|\1  |' "$sha_file")"
+  if command -v sha256sum >/dev/null; then
+    echo "$cleaned" | sha256sum -c -
   else
-    # shasum -a 256 -c 也认 sha256sum 格式
-    shasum -a 256 -c "$1"
+    echo "$cleaned" | shasum -a 256 -c -
   fi
 }
 
