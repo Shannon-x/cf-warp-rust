@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# warp-rust install.sh  schema=3  (verbose progress + wait for SOCKS5 listening)
+# warp-rust install.sh  schema=5  (default non-interactive for curl|bash; -i for wizard)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -32,6 +32,27 @@
 set -euo pipefail
 
 REPO="Shannon-x/cf-warp-rust"
+
+# GitHub 代理镜像列表（国内连 github.com 慢时自动 fallback）
+# 用法：
+#   GH_PROXY="https://ghproxy.com/" curl ... | sudo bash      # 显式指定
+#   GH_PROXY="" curl ... | sudo bash                          # 强制直连 GitHub
+# 默认按顺序尝试：直连 → ghproxy.com → ghproxy.cn → ghp.ci
+# 任一可达就用它，全失败才报错
+GH_PROXIES_DEFAULT=(
+  ""                              # 先试直连
+  "https://ghproxy.net/"
+  "https://mirror.ghproxy.com/"
+  "https://ghproxy.cn/"
+  "https://gh.api.99988866.xyz/"
+)
+if [ -n "${GH_PROXY+x}" ]; then
+  # 用户显式设了 GH_PROXY（即使是空串），只用这一个值
+  GH_PROXIES=("$GH_PROXY")
+else
+  GH_PROXIES=("${GH_PROXIES_DEFAULT[@]}")
+fi
+
 INSTALL_BIN="/usr/local/bin/warp-rust"
 CONF_DIR="/etc/warp-rust"
 CONF_FILE="${CONF_DIR}/config.toml"
@@ -70,95 +91,101 @@ esac
 
 # ── 解析参数 ─────────────────────────────────────────────────────────────────
 PORT=""
-EXPOSE=""        # 空 = 未指定 → 交互问；0/1 = 已显式给定
+EXPOSE=""
 USER_NAME=""
 PASS=""
 VERSION=""
 ACTION="install"
-NONINTERACTIVE=0  # 传任何参数即视为非交互
+INTERACTIVE=0      # 默认非交互（curl|bash 模式最稳）
 
-ARG_COUNT=$#
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port)         PORT="${2:?}"; shift; NONINTERACTIVE=1 ;;
-    --expose)       EXPOSE=1; NONINTERACTIVE=1 ;;
-    --no-expose)    EXPOSE=0; NONINTERACTIVE=1 ;;
-    --user)         USER_NAME="${2:?}"; shift; NONINTERACTIVE=1 ;;
-    --pass)         PASS="${2:?}"; shift; NONINTERACTIVE=1 ;;
-    --version)      VERSION="${2:?}"; shift ;;
-    --yes|-y)       NONINTERACTIVE=1 ;;  # 用所有默认值跳过交互
-    --uninstall)    ACTION="uninstall" ;;
-    --update)       ACTION="update" ;;
-    --status)       ACTION="status" ;;
-    -h|--help)      sed -n '2,40p' "$0" 2>/dev/null || sed -n '2,40p' /dev/stdin; exit 0 ;;
+    --port)              PORT="${2:?}"; shift ;;
+    --expose)            EXPOSE=1 ;;
+    --no-expose)         EXPOSE=0 ;;
+    --user)              USER_NAME="${2:?}"; shift ;;
+    --pass)              PASS="${2:?}"; shift ;;
+    --version)           VERSION="${2:?}"; shift ;;
+    --interactive|-i)    INTERACTIVE=1 ;;
+    --yes|-y)            INTERACTIVE=0 ;;
+    --uninstall)         ACTION="uninstall" ;;
+    --update)            ACTION="update" ;;
+    --status)            ACTION="status" ;;
+    -h|--help)           sed -n '2,42p' "$0" 2>/dev/null; exit 0 ;;
     *) die "未知参数：$1（用 --help 看帮助）" ;;
   esac
   shift
 done
 
-# ── 交互模式（无任何安装参数 + /dev/tty 可用）─────────────────────────────
-# 通过 `curl ... | sudo bash` 跑时，stdin 是脚本本身，但 /dev/tty 仍指向终端，
-# 显式从 /dev/tty 读就能实现交互。
-if [ "$ACTION" = "install" ] && [ "$NONINTERACTIVE" = 0 ] && [ -e /dev/tty ]; then
-  exec </dev/tty
+# 自动启用交互模式的条件：用户用本地 bash 跑（stdin 是 tty），不是 curl|bash
+# 这样：
+#   - `curl ... | sudo bash`  → stdin 不是 tty → 走非交互默认（秒装）
+#   - `wget install.sh; sudo bash install.sh` → stdin 是 tty → 自动交互
+#   - `curl ... | sudo bash -s -- -i` → 显式要求交互
+if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 0 ] && [ -t 0 ]; then
+  INTERACTIVE=1
+fi
+
+# ── 交互向导（显式 -i 或本地 bash 时启用）──────────────────────────────────
+if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
+  # 显式 -i 但 stdin 不是 tty 时，尝试从 /dev/tty 拿（curl|bash -i 场景）
+  if [ ! -t 0 ]; then
+    if [ -e /dev/tty ] && exec 0</dev/tty 2>/dev/null; then
+      :  # OK
+    else
+      warn "-i 启用但 /dev/tty 不可用，自动回退到非交互默认安装"
+      INTERACTIVE=0
+    fi
+  fi
+fi
+
+if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   echo
   echo "${BOLD}════════════════════════════════════════════════════════${RESET}"
   echo "${BOLD}  warp-rust 安装向导${RESET}"
   echo "${BOLD}════════════════════════════════════════════════════════${RESET}"
   echo
-  echo "  通过 Cloudflare WARP 出口的 SOCKS5 + UDP 代理"
   echo "  · 仅本机访问（127.0.0.1）${BOLD}不需要${RESET}密码"
   echo "  · 对外暴露（0.0.0.0）会${BOLD}强制${RESET}启用强密码鉴权"
-  echo "  · 全程用户态，${BOLD}不动${RESET}宿主路由 / iptables / TUN"
   echo
 
-  # ── 端口 ──
   while :; do
-    read -r -p "  SOCKS5 监听端口 [1080]: " ans
+    read -r -p "  SOCKS5 监听端口 [1080]: " ans || ans=""
     PORT="${ans:-1080}"
     [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] && break
-    warn "端口非法，请输入 1-65535 之间的整数"
+    warn "端口非法，请输入 1-65535"
   done
 
-  # ── 暴露范围 ──
   while :; do
     echo
-    echo "  绑定范围："
-    echo "    L = 仅本机 127.0.0.1（推荐，最安全）"
-    echo "    E = 对外 0.0.0.0（自动启用密码鉴权）"
-    read -r -p "  选择 [L/e]: " ans
+    echo "  绑定范围：L=仅本机 127.0.0.1（推荐）  E=对外 0.0.0.0（强制密码）"
+    read -r -p "  选择 [L/e]: " ans || ans="L"
     case "${ans:-L}" in
-      L|l|local|"") EXPOSE=0; break ;;
-      E|e|external) EXPOSE=1; break ;;
+      L|l|"")        EXPOSE=0; break ;;
+      E|e|external)  EXPOSE=1; break ;;
       *) warn "请输入 L 或 E" ;;
     esac
   done
 
-  # ── 鉴权（仅 expose 时）──
   if [ "$EXPOSE" = 1 ]; then
     echo
-    read -r -p "  SOCKS5 用户名 [warp]: " ans
+    read -r -p "  SOCKS5 用户名 [warp]: " ans || ans=""
     USER_NAME="${ans:-warp}"
-
     while :; do
-      echo "  密码：直接回车 = 自动生成 24 位强密码；或手输 ≥16 位含大小写+数字"
-      read -r -s -p "  密码: " pw
+      echo "  密码：直接回车 = 自动生成 24 位；或手输 ≥16 位含大小写+数字"
+      read -r -s -p "  密码: " pw || pw=""
       echo
-      if [ -z "$pw" ]; then
-        PASS=""   # 后面会走自动生成分支
-        break
-      fi
+      if [ -z "$pw" ]; then PASS=""; break; fi
       if [ "${#pw}" -ge 16 ] && [[ "$pw" =~ [A-Z] ]] && [[ "$pw" =~ [a-z] ]] && [[ "$pw" =~ [0-9] ]]; then
-        PASS="$pw"
-        break
+        PASS="$pw"; break
       fi
-      warn "密码强度不够（需 ≥16 位 + 大小写 + 数字），重输"
+      warn "密码强度不够，请重输"
     done
   fi
   echo
 fi
 
-# 非交互模式补默认
+# 默认值（非交互或交互未指定时）
 [ -z "$PORT" ] && PORT=1080
 [ -z "$EXPOSE" ] && EXPOSE=0
 [ -z "$USER_NAME" ] && USER_NAME="warp"
@@ -195,6 +222,54 @@ ok_pw() {
   local p="$1"
   [ "${#p}" -ge 16 ] && [[ "$p" =~ [A-Z] ]] && [[ "$p" =~ [a-z] ]] && [[ "$p" =~ [0-9] ]]
 }
+# 通用 fetch：按 GH_PROXIES 列表挨个试，先成功的赢。
+# 用法：gh_fetch <output_file> <relative_url_to_github>
+#   gh_fetch /tmp/file.tgz "https://github.com/owner/repo/releases/download/v1/x.tgz"
+# 也支持 api.github.com（同样会被代理）
+gh_fetch() {
+  local out="$1" url="$2"
+  local proxy effective code
+  for proxy in "${GH_PROXIES[@]}"; do
+    if [ -n "$proxy" ]; then
+      effective="${proxy%/}/${url}"
+    else
+      effective="$url"
+    fi
+    # 静默尝试，10 秒连接 + 60 秒总；成功则退出
+    code="$(curl -fsSL -o "$out" -w '%{http_code}' \
+              --connect-timeout 10 --max-time 60 \
+              "$effective" 2>/dev/null || echo "000")"
+    if [ "$code" = "200" ] && [ -s "$out" ]; then
+      [ -n "$proxy" ] && info "  (via 代理 ${proxy})"
+      return 0
+    fi
+    [ -n "$proxy" ] && warn "  代理 ${proxy} 失败（code=$code），尝试下一个..."
+  done
+  return 1
+}
+
+# 大文件下载版（同 gh_fetch，但带进度条）
+gh_download() {
+  local out="$1" url="$2"
+  local proxy effective
+  for proxy in "${GH_PROXIES[@]}"; do
+    if [ -n "$proxy" ]; then
+      effective="${proxy%/}/${url}"
+      info "  尝试代理：${proxy}"
+    else
+      effective="$url"
+      info "  尝试直连 GitHub"
+    fi
+    if curl -fSL --progress-bar \
+            --connect-timeout 15 --max-time 300 \
+            "$effective" -o "$out" 2>&1; then
+      return 0
+    fi
+    warn "  失败，换下一个源..."
+  done
+  return 1
+}
+
 verify_sha256() {
   # 不用 `sha256sum -c`（它会按 sha 文件里写的路径去找文件，路径前缀就会出错）。
   # 直接抽出 sha 文件里的 hash 跟实际文件的 hash 对比 —— 无论 sha 文件里
@@ -248,12 +323,17 @@ fi
 
 # ── 解析最新版本号 ───────────────────────────────────────────────────────────
 if [ -z "$VERSION" ]; then
-  info "[1/5] 查询 GitHub 最新 release（最多 15 秒）..."
-  if ! VERSION="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" \
-                  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)" \
-       || [ -z "$VERSION" ]; then
-    warn "查询失败（国内连 api.github.com 可能慢/限速）"
-    die "请加 --version v0.1.0 跳过 API 查询，或换网络重试"
+  info "[1/5] 查询 GitHub 最新 release"
+  TMP_API="$(mktemp)"
+  if gh_fetch "$TMP_API" "https://api.github.com/repos/${REPO}/releases/latest"; then
+    VERSION="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP_API" | head -1)"
+  fi
+  rm -f "$TMP_API"
+  if [ -z "$VERSION" ]; then
+    warn "所有源都获取不到最新版本号"
+    echo "  → 加 --version v0.1.0 跳过 API 查询：" >&2
+    echo "    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo bash -s -- --version v0.1.0" >&2
+    die "无法获取最新版本号"
   fi
   ok "最新版本：${BOLD}$VERSION${RESET}"
 else
@@ -269,9 +349,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 info "[2/5] 下载 ${ASSET}（约 4 MB）"
-curl -fSL --progress-bar --max-time 120 "$URL_TGZ" -o "$TMP/$ASSET" \
-  || die "下载失败（网络问题？）：$URL_TGZ"
-curl -fsSL --max-time 30 "$URL_SHA" -o "$TMP/$ASSET.sha256" \
+gh_download "$TMP/$ASSET" "$URL_TGZ" \
+  || die "下载失败（所有源都不通；可手动 wget 后用 --version 跳过）"
+gh_fetch "$TMP/$ASSET.sha256" "$URL_SHA" \
   || die "下载 sha256 失败"
 
 info "[3/5] 校验 sha256..."
