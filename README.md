@@ -13,22 +13,43 @@
 - **配置热重载** — `config.toml` 改动会被监听并立即解析校验，TOML 语法错或字段错会马上在日志里报告。需要重启才能生效的字段（监听地址、日志级别等）也会在日志里写明。
 - **Docker 部署就绪**，多阶段构建到 distroless 运行时镜像。
 
-## 快速开始
+## 快速开始（推荐）
+
+三个开箱即用的脚本，按场景挑一个：
+
+```bash
+# 1) 完全交互：问你模式、端口、是否对外、要不要密码
+./scripts/quickstart.sh
+
+# 2) 一键二进制启动（默认 127.0.0.1:1080，无鉴权）
+./scripts/run-binary.sh
+./scripts/run-binary.sh 1081                 # 改端口
+./scripts/run-binary.sh 1080 --expose        # 对外暴露 → 自动生成 24 位强密码并打印
+
+# 3) 一键容器启动（拉不到镜像就本地 docker build）
+./scripts/run-docker.sh 1080
+./scripts/run-docker.sh 1080 --expose --user me --pass 'MyStrong16Pass!!'
+./scripts/run-docker.sh --stop               # 停止
+```
+
+任一脚本启动后验证：
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace
+# 期望：warp=on
+```
+
+UDP 链路验证：仓库 `tests/test_socks5_udp.py` 通过代理对 1.1.1.1:53 发 DNS 查询。
+
+> **安全提示**：默认绑 `127.0.0.1`，只有本机可用。`--expose` 选项会把端口绑到 `0.0.0.0` 并强制启用强密码鉴权（≥16 位，含大小写和数字），弱密码直接拒绝。详见 [SECURITY.md](SECURITY.md)。
+
+## 手动启动（不用脚本）
 
 ```bash
 cp config.toml.example config.toml
 cargo build --release
 ./target/release/warp-rust --config config.toml
 ```
-
-另开终端：
-
-```bash
-curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace
-# 期望看到：warp=on （如果设置了 license_key 还会有 warp=plus）
-```
-
-UDP 链路验证可用任意支持 SOCKS5 UDP 的客户端；本仓库 `tests/` 目录里有一个小 Python 脚本，通过代理对 1.1.1.1:53 发 DNS 查询。
 
 ## 配置项
 

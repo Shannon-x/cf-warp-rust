@@ -80,7 +80,10 @@ pub async fn run_relay(
                 if parent.is_cancelled() {
                     break;
                 }
-                match tunnel_udp.recv_from(&mut buf, Duration::from_millis(200)).await {
+                match tunnel_udp
+                    .recv_from(&mut buf, Duration::from_millis(200))
+                    .await
+                {
                     Ok((n, src_v4)) => {
                         let dst = match *client_addr.lock().await {
                             Some(a) => a,
@@ -114,7 +117,10 @@ pub async fn run_relay(
     Ok(())
 }
 
-async fn forward_client_to_tunnel(packet: &[u8], tunnel_udp: &wireguard_netstack::UdpHandle) -> Result<()> {
+async fn forward_client_to_tunnel(
+    packet: &[u8],
+    tunnel_udp: &wireguard_netstack::UdpHandle,
+) -> Result<()> {
     let (dest, payload) = parse_socks5_udp(packet)?;
     tunnel_udp.send_to(payload, dest).await?;
     Ok(())
@@ -163,9 +169,7 @@ fn parse_socks5_udp(buf: &[u8]) -> Result<(SocketAddrV4, &[u8])> {
                     SocketAddr::V4(v4) => Some(v4),
                     SocketAddr::V6(_) => None,
                 });
-            let dest = addrs
-                .next()
-                .ok_or_else(|| Error::DnsNoIpv4(host.clone()))?;
+            let dest = addrs.next().ok_or_else(|| Error::DnsNoIpv4(host.clone()))?;
             Ok((dest, payload))
         }
         0x04 => Err(Error::other("SOCKS5 UDP IPv6 not supported")),

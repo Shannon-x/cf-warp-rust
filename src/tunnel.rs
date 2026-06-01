@@ -73,6 +73,9 @@ impl Tunnel {
     /// 给后续探针留出的接口：距上一次 WireGuard 握手的时长。
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
         let snapshot = self.inner.load_full();
-        snapshot.as_ref().as_ref().and_then(|t| t.time_since_last_handshake())
+        snapshot
+            .as_ref()
+            .as_ref()
+            .and_then(|t| t.time_since_last_handshake())
     }
 }

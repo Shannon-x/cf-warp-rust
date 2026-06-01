@@ -61,7 +61,8 @@ impl IdentityPool {
         let mut tmp = tempfile::NamedTempFile::new_in(data_dir)?;
         tmp.write_all(&bytes)?;
         tmp.as_file().sync_all()?;
-        tmp.persist(&dest).map_err(|e| crate::error::Error::Io(e.error))?;
+        tmp.persist(&dest)
+            .map_err(|e| crate::error::Error::Io(e.error))?;
         info!(src = %src.display(), dest = %dest.display(), "activated identity from pool");
         Ok(())
     }

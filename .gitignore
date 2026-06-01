@@ -3,3 +3,6 @@ data/
 config.toml
 *.swp
 .DS_Store
+config.runbin.toml
+config.docker.toml
+config.quickstart.toml

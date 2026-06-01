@@ -10,7 +10,9 @@
 
 use crate::config::{AuthConfig, ServerConfig};
 use crate::error::{Error, Result};
-use crate::metrics::{M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_UDP_ASSOCIATES_ACTIVE};
+use crate::metrics::{
+    M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_UDP_ASSOCIATES_ACTIVE,
+};
 use crate::proxy::udp;
 use crate::tunnel::Tunnel;
 use fast_socks5::server::Socks5ServerProtocol;
@@ -25,7 +27,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use wireguard_netstack::TcpConnection;
 
-pub async fn serve(cfg: ServerConfig, tunnel: Arc<Tunnel>, cancel: CancellationToken) -> Result<()> {
+pub async fn serve(
+    cfg: ServerConfig,
+    tunnel: Arc<Tunnel>,
+    cancel: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(cfg.bind).await?;
     info!(addr = %cfg.bind, "SOCKS5 listening");
 
@@ -139,7 +145,10 @@ async fn handle(
 /// 处理 SOCKS5 UDP ASSOCIATE：本地绑定一个 UDP 中继 socket，把地址告诉客户端，
 /// 启动转发 task，然后挂着 TCP 控制流——客户端关 TCP 即视为会话结束，撤下中继。
 async fn handle_udp_associate(
-    proto: fast_socks5::server::Socks5ServerProtocol<TcpStream, fast_socks5::server::states::CommandRead>,
+    proto: fast_socks5::server::Socks5ServerProtocol<
+        TcpStream,
+        fast_socks5::server::states::CommandRead,
+    >,
     peer: SocketAddr,
     server_ip: IpAddr,
     tunnel: Arc<Tunnel>,
