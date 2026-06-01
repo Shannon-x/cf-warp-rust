@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# warp-rust install.sh  schema=2  (sha256-by-hash-compare, interactive)
+# warp-rust install.sh  schema=3  (verbose progress + wait for SOCKS5 listening)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -166,6 +166,23 @@ fi
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
   || die "端口非法：$PORT"
 
+# ── 交互完后立刻显示配置摘要，让用户知道脚本继续走 ─────────────────────────
+if [ "$ACTION" = "install" ]; then
+  echo "${BOLD}配置摘要：${RESET}"
+  if [ "$EXPOSE" = 1 ]; then
+    echo "  绑定地址 : ${BOLD}0.0.0.0:$PORT${RESET}（对外暴露）"
+    echo "  鉴权     : 用户名 ${BOLD}$USER_NAME${RESET}，密码 ${BOLD}$([ -n "$PASS" ] && echo '已指定' || echo '自动生成')${RESET}"
+  else
+    echo "  绑定地址 : ${BOLD}127.0.0.1:$PORT${RESET}（仅本机）"
+    echo "  鉴权     : 无（loopback only）"
+  fi
+  echo "  架构     : $TARGET"
+  echo
+  info "接下来会自动执行：查询版本 → 下载二进制 → 校验 → 安装 → 启动服务"
+  info "全程约 15-30 秒（首次启动时会注册 WARP 账号，需要约 5 秒）"
+  echo
+fi
+
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 gen_pw() {
   if command -v openssl >/dev/null 2>&1; then
@@ -231,10 +248,16 @@ fi
 
 # ── 解析最新版本号 ───────────────────────────────────────────────────────────
 if [ -z "$VERSION" ]; then
-  info "查询最新 release..."
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-  [ -n "$VERSION" ] || die "无法获取最新版本号（GitHub API 速率限制？可用 --version 手动指定）"
+  info "[1/5] 查询 GitHub 最新 release（最多 15 秒）..."
+  if ! VERSION="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" \
+                  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)" \
+       || [ -z "$VERSION" ]; then
+    warn "查询失败（国内连 api.github.com 可能慢/限速）"
+    die "请加 --version v0.1.0 跳过 API 查询，或换网络重试"
+  fi
+  ok "最新版本：${BOLD}$VERSION${RESET}"
+else
+  info "[1/5] 使用指定版本：${BOLD}$VERSION${RESET}"
 fi
 
 # ── 下载 + 校验 ─────────────────────────────────────────────────────────────
@@ -245,17 +268,18 @@ URL_SHA="${URL_TGZ}.sha256"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-info "下载 ${ASSET}（${VERSION}, ${TARGET}）"
-curl -fSL --progress-bar "$URL_TGZ" -o "$TMP/$ASSET" \
-  || die "下载失败：$URL_TGZ"
-curl -fsSL "$URL_SHA" -o "$TMP/$ASSET.sha256" \
+info "[2/5] 下载 ${ASSET}（约 4 MB）"
+curl -fSL --progress-bar --max-time 120 "$URL_TGZ" -o "$TMP/$ASSET" \
+  || die "下载失败（网络问题？）：$URL_TGZ"
+curl -fsSL --max-time 30 "$URL_SHA" -o "$TMP/$ASSET.sha256" \
   || die "下载 sha256 失败"
 
-info "校验 sha256..."
+info "[3/5] 校验 sha256..."
 verify_sha256 "$TMP/$ASSET.sha256" "$TMP/$ASSET" >/dev/null \
   || die "sha256 校验失败 —— 文件可能损坏或被篡改"
+ok "sha256 校验通过"
 
-info "解压..."
+info "[4/5] 解压并安装到系统..."
 tar xzf "$TMP/$ASSET" -C "$TMP"
 EXTRACTED="$TMP/warp-rust-${VERSION}-${TARGET}"
 [ -x "$EXTRACTED/warp-rust" ] || die "解压后未找到 warp-rust 可执行文件"
@@ -277,17 +301,19 @@ if [ "$ACTION" = "update" ]; then
 fi
 
 # ── 操作：install ───────────────────────────────────────────────────────────
-info "确保系统用户 $SERVICE_USER 存在..."
+# 系统用户
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  # 优先 useradd（util-linux），无则用 adduser（busybox/debian）
+  echo "  · 创建系统用户 $SERVICE_USER"
   useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
     || adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+else
+  echo "  · 系统用户 $SERVICE_USER 已存在"
 fi
 
-info "安装二进制 -> $INSTALL_BIN"
+echo "  · 安装二进制到 $INSTALL_BIN"
 install -m 0755 -o root -g root "$EXTRACTED/warp-rust" "$INSTALL_BIN"
 
-info "创建目录..."
+echo "  · 创建目录 $CONF_DIR / $DATA_DIR"
 install -m 0755 -d "$CONF_DIR"
 install -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" -d "$DATA_DIR"
 
@@ -305,7 +331,7 @@ else
 fi
 
 # ── 写配置 ──────────────────────────────────────────────────────────────────
-info "生成配置 $CONF_FILE"
+echo "  · 生成配置 $CONF_FILE"
 {
   echo "# 由 install.sh 自动生成"
   echo "# 重新跑 install.sh 会覆盖；要保留请改名再启动 systemd 自定义 unit"
@@ -354,7 +380,7 @@ chown root:"$SERVICE_USER" "$CONF_FILE"
 chmod 0640 "$CONF_FILE"
 
 # ── 写 systemd unit ─────────────────────────────────────────────────────────
-info "写 systemd unit -> $SERVICE_FILE"
+echo "  · 写 systemd unit $SERVICE_FILE"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=warp-rust SOCKS5 proxy through Cloudflare WARP
@@ -404,9 +430,43 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-info "启动服务..."
-systemctl enable --now "$SERVICE_NAME" >/dev/null
-sleep 2
+ok "[4/5] 安装完成"
+
+info "[5/5] 启动 systemd 服务，等服务真正可用..."
+systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+# 跟实时日志最多 25 秒，看到 'SOCKS5 listening' 就算成功
+echo
+echo "${CYAN}── 服务启动日志（实时）──${RESET}"
+SECS_LIMIT=25
+START=$SECONDS
+LAST_JOURNAL_TS=""
+READY=0
+while [ $((SECONDS - START)) -lt $SECS_LIMIT ]; do
+  # 拿最近 30 行日志
+  CURRENT="$(journalctl -u "$SERVICE_NAME" --no-pager -q -n 30 --since "30 seconds ago" 2>/dev/null \
+              | sed 's/^/  /')"
+  if [ "$CURRENT" != "$LAST_JOURNAL_TS" ]; then
+    # 显示新增的行（简单 diff）
+    if [ -z "$LAST_JOURNAL_TS" ]; then
+      echo "$CURRENT"
+    else
+      diff <(echo "$LAST_JOURNAL_TS") <(echo "$CURRENT") | sed -n 's/^> //p'
+    fi
+    LAST_JOURNAL_TS="$CURRENT"
+  fi
+  # 检测启动成功标志
+  if echo "$CURRENT" | grep -q "SOCKS5 listening"; then
+    READY=1
+    break
+  fi
+  # 检测明显失败
+  if echo "$CURRENT" | grep -q "fatal:\|FATAL\|panicked at"; then
+    break
+  fi
+  sleep 1
+done
+echo "${CYAN}── 日志结束 ──${RESET}"
 
 # ── 报告 ────────────────────────────────────────────────────────────────────
 echo
@@ -444,8 +504,14 @@ echo "    | sudo bash -s -- --uninstall"
 echo
 
 # 服务真的起来了吗？
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-  ok "服务运行正常（systemctl is-active = active）"
+if [ "$READY" = 1 ] && systemctl is-active --quiet "$SERVICE_NAME"; then
+  ok "${BOLD}服务运行正常，SOCKS5 已监听 $BIND${RESET}"
+elif systemctl is-active --quiet "$SERVICE_NAME"; then
+  warn "服务 active 但 25 秒内没看到 'SOCKS5 listening'（WARP 握手慢？）"
+  echo "  跟踪日志：${BOLD}sudo journalctl -u $SERVICE_NAME -f${RESET}"
 else
-  warn "服务启动后未变 active，请用 journalctl -u $SERVICE_NAME -n 80 排查"
+  warn "服务未变 active；以下是最近日志："
+  journalctl -u "$SERVICE_NAME" --no-pager -q -n 40 2>/dev/null | sed 's/^/  /'
+  echo
+  echo "完整排查：${BOLD}sudo journalctl -u $SERVICE_NAME -n 200${RESET}"
 fi
