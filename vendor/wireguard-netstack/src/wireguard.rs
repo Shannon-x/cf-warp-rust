@@ -17,6 +17,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
+use crate::netstack::{DEFAULT_MTU, DEFAULT_TCP_BUFFER_SIZE};
+
+const UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Configuration for the WireGuard tunnel.
 #[derive(Clone)]
@@ -35,8 +38,10 @@ pub struct WireGuardConfig {
     pub preshared_key: Option<[u8; 32]>,
     /// Keepalive interval in seconds (0 = disabled).
     pub keepalive_seconds: Option<u16>,
-    /// MTU for the tunnel interface (defaults to 460 if None).
+    /// MTU for the tunnel interface.
     pub mtu: Option<u16>,
+    /// Size of each smoltcp TCP socket RX/TX buffer.
+    pub tcp_buffer_size: Option<usize>,
 }
 
 /// A WireGuard tunnel that encrypts/decrypts IP packets.
@@ -53,6 +58,8 @@ pub struct WireGuardTunnel {
     tunnel_ipv6: Option<Ipv6Addr>,
     /// MTU for the tunnel interface.
     mtu: u16,
+    /// Size of each smoltcp TCP socket RX/TX buffer.
+    tcp_buffer_size: usize,
     /// Channel to send received IP packets.
     incoming_tx: mpsc::Sender<BytesMut>,
     /// Channel to receive IP packets to send.
@@ -85,12 +92,10 @@ impl WireGuardTunnel {
 
         // Increase socket receive buffer to avoid packet loss
         let sock_ref = socket2::SockRef::from(&udp_socket);
-        if let Err(e) = sock_ref.set_recv_buffer_size(1024 * 1024) {
-            // 1MB buffer
+        if let Err(e) = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE) {
             log::warn!("Failed to set UDP recv buffer size: {}", e);
         }
-        if let Err(e) = sock_ref.set_send_buffer_size(1024 * 1024) {
-            // 1MB buffer
+        if let Err(e) = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE) {
             log::warn!("Failed to set UDP send buffer size: {}", e);
         }
         log::info!("UDP recv buffer size: {:?}", sock_ref.recv_buffer_size());
@@ -104,9 +109,9 @@ impl WireGuardTunnel {
         // Create channels for packet communication
         // incoming: packets received from the tunnel (decrypted)
         // outgoing: packets to send through the tunnel (to be encrypted)
-        // PERF-1（warp-rust fork）：从 256 提到 1024 缓解 try_send 满时丢包概率。
-        let (incoming_tx, incoming_rx) = mpsc::channel(1024);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
+        // v0.3.0：扩大队列并在 netstack 满队列时回压，避免 TCP 包被直接丢弃重传。
+        let (incoming_tx, incoming_rx) = mpsc::channel(8192);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(8192);
 
         let tunnel = Arc::new(Self {
             tunn: Mutex::new(tunn),
@@ -114,7 +119,8 @@ impl WireGuardTunnel {
             peer_endpoint: config.peer_endpoint,
             tunnel_ip: config.tunnel_ip,
             tunnel_ipv6: config.tunnel_ipv6,
-            mtu: config.mtu.unwrap_or(460), // Default MTU
+            mtu: config.mtu.unwrap_or(DEFAULT_MTU as u16),
+            tcp_buffer_size: config.tcp_buffer_size.unwrap_or(DEFAULT_TCP_BUFFER_SIZE),
             incoming_tx,
             incoming_rx: Mutex::new(Some(incoming_rx)),
             outgoing_tx,
@@ -137,6 +143,11 @@ impl WireGuardTunnel {
     /// Get the MTU for the tunnel.
     pub fn mtu(&self) -> u16 {
         self.mtu
+    }
+
+    /// Get the TCP socket buffer size for the userspace netstack.
+    pub fn tcp_buffer_size(&self) -> usize {
+        self.tcp_buffer_size
     }
 
     /// Get the sender for outgoing packets.

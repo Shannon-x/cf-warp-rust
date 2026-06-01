@@ -31,7 +31,11 @@ use tracing::{error, info};
 use wireguard_netstack::ManagedTunnel;
 
 #[derive(Debug, Parser)]
-#[command(name = "warp-rust", about = "SOCKS5 proxy through Cloudflare WARP")]
+#[command(
+    name = "warp-rust",
+    version,
+    about = "SOCKS5 proxy through Cloudflare WARP"
+)]
 struct Cli {
     /// 配置文件路径。默认 ./config.toml
     #[arg(long, default_value = "config.toml")]

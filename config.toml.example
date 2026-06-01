@@ -13,7 +13,7 @@ bind = "127.0.0.1:1080"
 
 [logging]
 # tracing 的 env-filter 过滤器；环境变量 RUST_LOG 会优先于此处的值
-level = "info,warp_rust=debug,wireguard_netstack=info"
+level = "warn,warp_rust=info,wireguard_netstack=warn"
 # 输出格式：pretty | compact | json
 format = "pretty"
 
@@ -28,9 +28,12 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 # 两次重注册之间的最小冷却（防风暴；Cloudflare 注册接口对源 IP 有限流）
 register_cooldown = "10m"
-# WireGuard 接口 MTU。默认 1280（含 80B 安全余量，绝大多数线路稳定）；
-# 大流量场景可调到 1420 试试是否能跑满（PMTU 不够会被分片或丢包）
-mtu = 1280
+# WireGuard 接口 MTU。默认 1420（标准 WireGuard / wireproxy 常用值）；
+# 若底层路径 PMTU 不足导致卡顿或丢包，可回退到 1280
+mtu = 1420
+# smoltcp TCP socket 单向 buffer。实际每条 TCP 连接约占 2 × 该值。
+# 64KB 会把 15-50ms RTT 的单连接吞吐卡在几十 Mbps；1MB 更适合大流量代理。
+tcp_buffer_size = 1048576
 
 [health]
 # 健康探针节奏（每多少秒拨号一次 1.1.1.1:443，确认隧道通畅）
@@ -63,6 +66,7 @@ enabled = true
 max_concurrent_connections = 1024   # 同时在飞 SOCKS5 连接上限；满即拒
 handshake_timeout = "10s"           # SOCKS5 握手 + read_command 总超时
 idle_timeout = "300s"               # 双向 relay 的 idle 超时
+relay_buffer_size = 262144          # TCP relay buffer；对齐 wireproxy 的 256KB buffer pool
 auth_fail_sleep = "1s"              # 鉴权失败后强制延迟，防暴破
 
 [dns]

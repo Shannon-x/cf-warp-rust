@@ -23,17 +23,19 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// MTU for the virtual interface.
 ///
-/// v0.1.1（warp-rust fork）：从上游的 460 提升到 1280。
-/// - 1280 是 IPv6 最小 MTU，绝大多数路径上稳定可达
-/// - + 80 字节 WG/UDP/IP 包头 ≈ 1360 字节，远小于以太网 1500 的常见 PMTU 限
-/// - 用户可在 config 里 `[warp].mtu` 覆盖到 1420（标准 WG MTU）追求更高吞吐
-pub const DEFAULT_MTU: usize = 1280;
+/// v0.3.0（warp-rust fork）：对齐 wireproxy / 标准 WireGuard 的 1420。
+/// 如果底层路径 PMTU 不足，用户仍可在 config 里 `[warp].mtu = 1280` 回退。
+pub const DEFAULT_MTU: usize = 1420;
 
 /// Size of TCP socket buffers.
-const TCP_BUFFER_SIZE: usize = 65535;
+///
+/// 64KiB 会把单连接吞吐限制在 `buffer / RTT`，在 15-50ms 出口 RTT 下只能跑
+/// 10-35Mbps。默认提升到 1MiB，实际内存约为每连接 2MiB（rx + tx）。
+pub const DEFAULT_TCP_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// A virtual network device that sends/receives through the WireGuard tunnel.
 struct VirtualDevice {
@@ -62,6 +64,16 @@ impl VirtualDevice {
     /// Take all packets from the transmit queue (to send via WireGuard).
     fn drain_tx(&mut self) -> Vec<BytesMut> {
         self.tx_queue.drain(..).collect()
+    }
+
+    fn prepend_tx(&mut self, mut packets: VecDeque<BytesMut>) {
+        while let Some(packet) = packets.pop_back() {
+            self.tx_queue.push_front(packet);
+        }
+    }
+
+    fn has_pending_tx(&self) -> bool {
+        !self.tx_queue.is_empty()
     }
 }
 
@@ -144,8 +156,11 @@ pub struct NetStack {
     wg_tunnel: Arc<WireGuardTunnel>,
     /// Sender to queue packets for transmission through WireGuard.
     wg_tx: mpsc::Sender<BytesMut>,
+    tcp_buffer_size: usize,
     /// PERF-2（warp-rust fork）：事件驱动 poll —— rx/read/write 路径唤醒 poll loop
     poll_notify: tokio::sync::Notify,
+    /// 唤醒等待 socket 状态变化的 TCP connect/read/write 调用方。
+    state_notify: tokio::sync::Notify,
 }
 
 impl NetStack {
@@ -154,6 +169,7 @@ impl NetStack {
         let tunnel_ip = wg_tunnel.tunnel_ip();
         let tunnel_ipv6 = wg_tunnel.tunnel_ipv6();
         let mtu = wg_tunnel.mtu() as usize;
+        let tcp_buffer_size = wg_tunnel.tcp_buffer_size();
         let wg_tx = wg_tunnel.outgoing_sender();
 
         // Create the virtual device with the configured MTU
@@ -214,7 +230,9 @@ impl NetStack {
             inner: Mutex::new(inner),
             wg_tunnel,
             wg_tx,
+            tcp_buffer_size,
             poll_notify: tokio::sync::Notify::new(),
+            state_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -224,13 +242,29 @@ impl NetStack {
         self.poll_notify.notify_one();
     }
 
+    #[inline]
+    fn notify_state(&self) {
+        self.state_notify.notify_waiters();
+    }
+
+    async fn wait_for_activity(&self) {
+        tokio::select! {
+            _ = self.state_notify.notified() => {}
+            // Fallback covers the small race where a notification is emitted
+            // between the caller's readiness check and registering the waiter.
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+
     /// Create a new TCP socket and return its handle.
     pub fn create_tcp_socket(&self) -> SocketHandle {
         let mut inner = self.inner.lock();
 
-        let rx_buffer = SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-        let tx_buffer = SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let rx_buffer = SocketBuffer::new(vec![0u8; self.tcp_buffer_size]);
+        let tx_buffer = SocketBuffer::new(vec![0u8; self.tcp_buffer_size]);
+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+        socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None);
 
         inner.sockets.add(socket)
     }
@@ -426,7 +460,8 @@ impl NetStack {
             log::trace!("NetStack poll sending {} packets", tx_count);
         }
 
-        for packet in tx_packets {
+        let mut iter = tx_packets.into_iter();
+        while let Some(packet) = iter.next() {
             // Log outgoing TCP packets at debug level
             if log::log_enabled!(log::Level::Debug) {
                 if let Ok(ip_packet) = Ipv4Packet::new_checked(&packet) {
@@ -465,12 +500,27 @@ impl NetStack {
                 }
             }
 
-            // PERF-1：去 per-packet spawn；try_send 失败直接丢，WG 自带重传。
-            // v0.2.2：失败时打 metric counter，便于 prometheus 看到丢包率。
-            if self.wg_tx.try_send(packet).is_err() {
-                metrics::counter!("warp_rust_wg_tx_dropped_total").increment(1);
-                log::trace!("WG outgoing queue full, dropping packet (WG will retransmit)");
+            match self.wg_tx.try_send(packet) {
+                Ok(()) => {}
+                Err(TrySendError::Full(packet)) => {
+                    metrics::counter!("warp_rust_wg_tx_backpressure_total").increment(1);
+                    let mut unsent = VecDeque::new();
+                    unsent.push_back(packet);
+                    unsent.extend(iter);
+                    let mut inner = self.inner.lock();
+                    inner.device.prepend_tx(unsent);
+                    break;
+                }
+                Err(TrySendError::Closed(_packet)) => {
+                    metrics::counter!("warp_rust_wg_tx_dropped_total").increment(1);
+                    log::trace!("WG outgoing queue closed, dropping packet");
+                    break;
+                }
             }
+        }
+
+        if processed || tx_count > 0 {
+            self.notify_state();
         }
 
         processed
@@ -540,17 +590,21 @@ impl NetStack {
                     smoltcp::time::Instant::from_millis(started.elapsed().as_millis() as i64);
                 let NetStackInner {
                     ref mut interface,
+                    ref device,
                     ref sockets,
-                    ..
                 } = *inner;
-                match interface.poll_at(now, sockets) {
-                    Some(at) if at > now => {
-                        let ms = (at - now).total_millis().max(0) as u64;
-                        // 限制最长 1 秒，让 kick() 能定期把控制权拿回来
-                        Duration::from_millis(ms.min(1000))
+                if device.has_pending_tx() {
+                    Duration::from_millis(1)
+                } else {
+                    match interface.poll_at(now, sockets) {
+                        Some(at) if at > now => {
+                            let ms = (at - now).total_millis().max(0) as u64;
+                            // 限制最长 1 秒，让 kick() 能定期把控制权拿回来
+                            Duration::from_millis(ms.min(1000))
+                        }
+                        Some(_) => Duration::ZERO,
+                        None => Duration::from_secs(1),
                     }
-                    Some(_) => Duration::ZERO,
-                    None => Duration::from_secs(1),
                 }
             };
 
@@ -613,19 +667,17 @@ impl TcpConnection {
                 netstack.remove_socket(handle);
                 return Err(Error::TcpTimeout);
             }
-            // 100µs 短 sleep 让 poll loop 推进握手（PERF-2）
-            tokio::time::sleep(Duration::from_micros(100)).await;
+            netstack.wait_for_activity().await;
         }
     }
 
     /// Read data from the connection.
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        // PERF-2（warp-rust fork）：上游用 30s 硬超时 + 1ms 忙轮询；改成无超时
-        // （由上层 idle_timeout 控制）+ 100µs 短 sleep；这条路径每包都跑，
-        // 100µs vs 1ms 直接把读路径理论延迟降 10×。
+        // v0.3.0：无硬超时（由上层 idle_timeout 控制），并用 poll loop 的
+        // state_notify 唤醒，避免每条连接 100µs 忙轮询抢同一把 netstack 锁。
         loop {
             // 直接读：smoltcp socket 状态由 poll loop 推进，我们这里不 poll
-            // 避免抢锁。第一次循环若没数据则 sleep + 重试。
+            // 避免抢锁。第一次循环若没数据则等待状态变化。
             if self.netstack.can_recv(self.handle) {
                 match self.netstack.recv(self.handle, buf) {
                     Ok(n) if n > 0 => return Ok(n),
@@ -638,7 +690,7 @@ impl TcpConnection {
                 return Ok(0); // 对端关闭
             }
 
-            tokio::time::sleep(Duration::from_micros(100)).await;
+            self.netstack.wait_for_activity().await;
         }
     }
 
@@ -665,7 +717,7 @@ impl TcpConnection {
             }
 
             if written < data.len() {
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                self.netstack.wait_for_activity().await;
             }
         }
         Ok(written)

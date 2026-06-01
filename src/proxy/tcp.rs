@@ -104,6 +104,8 @@ async fn handle(
     limits: Arc<LimitsConfig>,
     parent_cancel: CancellationToken,
 ) -> Result<()> {
+    stream.set_nodelay(true)?;
+
     // FIX-3 握手超时
     let hs = tokio::time::timeout(
         limits.handshake_timeout,
@@ -166,8 +168,13 @@ async fn handle(
     debug!(%peer, %upstream_addr, "socks5 connect established");
 
     // FIX-3 idle 超时 + 双向 relay
-    let (bytes_up, bytes_down) =
-        relay_with_idle_timeout(client, upstream, limits.idle_timeout).await?;
+    let (bytes_up, bytes_down) = relay_with_idle_timeout(
+        client,
+        upstream,
+        limits.idle_timeout,
+        limits.relay_buffer_size,
+    )
+    .await?;
     counter!(M_BYTES_UP).increment(bytes_up);
     counter!(M_BYTES_DOWN).increment(bytes_down);
     counter!(M_CONNS_CLOSED).increment(1);
@@ -350,6 +357,7 @@ async fn relay_with_idle_timeout(
     client: TcpStream,
     upstream: TcpConnection,
     idle: Duration,
+    buf_size: usize,
 ) -> Result<(u64, u64)> {
     let (mut client_r, mut client_w) = tokio::io::split(client);
     let upstream = Arc::new(upstream);
@@ -358,7 +366,7 @@ async fn relay_with_idle_timeout(
 
     // client → upstream
     let send = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; buf_size];
         let mut total: u64 = 0;
         loop {
             let read_fut = client_r.read(&mut buf);
@@ -384,7 +392,7 @@ async fn relay_with_idle_timeout(
 
     // upstream → client
     let recv = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; buf_size];
         let mut total: u64 = 0;
         loop {
             let read_fut = up_for_recv.read(&mut buf);

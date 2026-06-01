@@ -289,6 +289,7 @@ async fn get_config_with_client_id(
         preshared_key: None,
         keepalive_seconds: Some(25),
         mtu: None, // Use default MTU
+        tcp_buffer_size: None,
     };
 
     Ok((config, client_id))

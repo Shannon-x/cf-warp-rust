@@ -51,6 +51,11 @@ impl AccountManager {
         self.cfg.data_dir.join("account.json")
     }
 
+    fn apply_transport_tuning(&self, wg_config: &mut WireGuardConfig) {
+        wg_config.mtu = Some(self.cfg.mtu);
+        wg_config.tcp_buffer_size = Some(self.cfg.tcp_buffer_size);
+    }
+
     /// 已有持久化凭据时加载并向 Cloudflare 拉一份最新 WG 配置；否则发起一次全新注册。
     pub async fn load_or_register(&self) -> Result<AccountSnapshot> {
         let _guard = self.api_lock.lock().await;
@@ -64,7 +69,7 @@ impl AccountManager {
             );
             // 刷一次配置：成本很低，但能让长时间离线后的恢复更快
             let mut wg_config = get_config(&file.credentials).await?;
-            wg_config.mtu = Some(self.cfg.mtu);
+            self.apply_transport_tuning(&mut wg_config);
             return Ok(AccountSnapshot {
                 wg_config,
                 credentials: file.credentials,
@@ -105,7 +110,7 @@ impl AccountManager {
         let _guard = self.api_lock.lock().await;
         debug!("refreshing WARP WG config");
         let mut wg_config = get_config(creds).await?;
-        wg_config.mtu = Some(self.cfg.mtu);
+        self.apply_transport_tuning(&mut wg_config);
         Ok(wg_config)
     }
 
@@ -117,9 +122,14 @@ impl AccountManager {
         };
 
         let (mut wg_config, credentials) = register(options).await?;
-        // 注入用户配置的 MTU（覆盖 warp-wireguard-gen 返回的默认值）
-        wg_config.mtu = Some(self.cfg.mtu);
-        info!(device_id = %credentials.device_id, mtu = self.cfg.mtu, "WARP registration ok");
+        // 注入用户配置的传输参数（覆盖 warp-wireguard-gen 返回的默认值）
+        self.apply_transport_tuning(&mut wg_config);
+        info!(
+            device_id = %credentials.device_id,
+            mtu = self.cfg.mtu,
+            tcp_buffer_size = self.cfg.tcp_buffer_size,
+            "WARP registration ok"
+        );
 
         // 配了 license_key 时再单独绑一次（某些端点把 license 绑定放在注册之外的独立调用里）
         if let Some(key) = &self.cfg.license_key {

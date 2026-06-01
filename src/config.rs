@@ -73,7 +73,7 @@ pub enum LogFormat {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info,warp_rust=debug,wireguard_netstack=info".to_string(),
+            level: "warn,warp_rust=info,wireguard_netstack=warn".to_string(),
             format: LogFormat::Pretty,
         }
     }
@@ -90,9 +90,12 @@ pub struct WarpConfig {
     #[serde(with = "humantime_serde", default = "default_register_cooldown")]
     pub register_cooldown: Duration,
     /// WireGuard 接口 MTU。Cloudflare WARP 推荐 1280，更大可调到 1420（标准 WG）。
-    /// 默认 1280：含 80 字节安全余量，绝大多数线路都能通过。
+    /// 默认 1420：对齐标准 WireGuard / wireproxy；PMTU 不足时可回退 1280。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// smoltcp TCP socket 的单向 buffer 大小。实际每条 TCP 连接约占用 2 倍该值。
+    #[serde(default = "default_tcp_buffer_size")]
+    pub tcp_buffer_size: usize,
 }
 
 fn default_refresh_interval() -> Duration {
@@ -104,7 +107,11 @@ fn default_register_cooldown() -> Duration {
 }
 
 fn default_mtu() -> u16 {
-    1280
+    1420
+}
+
+fn default_tcp_buffer_size() -> usize {
+    1024 * 1024
 }
 
 impl Default for WarpConfig {
@@ -116,6 +123,7 @@ impl Default for WarpConfig {
             refresh_interval: default_refresh_interval(),
             register_cooldown: default_register_cooldown(),
             mtu: default_mtu(),
+            tcp_buffer_size: default_tcp_buffer_size(),
         }
     }
 }
@@ -194,9 +202,16 @@ pub struct LimitsConfig {
     /// 双向 relay 的 idle 超时；上下行都无数据传输到达时关连接
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
+    /// SOCKS TCP relay 每次读写使用的 buffer 大小。
+    #[serde(default = "default_relay_buffer_size")]
+    pub relay_buffer_size: usize,
     /// 鉴权失败后延迟，缓解暴破
     #[serde(with = "humantime_serde")]
     pub auth_fail_sleep: Duration,
+}
+
+fn default_relay_buffer_size() -> usize {
+    256 * 1024
 }
 
 impl Default for LimitsConfig {
@@ -205,6 +220,7 @@ impl Default for LimitsConfig {
             max_concurrent_connections: 1024,
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(300),
+            relay_buffer_size: default_relay_buffer_size(),
             auth_fail_sleep: Duration::from_secs(1),
         }
     }
@@ -284,6 +300,24 @@ impl Config {
                 bind = %self.metrics.bind,
                 "metrics 监听非 loopback；建议改为 127.0.0.1:9090 或通过反代/SSH 转发访问"
             );
+        }
+        if self.warp.mtu < 576 || self.warp.mtu > 1420 {
+            return Err(format!(
+                "[warp] mtu = {} 超出建议范围；请使用 576..=1420，WARP 常用 1280 或 1420",
+                self.warp.mtu
+            ));
+        }
+        if self.warp.tcp_buffer_size < 65_535 {
+            return Err(format!(
+                "[warp] tcp_buffer_size = {} 太小；至少 65535，推荐 1048576",
+                self.warp.tcp_buffer_size
+            ));
+        }
+        if self.limits.relay_buffer_size < 4096 {
+            return Err(format!(
+                "[limits] relay_buffer_size = {} 太小；至少 4096，推荐 262144",
+                self.limits.relay_buffer_size
+            ));
         }
         // 鉴权字段健全性
         if let Some(auth) = &self.server.auth {

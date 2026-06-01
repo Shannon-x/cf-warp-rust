@@ -11,6 +11,7 @@
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
 - **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置热重载** — `config.toml` 改动会被监听并立即解析校验，TOML 语法错或字段错会马上在日志里报告。
+- **高吞吐默认值**（v0.3.0）：默认 MTU 1420、1MB smoltcp TCP 窗口、256KB SOCKS relay buffer，减少 WARP SOCKS 出站的单连接限速。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
 - **开放代理保护**（v0.1.1）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动（需 `WARP_RUST_ALLOW_OPEN_PROXY=1` 才能跳过）
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
@@ -267,6 +268,9 @@ cargo build --release
 | `[warp]` | `license_key` | WARP+ 订阅密钥，可选 |
 | `[warp]` | `refresh_interval` | 周期刷新 WireGuard 配置的间隔。默认 24h |
 | `[warp]` | `register_cooldown` | 两次重注册之间的最小间隔。默认 10m |
+| `[warp]` | `mtu` | WireGuard MTU。默认 1420；PMTU 不稳时可回退 1280 |
+| `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 1048576；每连接约占 2 倍内存 |
+| `[limits]` | `relay_buffer_size` | SOCKS TCP relay buffer。默认 262144 |
 | `[health]` | `interval` / `timeout` | 探针节奏（隧道内拨号 1.1.1.1:443） |
 | `[recovery]` | `reconnect_after` 等四档 | 触发每一级恢复动作的连续失败次数阈值 |
 | `[metrics]` | `enabled` / `bind` | Prometheus `/metrics` 端点 |
@@ -404,7 +408,8 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 | `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
 | `warp_rust_udp_associates_active` | gauge | 当前活跃 UDP ASSOCIATE |
 | `warp_rust_dns_query_total` / `dns_cache_hit_total` | counter | DNS 查询 / 缓存命中 |
-| `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道因满丢的包（高负载预警） |
+| `warp_rust_wg_tx_backpressure_total` | counter | WG 出口通道满时触发回压重试次数 |
+| `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道关闭时丢弃的包（异常预警） |
 | `warp_rust_handshake_timeout_total` / `idle_timeout_total` / `auth_fail_total` | counter | DoS 防护各类拦截 |
 
 加上 `metrics-exporter-prometheus` 自动导出的 `process_*` 系列（RSS / CPU / 文件描述符），就能在 Grafana 里画完整曲线。
@@ -449,7 +454,7 @@ ss -tlnp | grep warp-rust
 
 - **支持 IPv4 与 IPv6 出口（v0.2.0+）。** WARP 给的 `addresses.v6` 会被解析并配置到 netstack；SOCKS5 客户端给 IPv6 目标地址、或 SOCKS5 UDP ATYP=0x04，都能通过 WARP IPv6 出口访问。Domain ATYP 当前先解 A 记录走 v4，AAAA happy-eyeballs 待 v0.2.1。
 - **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。开启 `[dns].mode = "tunnel"` 后域名走隧道内 1.1.1.1:53。
-- **SOCKS5 BIND 不支持**，**UDP 分片不支持**：协议层留作 v0.3+ 增强。
+- **SOCKS5 BIND 不支持**，**UDP 分片不支持**：协议层留作后续版本增强。
 - **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE` 与 [SECURITY.md](SECURITY.md)。
 
 ## 代码结构

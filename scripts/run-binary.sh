@@ -77,6 +77,8 @@ data_dir = "./data"
 device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
+mtu = 1420
+tcp_buffer_size = 1048576
 
 [health]
 interval = "30s"
@@ -96,6 +98,13 @@ bind = "127.0.0.1:9090"
 
 [hot_reload]
 enabled = false
+
+[limits]
+max_concurrent_connections = 1024
+handshake_timeout = "10s"
+idle_timeout = "300s"
+relay_buffer_size = 262144
+auth_fail_sleep = "1s"
 EOF
 } > "$CFG"
 chmod 600 "$CFG"

@@ -185,6 +185,7 @@ impl WgConfigFile {
             preshared_key: self.preshared_key,
             keepalive_seconds: self.persistent_keepalive.or(Some(25)),
             mtu: self.mtu,
+            tcp_buffer_size: None,
         })
     }
 }

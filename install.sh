@@ -96,7 +96,7 @@ USER_NAME=""
 PASS=""
 VERSION=""
 ACTION="install"
-# v0.2.3 / schema=7：默认 auto —— /dev/tty 可达就交互，cron/CI 自动走默认非交互
+# v0.3.0 / schema=8：默认 auto —— /dev/tty 可达就交互，cron/CI 自动走默认非交互
 # (auto | yes | no)
 INTERACTIVE_MODE="auto"
 # 是否传入了任何 install 参数；传了就强制非交互，免得 curl|bash --port 8964 还问一遍
@@ -457,6 +457,8 @@ data_dir = "$DATA_DIR"
 device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
+mtu = 1420
+tcp_buffer_size = 1048576
 
 [health]
 interval = "30s"
@@ -476,6 +478,13 @@ bind = "127.0.0.1:9090"
 
 [hot_reload]
 enabled = false
+
+[limits]
+max_concurrent_connections = 1024
+handshake_timeout = "10s"
+idle_timeout = "300s"
+relay_buffer_size = 262144
+auth_fail_sleep = "1s"
 EOF
 } > "$CONF_FILE"
 chown root:"$SERVICE_USER" "$CONF_FILE"
