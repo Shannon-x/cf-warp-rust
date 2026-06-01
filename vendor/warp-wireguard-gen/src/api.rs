@@ -1,5 +1,6 @@
 //! Cloudflare WARP API client implementation.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -259,23 +260,14 @@ async fn get_config_with_client_id(
         }
     };
 
-    // Use the direct IPv4 endpoint from the API response
-    // (Don't resolve the hostname - it may return a different/wrong IP)
-    // The v4 field contains "IP:0" format, so we strip the port and use the one from host field
-    // (or default to 2408 which is WARP's standard port)
-    let endpoint_ip = peer.endpoint.v4
-        .rsplit_once(':')
-        .map(|(ip, _)| ip)
-        .unwrap_or(&peer.endpoint.v4);
-    
-    let port = peer.endpoint.host
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-        .unwrap_or(2408); // Default WARP port
-    
-    let peer_endpoint = format!("{}:{}", endpoint_ip, port)
-        .parse()
-        .map_err(|_| Error::InvalidEndpoint(peer.endpoint.v4.clone()))?;
+    // v0.2.3（warp-rust fork）：优先 DNS 解析 peer.endpoint.host，让 Cloudflare
+    // 自家的 DNS/Anycast 调度选当前最优 IP；失败时 fallback 到 API 返回的 v4。
+    //
+    // 旧实现「直接固定 API 返回的 v4 IP」的问题：
+    //   · 这个 IP 24h 内被某条骨干网限速 / 误屏蔽时，无法切换
+    //   · API 缓存的 IP 与 Cloudflare DNS 实际推荐的 IP 不一致时，命中差的那个
+    //   · WARP endpoint 设计上就是给 DNS-driven 调度用的稳定入口
+    let peer_endpoint = resolve_peer_endpoint(&peer.endpoint).await?;
 
     // Parse client_id if present
     let client_id = parse_client_id(resp.config.client_id.as_deref())?;
@@ -323,4 +315,155 @@ pub async fn update_license(credentials: &WarpCredentials, license_key: &str) ->
     log::info!("License key updated successfully");
 
     Ok(())
+}
+
+// ============================================================================
+// v0.2.3（warp-rust fork）：WARP peer endpoint 解析
+// ============================================================================
+//
+// 设计目标：让 WG peer endpoint 跟随 Cloudflare DNS/Anycast 调度，而不是把
+// API 返回的某一个 IPv4 IP 写死。流程：
+//
+//   1. 先用 tokio::net::lookup_host(host) 解析 "engage.cloudflareclient.com:2408"
+//      返回的第一个 IPv4 SocketAddr。这是 happy path，让 Cloudflare 自家 DNS
+//      把请求引到当前最优入口（不同地区不同 IP）。
+//   2. DNS 失败、无 v4 记录、或返回空时，fallback 到 API 响应里 peer.endpoint.v4
+//      并配合 host 字段提取的端口。保留兼容性，离线/隔离环境也能跑通。
+//   3. fallback 自己解析失败（v4 文本非法）→ 显式 Error::InvalidEndpoint，
+//      不 unwrap、不 panic。
+//
+// fallback_endpoint 拆成纯函数（无 IO）方便加单元测试覆盖各种格式边界。
+
+/// 异步解析 WARP peer endpoint：DNS 优先，失败 fallback 到 API 提供的 v4。
+async fn resolve_peer_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
+    let host_str = endpoint.host.trim();
+    match tokio::net::lookup_host(host_str).await {
+        Ok(iter) => {
+            for sa in iter {
+                if let SocketAddr::V4(_) = sa {
+                    log::info!(
+                        "WARP endpoint via DNS: '{}' -> {}",
+                        host_str,
+                        sa,
+                    );
+                    return Ok(sa);
+                }
+            }
+            log::warn!(
+                "WARP endpoint DNS '{}' returned no IPv4; fallback to API v4='{}'",
+                host_str,
+                endpoint.v4,
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "WARP endpoint DNS '{}' failed: {}; fallback to API v4='{}'",
+                host_str,
+                e,
+                endpoint.v4,
+            );
+        }
+    }
+    fallback_endpoint(endpoint)
+}
+
+/// 不做 IO 的 fallback 解析：从 peer.endpoint.v4 取 IP，从 peer.endpoint.host
+/// 取端口，组装出 SocketAddr。两种字段都可能格式异常，全部走 Result。
+fn fallback_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
+    // v4 字段通常是 "162.159.x.x:0"，去掉端口部分（:0 没意义）
+    let v4_ip_str = endpoint
+        .v4
+        .rsplit_once(':')
+        .map(|(ip, _)| ip)
+        .unwrap_or(endpoint.v4.as_str())
+        .trim();
+
+    // host 字段通常是 "engage.cloudflareclient.com:2408"
+    let port = endpoint
+        .host
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.trim().parse::<u16>().ok())
+        .unwrap_or(2408);
+
+    let assembled = format!("{}:{}", v4_ip_str, port);
+    assembled.parse::<SocketAddr>().map_err(|_| {
+        Error::InvalidEndpoint(format!(
+            "fallback parse failed: v4='{}' host='{}' assembled='{}'",
+            endpoint.v4, endpoint.host, assembled
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ep(host: &str, v4: &str, v6: &str) -> Endpoint {
+        Endpoint {
+            host: host.into(),
+            v4: v4.into(),
+            v6: v6.into(),
+        }
+    }
+
+    #[test]
+    fn fallback_parses_v4_with_zero_port_suffix() {
+        // 典型 WARP API 响应格式：v4 带 :0 后缀
+        let sa = fallback_endpoint(&ep(
+            "engage.cloudflareclient.com:2408",
+            "162.159.192.7:0",
+            "[2606:4700::]:2408",
+        ))
+        .unwrap();
+        assert_eq!(sa.to_string(), "162.159.192.7:2408");
+    }
+
+    #[test]
+    fn fallback_handles_bare_v4_no_port() {
+        // 防御：v4 字段如果就是裸 IP 没冒号
+        let sa = fallback_endpoint(&ep(
+            "engage.cloudflareclient.com:2408",
+            "162.159.192.7",
+            "",
+        ))
+        .unwrap();
+        assert_eq!(sa.to_string(), "162.159.192.7:2408");
+    }
+
+    #[test]
+    fn fallback_handles_missing_host_port_defaults_2408() {
+        // host 没端口（极少见）→ 默认 2408（WARP 标准）
+        let sa = fallback_endpoint(&ep(
+            "engage.cloudflareclient.com",
+            "162.159.192.7:0",
+            "",
+        ))
+        .unwrap();
+        assert_eq!(sa.port(), 2408);
+    }
+
+    #[test]
+    fn fallback_rejects_invalid_v4_text() {
+        // 非法 IPv4 文本 → Err，不 panic
+        let err = fallback_endpoint(&ep(
+            "engage.cloudflareclient.com:2408",
+            "not.an.ip:0",
+            "",
+        ))
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("fallback parse failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn fallback_rejects_garbage_port_uses_default() {
+        // host 端口非数字 → 走默认 2408（容忍）
+        let sa = fallback_endpoint(&ep(
+            "engage.cloudflareclient.com:not-a-port",
+            "162.159.192.7:0",
+            "",
+        ))
+        .unwrap();
+        assert_eq!(sa.port(), 2408);
+    }
 }
