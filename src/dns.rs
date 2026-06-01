@@ -135,7 +135,7 @@ impl Resolver {
 
     async fn query_one(&self, query: &[u8], server: SocketAddrV4) -> Result<Ipv4Addr> {
         let sock = self.tunnel.bind_udp()?;
-        sock.send_to(query, server).await?;
+        sock.send_to(query, SocketAddr::V4(server)).await?;
         let mut buf = vec![0u8; 1500];
         let (n, _src) = sock.recv_from(&mut buf, self.timeout).await?;
         parse_dns_answer_a(&buf[..n])

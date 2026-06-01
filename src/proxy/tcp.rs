@@ -138,7 +138,7 @@ async fn handle(
     }
 
     // 解析目标 → IPv4（走 Resolver，可隧道内或宿主）
-    let upstream_addr = match resolve_target_v4(&resolver, &target).await {
+    let upstream_addr = match resolve_target(&resolver, &target).await {
         Ok(a) => a,
         Err(e) => {
             warn!(%peer, %target, error = %e, "address resolution failed");
@@ -254,10 +254,12 @@ async fn handle_udp_associate(
     Ok(())
 }
 
-async fn resolve_target_v4(resolver: &Resolver, target: &TargetAddr) -> Result<SocketAddr> {
+/// v0.2.0：双栈解析。
+/// - IP 类型目标：原样返回（v4 或 v6 都可）
+/// - Domain：当前先解析为 v4（happy eyeballs 留 v0.2.1）
+async fn resolve_target(resolver: &Resolver, target: &TargetAddr) -> Result<SocketAddr> {
     match target {
-        TargetAddr::Ip(SocketAddr::V4(v4)) => Ok(SocketAddr::V4(*v4)),
-        TargetAddr::Ip(SocketAddr::V6(v6)) => Err(Error::DnsNoIpv4(v6.to_string())),
+        TargetAddr::Ip(sa) => Ok(*sa),
         TargetAddr::Domain(host, port) => {
             let sa4 = resolver.resolve_v4(host, *port).await?;
             Ok(SocketAddr::V4(sa4))

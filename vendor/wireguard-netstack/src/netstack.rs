@@ -16,10 +16,10 @@ use smoltcp::socket::udp::{
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Packet,
-    TcpPacket,
+    Ipv6Address, TcpPacket,
 };
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -152,6 +152,7 @@ impl NetStack {
     /// Create a new network stack backed by a WireGuard tunnel.
     pub fn new(wg_tunnel: Arc<WireGuardTunnel>) -> Arc<Self> {
         let tunnel_ip = wg_tunnel.tunnel_ip();
+        let tunnel_ipv6 = wg_tunnel.tunnel_ipv6();
         let mtu = wg_tunnel.mtu() as usize;
         let wg_tx = wg_tunnel.outgoing_sender();
 
@@ -164,26 +165,41 @@ impl NetStack {
         // Create the interface
         let mut interface = Interface::new(config, &mut device, Instant::now());
 
-        // Configure the interface with our tunnel IP
+        // v0.2.0：同时配置 v4 与 v6 地址（双栈）
         interface.update_ip_addrs(|addrs| {
+            let v4_octets = tunnel_ip.octets();
             addrs
                 .push(IpCidr::new(
-                    IpAddress::v4(
-                        tunnel_ip.octets()[0],
-                        tunnel_ip.octets()[1],
-                        tunnel_ip.octets()[2],
-                        tunnel_ip.octets()[3],
-                    ),
+                    IpAddress::v4(v4_octets[0], v4_octets[1], v4_octets[2], v4_octets[3]),
                     32,
                 ))
-                .unwrap();
+                .expect("push tunnel v4 cidr");
+
+            if let Some(v6) = tunnel_ipv6 {
+                let seg = v6.segments();
+                addrs
+                    .push(IpCidr::new(
+                        IpAddress::Ipv6(Ipv6Address::new(
+                            seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+                        )),
+                        128,
+                    ))
+                    .expect("push tunnel v6 cidr");
+                log::info!("netstack 配置双栈：v4={} v6={}", tunnel_ip, v6);
+            }
         });
 
-        // Set up routing - route everything through this interface
+        // 双栈默认路由：v4 走 0.0.0.0，v6 走 ::（WireGuard 隧道这一侧全部丢给对端）
         interface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(0, 0, 0, 0))
-            .unwrap();
+            .expect("v4 default route");
+        if tunnel_ipv6.is_some() {
+            interface
+                .routes_mut()
+                .add_default_ipv6_route(Ipv6Address::UNSPECIFIED)
+                .expect("v6 default route");
+        }
 
         // Create socket set
         let sockets = SocketSet::new(vec![]);
@@ -219,37 +235,56 @@ impl NetStack {
         inner.sockets.add(socket)
     }
 
-    /// Connect a TCP socket to the given address.
+    /// Connect a TCP socket to the given address. v0.2.0：v4 与 v6 都支持。
     pub fn connect(&self, handle: SocketHandle, addr: SocketAddr) -> Result<()> {
         let mut inner = self.inner.lock();
 
         let local_port = 49152 + (rand::random::<u16>() % 16384);
-        let local_addr = SocketAddrV4::new(self.wg_tunnel.tunnel_ip(), local_port);
 
-        let remote = match addr {
-            SocketAddr::V4(v4) => smoltcp::wire::IpEndpoint::new(
-                IpAddress::v4(
-                    v4.ip().octets()[0],
-                    v4.ip().octets()[1],
-                    v4.ip().octets()[2],
-                    v4.ip().octets()[3],
-                ),
-                v4.port(),
-            ),
-            SocketAddr::V6(_) => return Err(Error::Ipv6NotSupported),
+        let (remote, local, log_local) = match addr {
+            SocketAddr::V4(v4) => {
+                let oct = v4.ip().octets();
+                let remote_ep =
+                    IpEndpoint::new(IpAddress::v4(oct[0], oct[1], oct[2], oct[3]), v4.port());
+                let local_v4 = self.wg_tunnel.tunnel_ip();
+                let local_oct = local_v4.octets();
+                let local_ep = IpEndpoint::new(
+                    IpAddress::v4(local_oct[0], local_oct[1], local_oct[2], local_oct[3]),
+                    local_port,
+                );
+                (remote_ep, local_ep, format!("{}:{}", local_v4, local_port))
+            }
+            SocketAddr::V6(v6) => {
+                // 需要 tunnel_ipv6 才能拨 v6
+                let local_v6 = self
+                    .wg_tunnel
+                    .tunnel_ipv6()
+                    .ok_or(Error::Ipv6NotSupported)?;
+                let seg = v6.ip().segments();
+                let remote_ep = IpEndpoint::new(
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+                    )),
+                    v6.port(),
+                );
+                let local_seg = local_v6.segments();
+                let local_ep = IpEndpoint::new(
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        local_seg[0],
+                        local_seg[1],
+                        local_seg[2],
+                        local_seg[3],
+                        local_seg[4],
+                        local_seg[5],
+                        local_seg[6],
+                        local_seg[7],
+                    )),
+                    local_port,
+                );
+                (remote_ep, local_ep, format!("[{}]:{}", local_v6, local_port))
+            }
         };
 
-        let local = smoltcp::wire::IpEndpoint::new(
-            IpAddress::v4(
-                local_addr.ip().octets()[0],
-                local_addr.ip().octets()[1],
-                local_addr.ip().octets()[2],
-                local_addr.ip().octets()[3],
-            ),
-            local_addr.port(),
-        );
-
-        // Use destructuring to avoid split borrow issues
         let NetStackInner {
             ref mut interface,
             ref mut sockets,
@@ -261,7 +296,10 @@ impl NetStack {
             .connect(cx, remote, local)
             .map_err(|e| Error::TcpConnectGeneric(format!("TCP connect failed: {}", e)))?;
 
-        log::debug!("TCP socket connecting to {} from {}", addr, local_addr);
+        log::debug!("TCP socket connecting to {} from {}", addr, log_local);
+
+        // 避免 unused：仅用于 SocketAddrV6 import 抑制
+        let _ = std::marker::PhantomData::<SocketAddrV6>;
 
         Ok(())
     }
@@ -666,7 +704,17 @@ const UDP_PAYLOAD_BYTES: usize = 1500 * UDP_PKT_SLOTS;
 impl NetStack {
     /// 创建一个绑定到 `(tunnel_ip, local_port)` 的 UDP socket。传 `0` 让实现
     /// 从 ephemeral 范围（49152-65535）随机分配一个端口。
+    /// v0.2.0：`prefer_v6 = true` 时优先绑 IPv6 tunnel address（如果可用）。
     pub fn create_udp_socket(self: &Arc<Self>, local_port: u16) -> Result<UdpHandle> {
+        self.create_udp_socket_with(local_port, false)
+    }
+
+    /// v0.2.0：可指定 v4 / v6 binding。
+    pub fn create_udp_socket_with(
+        self: &Arc<Self>,
+        local_port: u16,
+        prefer_v6: bool,
+    ) -> Result<UdpHandle> {
         let port = if local_port == 0 {
             49152 + (rand::random::<u16>() % 16384)
         } else {
@@ -685,14 +733,34 @@ impl NetStack {
         );
         let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
 
-        let tunnel_ip = self.wg_tunnel.tunnel_ip();
+        let (addr, log_str) = if prefer_v6 {
+            if let Some(v6) = self.wg_tunnel.tunnel_ipv6() {
+                let seg = v6.segments();
+                (
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+                    )),
+                    format!("[{}]", v6),
+                )
+            } else {
+                let v4 = self.wg_tunnel.tunnel_ip();
+                let oct = v4.octets();
+                (
+                    IpAddress::v4(oct[0], oct[1], oct[2], oct[3]),
+                    v4.to_string(),
+                )
+            }
+        } else {
+            let v4 = self.wg_tunnel.tunnel_ip();
+            let oct = v4.octets();
+            (
+                IpAddress::v4(oct[0], oct[1], oct[2], oct[3]),
+                v4.to_string(),
+            )
+        };
+
         let listen = IpListenEndpoint {
-            addr: Some(IpAddress::v4(
-                tunnel_ip.octets()[0],
-                tunnel_ip.octets()[1],
-                tunnel_ip.octets()[2],
-                tunnel_ip.octets()[3],
-            )),
+            addr: Some(addr),
             port,
         };
 
@@ -701,7 +769,7 @@ impl NetStack {
             .map_err(|e| Error::TcpConnectGeneric(format!("UDP bind failed: {}", e)))?;
 
         let handle = inner.sockets.add(socket);
-        log::debug!("UDP socket bound to {}:{}", tunnel_ip, port);
+        log::debug!("UDP socket bound to {}:{}", log_str, port);
 
         Ok(UdpHandle {
             netstack: Arc::clone(self),
@@ -712,16 +780,23 @@ impl NetStack {
 
     /// 通过 `handle` 向 `dest` 发送一个 UDP 数据报。Ok 表示 smoltcp 已经接收
     /// 净荷；后续由 netstack 的 poll 循环把它真正发出去。
-    pub fn udp_send_to(&self, handle: SocketHandle, payload: &[u8], dest: SocketAddrV4) -> Result<()> {
-        let endpoint = IpEndpoint::new(
-            IpAddress::v4(
-                dest.ip().octets()[0],
-                dest.ip().octets()[1],
-                dest.ip().octets()[2],
-                dest.ip().octets()[3],
-            ),
-            dest.port(),
-        );
+    /// v0.2.0：支持 v4 与 v6 目标。
+    pub fn udp_send_to(&self, handle: SocketHandle, payload: &[u8], dest: SocketAddr) -> Result<()> {
+        let endpoint = match dest {
+            SocketAddr::V4(v4) => {
+                let oct = v4.ip().octets();
+                IpEndpoint::new(IpAddress::v4(oct[0], oct[1], oct[2], oct[3]), v4.port())
+            }
+            SocketAddr::V6(v6) => {
+                let seg = v6.ip().segments();
+                IpEndpoint::new(
+                    IpAddress::Ipv6(Ipv6Address::new(
+                        seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+                    )),
+                    v6.port(),
+                )
+            }
+        };
         let mut inner = self.inner.lock();
         let socket = inner.sockets.get_mut::<UdpSocket>(handle);
         socket
@@ -731,12 +806,12 @@ impl NetStack {
     }
 
     /// 尝试从 `handle` 取出一个数据报。当前没有数据时返回 `Ok(None)`，
-    /// 调用方需要稍后重试。
+    /// 调用方需要稍后重试。v0.2.0：返回的源地址支持 v4/v6。
     pub fn udp_try_recv(
         &self,
         handle: SocketHandle,
         buf: &mut [u8],
-    ) -> Result<Option<(usize, SocketAddrV4)>> {
+    ) -> Result<Option<(usize, SocketAddr)>> {
         let mut inner = self.inner.lock();
         let socket = inner.sockets.get_mut::<UdpSocket>(handle);
         if !socket.can_recv() {
@@ -745,13 +820,27 @@ impl NetStack {
         let (n, meta) = socket
             .recv_slice(buf)
             .map_err(|e| Error::TcpRecv(format!("UDP recv: {}", e)))?;
-        let v4 = match meta.endpoint.addr {
-            IpAddress::Ipv4(a) => SocketAddrV4::new(
+        let src = match meta.endpoint.addr {
+            IpAddress::Ipv4(a) => SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(a.octets()[0], a.octets()[1], a.octets()[2], a.octets()[3]),
                 meta.endpoint.port,
-            ),
+            )),
+            IpAddress::Ipv6(a) => {
+                let oct = a.octets();
+                let v6 = Ipv6Addr::new(
+                    u16::from_be_bytes([oct[0], oct[1]]),
+                    u16::from_be_bytes([oct[2], oct[3]]),
+                    u16::from_be_bytes([oct[4], oct[5]]),
+                    u16::from_be_bytes([oct[6], oct[7]]),
+                    u16::from_be_bytes([oct[8], oct[9]]),
+                    u16::from_be_bytes([oct[10], oct[11]]),
+                    u16::from_be_bytes([oct[12], oct[13]]),
+                    u16::from_be_bytes([oct[14], oct[15]]),
+                );
+                SocketAddr::V6(SocketAddrV6::new(v6, meta.endpoint.port, 0, 0))
+            }
         };
-        Ok(Some((n, v4)))
+        Ok(Some((n, src)))
     }
 }
 
@@ -769,15 +858,16 @@ impl UdpHandle {
     }
 
     /// 发送一个数据报，并主动 poll 一次让 WireGuard 立即把它转出去
-    pub async fn send_to(&self, payload: &[u8], dest: SocketAddrV4) -> Result<()> {
+    /// v0.2.0：接受 SocketAddr（v4/v6 都可）
+    pub async fn send_to(&self, payload: &[u8], dest: SocketAddr) -> Result<()> {
         self.netstack.udp_send_to(self.handle, payload, dest)?;
         self.netstack.poll();
         Ok(())
     }
 
     /// 接收一个数据报。1ms 节奏忙轮询，最多等待 `timeout`；超时返回
-    /// `Err(ReadTimeout)`。
-    pub async fn recv_from(&self, buf: &mut [u8], timeout: Duration) -> Result<(usize, SocketAddrV4)> {
+    /// `Err(ReadTimeout)`。v0.2.0：返回 SocketAddr（v4/v6）。
+    pub async fn recv_from(&self, buf: &mut [u8], timeout: Duration) -> Result<(usize, SocketAddr)> {
         let start = std::time::Instant::now();
         loop {
             self.netstack.poll();

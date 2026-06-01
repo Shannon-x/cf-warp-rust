@@ -1,0 +1,37 @@
+# Vendored fork of warp-wireguard-gen v0.1.6（warp-rust）
+# 改动：API 响应里的 `addresses.v6` 解析并塞入 WireGuardConfig 的新字段 `tunnel_ipv6`
+[package]
+name = "warp-wireguard-gen"
+version = "0.1.6"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["Lorenzo Rizzotti <dev@dreaming.codes>", "warp-rust contributors"]
+repository = "https://github.com/Dreaming-Codes/wireguard-hyper-connector"
+description = "Generate WireGuard configs by registering with Cloudflare WARP (warp-rust fork: v6 support)"
+keywords = ["wireguard", "warp", "cloudflare", "vpn"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = []
+serde = ["dep:serde_json"]
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "1.0"
+
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+chrono = "0.4"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
+# 通过 [patch.crates-io] 重定向到本地 fork
+wireguard-netstack = "0.3"

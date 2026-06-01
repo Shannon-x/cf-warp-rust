@@ -335,8 +335,9 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 
 ## 已知限制与注意事项
 
-- **仅支持 IPv4。** `wireguard-netstack` 目前不支持 IPv6。SOCKS5 客户端给我们 v6 目标地址时会得到 `HostUnreachable` 回复。
-- **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。
+- **支持 IPv4 与 IPv6 出口（v0.2.0+）。** WARP 给的 `addresses.v6` 会被解析并配置到 netstack；SOCKS5 客户端给 IPv6 目标地址、或 SOCKS5 UDP ATYP=0x04，都能通过 WARP IPv6 出口访问。Domain ATYP 当前先解 A 记录走 v4，AAAA happy-eyeballs 待 v0.2.1。
+- **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。开启 `[dns].mode = "tunnel"` 后域名走隧道内 1.1.1.1:53。
+- **SOCKS5 BIND 不支持**，**UDP 分片不支持**：协议层留作 v0.3+ 增强。
 - **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE` 与 [SECURITY.md](SECURITY.md)。
 
 ## 代码结构
