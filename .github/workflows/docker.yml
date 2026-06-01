@@ -1,5 +1,9 @@
 name: docker
 
+# 多架构镜像构建。采用 Docker 官方推荐的「分 runner 并行 build + manifest 合并」
+# 模式，避免 QEMU 模拟编译 Rust ARM（动辄 30+ 分钟）。
+# 参考：https://docs.docker.com/build/ci/github-actions/multi-platform/
+
 on:
   push:
     branches: [main]
@@ -8,7 +12,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 同一引用并发触发时，旧的取消掉
 concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: true
@@ -17,26 +20,94 @@ permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/cf-warp-rust
+
 jobs:
-  build-push:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            # GitHub 2025-01 起免费提供的 ARM 原生 runner；公开仓库可用
+            runs-on: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 跨架构编译需要 QEMU 模拟器
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 仅在 push 到 main 或 tag 时登录并推送；PR 阶段只验证可构建
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=cf-warp-rust
+            org.opencontainers.image.description=Long-running SOCKS5+UDP proxy through Cloudflare WARP
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          # 关键：push-by-digest 模式 — 镜像推送但不带标签，后续 manifest 步骤再绑标签
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,scope=${{ matrix.suffix }},mode=max
+          provenance: false
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge & publish manifest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -44,8 +115,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # 镜像 owner 强制小写（GHCR 要求）
-          images: ghcr.io/${{ github.repository_owner }}/cf-warp-rust
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -53,21 +123,14 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.title=cf-warp-rust
-            org.opencontainers.image.description=Long-running SOCKS5+UDP proxy through Cloudflare WARP, in Rust
-            org.opencontainers.image.licenses=GPL-3.0-or-later
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # GHA cache 加速重复构建
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+      - name: Create & push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
