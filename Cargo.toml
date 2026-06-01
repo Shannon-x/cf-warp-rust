@@ -1,0 +1,62 @@
+[package]
+name = "warp-rust"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Long-running SOCKS5 proxy through Cloudflare WARP, with auto-register and self-healing"
+authors = ["warp-rust contributors"]
+
+[[bin]]
+name = "warp-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# WARP & WireGuard userspace stack (GPL-3.0; their licenses propagate to us)
+warp-wireguard-gen = { version = "0.1", features = ["serde"] }
+wireguard-netstack = "0.3"
+
+# SOCKS5 server
+fast-socks5 = "1"
+
+# Config / CLI / persistence
+clap = { version = "4", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+humantime-serde = "1"
+tempfile = "3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error
+anyhow = "1"
+thiserror = "2"
+
+# Observability (M3)
+axum = "0.8"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# Config hot-reload (M3)
+notify = "8"
+
+# Util
+arc-swap = "1"
+bytes = "1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+
+# Redirect both our direct dependency AND warp-wireguard-gen's transitive
+# dependency to our fork (which exposes UdpHandle).
+[patch.crates-io]
+wireguard-netstack = { path = "vendor/wireguard-netstack" }

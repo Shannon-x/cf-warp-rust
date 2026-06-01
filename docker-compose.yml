@@ -1,0 +1,15 @@
+# 个人使用的最小 compose 配置：将 SOCKS5 与 metrics 绑定到宿主机 loopback
+# 凭据持久化到 ./data，配置文件以只读方式挂入
+services:
+  warp-rust:
+    build: .
+    container_name: warp-rust
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"   # SOCKS5
+      - "127.0.0.1:9090:9090"   # Prometheus
+    volumes:
+      - ./data:/app/data
+      - ./config.toml:/app/config.toml:ro
+    environment:
+      - RUST_LOG=info,warp_rust=info

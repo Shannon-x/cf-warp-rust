@@ -1,0 +1,62 @@
+# 本地 fork：wireguard-netstack v0.3.0 + UDP 扩展
+# 上游 base commit：7e6ea79e241feb177c3fb3cfed4e793b1a594584
+# 相对上游的改动：
+#   - 去掉了 workspace 相对引用，让本 crate 可以独立编译
+#   - 在 smoltcp 中启用了 `socket-udp` feature
+#   - 新增用户态 UDP socket 支持（见 src/netstack.rs 里的 UdpHandle）
+#   - 在 lib.rs 中重新导出 UdpHandle
+[package]
+name = "wireguard-netstack"
+version = "0.3.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["Lorenzo Rizzotti <dev@dreaming.codes>", "warp-rust contributors"]
+repository = "https://github.com/Dreaming-Codes/wireguard-hyper-connector"
+description = "Userspace WireGuard tunnel with TCP/IP network stack (warp-rust fork with UDP support)"
+keywords = ["wireguard", "vpn", "tunnel", "networking"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# WireGuard implementation
+gotatun = "0.2"
+
+# 用户态 TCP/IP 栈。`socket-udp` 是本 fork 新增的
+smoltcp = { version = "0.12", default-features = false, features = [
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "std",
+    "log",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS (for DoH)
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "1.0"
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+bytes = "1"
+parking_lot = "0.12"
+rand = "0.10"
+base64 = "0.22"
+log = "0.4"
+
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+serde_ini = "0.2"
+
+# IP address handling
+ipnet = "2"
+
+# Socket options
+socket2 = "0.6"
+
+# For zerocopy traits
+zerocopy = "0.8"

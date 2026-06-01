@@ -1,0 +1,56 @@
+# warp-rust 配置文件示例
+# 所有字段都可以通过环境变量覆盖，例如 WARP_RUST_SERVER__BIND=0.0.0.0:1080
+# （`__` 分隔表段名和字段名）
+
+[server]
+# SOCKS5 监听地址。个人本机使用绑 127.0.0.1，需要对外暴露时改成 0.0.0.0
+bind = "127.0.0.1:1080"
+
+# 启用用户名/密码鉴权时取消注释；整个表段省略 = 无鉴权
+# [server.auth]
+# username = "me"
+# password = "..."
+
+[logging]
+# tracing 的 env-filter 过滤器；环境变量 RUST_LOG 会优先于此处的值
+level = "info,warp_rust=debug,wireguard_netstack=info"
+# 输出格式：pretty | compact | json
+format = "pretty"
+
+[warp]
+# 凭据与身份池目录
+data_dir = "./data"
+# 注册时上报给 Cloudflare 的设备型号字符串（仪表盘展示用）
+device_model = "warp-rust"
+# 可选的 WARP+ 许可证 key（用真 1.1.1.1 客户端购买的才有效，referral 来的无效）
+# license_key = "xxxxxxxx-xxxxxxxx-xxxxxxxx"
+# 周期重新拉取一次 WireGuard 配置。设 "0s" 关闭
+refresh_interval = "24h"
+# 两次重注册之间的最小冷却（防风暴；Cloudflare 注册接口对源 IP 有限流）
+register_cooldown = "10m"
+
+[health]
+# 健康探针节奏（每多少秒拨号一次 1.1.1.1:443，确认隧道通畅）
+interval = "30s"
+# 单次探针超时
+timeout = "8s"
+
+[recovery]
+# 自愈阶梯：连续失败几次触发对应级别的恢复动作
+reconnect_after        = 1   # 1 次失败 → 用同一配置重连
+rebuild_config_after   = 3   # 3 次失败 → 重新向 Cloudflare 拉取一份新配置
+reregister_after       = 5   # 5 次失败 → 丢弃 account.json，重新注册账号
+rotate_identity_after  = 10  # 10 次失败 → 从 data/identities/ 取下一个身份替换
+# 每次重连前的指数退避
+backoff_min = "500ms"
+backoff_max = "30s"
+
+[metrics]
+# Prometheus /metrics 端点；enabled=false 时不会监听端口
+enabled = true
+bind = "127.0.0.1:9090"
+
+[hot_reload]
+# 监听本配置文件的变化。v1 行为：变化时仅重新解析校验，把结果写入日志；
+# 非平凡字段（监听地址、日志级别等）仍需重启才能生效
+enabled = true

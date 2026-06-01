@@ -1,0 +1,5 @@
+target/
+data/
+config.toml
+*.swp
+.DS_Store
