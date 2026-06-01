@@ -43,8 +43,8 @@ pub async fn serve(cfg: MetricsConfig, cancel: CancellationToken) -> Result<()> 
     info!(%addr, "metrics endpoint listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { cancel.cancelled().await });
+    let serve =
+        axum::serve(listener, app).with_graceful_shutdown(async move { cancel.cancelled().await });
 
     if let Err(e) = serve.await {
         warn!(error = %e, "metrics server exited with error");

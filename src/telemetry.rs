@@ -14,11 +14,18 @@ pub fn init(cfg: &LoggingConfig) {
             registry.with(fmt::layer().with_target(true)).init();
         }
         LogFormat::Compact => {
-            registry.with(fmt::layer().compact().with_target(true)).init();
+            registry
+                .with(fmt::layer().compact().with_target(true))
+                .init();
         }
         LogFormat::Json => {
             registry
-                .with(fmt::layer().json().with_target(true).with_current_span(false))
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_current_span(false),
+                )
                 .init();
         }
     }

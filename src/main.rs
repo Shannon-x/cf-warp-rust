@@ -109,7 +109,10 @@ async fn run(cli: Cli) -> Result<()> {
     });
 
     // 7. 配置文件热重载 watcher
-    info!(hot_reload_enabled = cfg.hot_reload.enabled, "hot reload status");
+    info!(
+        hot_reload_enabled = cfg.hot_reload.enabled,
+        "hot reload status"
+    );
     if cfg.hot_reload.enabled {
         let abs_path = std::fs::canonicalize(&cli.config).unwrap_or_else(|_| cli.config.clone());
         config_watch::spawn(abs_path, cancel.clone());

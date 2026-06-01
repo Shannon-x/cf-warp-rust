@@ -9,26 +9,206 @@
 - **用户态 WireGuard**，基于 [`wireguard-netstack`](https://crates.io/crates/wireguard-netstack)（本仓库在 `vendor/` 下做了 fork，新增 UDP 暴露）。**无需 `wg-quick`、无需 TUN 设备、无需 root**。
 - **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。健康探针每 30 秒通过隧道内拨号一次。
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
-- **Prometheus 指标** 暴露在 `/metrics`（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
-- **配置热重载** — `config.toml` 改动会被监听并立即解析校验，TOML 语法错或字段错会马上在日志里报告。需要重启才能生效的字段（监听地址、日志级别等）也会在日志里写明。
-- **Docker 部署就绪**，多阶段构建到 distroless 运行时镜像。
+- **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
+- **配置热重载** — `config.toml` 改动会被监听并立即解析校验，TOML 语法错或字段错会马上在日志里报告。
+- **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl、Linux aarch64-musl、macOS Intel、macOS Apple Silicon）。
 
-## 快速开始
+---
+
+## 🚀 一键脚本（推荐用法）
+
+仓库 `scripts/` 下有三个脚本，按你想要的「省心程度」挑一个：
+
+| 脚本 | 用法 | 适合场景 |
+| --- | --- | --- |
+| **`quickstart.sh`** | 全交互式，逐步问你端口 / 暴露范围 / 鉴权 | 第一次用、不熟悉参数 |
+| **`run-binary.sh`** | 一行命令带参数，自动 `cargo build` | 本机或服务器跑二进制 |
+| **`run-docker.sh`** | 一行命令带参数，自动 `docker pull` 或 build | 想要容器隔离、systemd 友好 |
+
+### 30 秒上手：最简模式（本机自用，**无需密码**）
+
+```bash
+git clone https://github.com/Shannon-x/cf-warp-rust.git
+cd cf-warp-rust
+
+# 二进制方式（前台跑）
+./scripts/run-binary.sh
+# → 监听 127.0.0.1:1080，无任何鉴权（loopback only，外人到不了）
+
+# 或容器方式（后台跑，自动重启）
+./scripts/run-docker.sh
+# → 拉 ghcr.io/shannon-x/cf-warp-rust:latest，映射到 127.0.0.1:1080
+```
+
+验证一下流量真的从 Cloudflare 出去：
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace
+# 关键字段：
+#   ip=<Cloudflare 出口 IP>     ← 不是你的真实 IP
+#   warp=on                      ← 走了 WARP
+#   colo=NRT                     ← 出口数据中心代码
+```
+
+### ⚠️ 密码什么时候才需要？
+
+**只有把端口绑到 `0.0.0.0` 让外部能访问时（加 `--expose`），脚本才会强制要求密码。** 默认 `127.0.0.1` 模式下完全不要密码：
+
+| 绑定地址 | 谁能访问 | 鉴权 |
+| --- | --- | --- |
+| `127.0.0.1`（默认） | 仅本机其它进程 | ❌ **不需要密码** |
+| `0.0.0.0`（`--expose`） | 互联网/局域网都能访问 | ✅ **强制强密码** |
+
+设计哲学：默认安全且方便——本地无打扰，对外不裸奔。
+
+### 详细用法：`run-binary.sh`
+
+```bash
+# 用法：./scripts/run-binary.sh [PORT] [--expose [--user U] [--pass P]]
+# PORT 不传默认 1080
+
+# 最简：默认端口 1080，本机无鉴权
+./scripts/run-binary.sh
+
+# 换端口
+./scripts/run-binary.sh 8964
+
+# 对外暴露 + 自动生成 24 位强密码（推荐做法）
+./scripts/run-binary.sh 1080 --expose
+# 输出示例：
+#   ✓ 自动生成强密码：a8KZmpQfXn5RvtLs0cYHbW3D
+#     请立即妥善保存。
+#   ▸ SOCKS5 监听：0.0.0.0:1080
+#   ▸ 鉴权：warp / 密码见上方或 ./config.runbin.toml
+
+# 对外暴露 + 自定义强密码（≥16 位、含大写+小写+数字，否则拒绝启动）
+./scripts/run-binary.sh 1080 --expose --user shannon --pass 'MyVeryStrong16Pass'
+```
+
+### 详细用法：`run-docker.sh`
+
+```bash
+# 用法：./scripts/run-docker.sh [PORT] [--expose [--user U] [--pass P]] | --stop
+
+# 启动（默认本机 127.0.0.1:1080）
+./scripts/run-docker.sh
+
+# 启动到 8964 端口
+./scripts/run-docker.sh 8964
+
+# 对外暴露 + 自动强密码
+./scripts/run-docker.sh 1080 --expose
+
+# 对外暴露 + 自定义强密码
+./scripts/run-docker.sh 1080 --expose --user me --pass 'MyVeryStrong16Pass'
+
+# 停止
+./scripts/run-docker.sh --stop
+
+# 指定镜像版本（默认 :latest）
+WARP_RUST_IMAGE=ghcr.io/shannon-x/cf-warp-rust:v0.1.0 ./scripts/run-docker.sh
+```
+
+容器以 `--restart unless-stopped` 启动，机器重启会自动拉起；镜像优先 `docker pull`，拉不到（如离线）会自动用本地 Dockerfile 构建作为兜底。
+
+### 详细用法：`quickstart.sh`（完全交互式）
+
+```bash
+./scripts/quickstart.sh
+```
+
+会依次问你：
+
+1. **运行模式**：1=二进制（cargo build），2=Docker 容器
+2. **SOCKS5 端口**：默认 1080
+3. **绑定范围**：L=仅本机 `127.0.0.1`（推荐），E=对外 `0.0.0.0`
+   - 选 E 时会进入密码流程：输入或留空自动生成
+4. 若 `config.toml` 已存在，是否覆盖
+
+最后自动生成配置并启动。
+
+### 三种用法对照
+
+```bash
+# 本机自用，最简
+./scripts/run-binary.sh
+
+# 本机自用 + Docker
+./scripts/run-docker.sh
+
+# 公网对外（自动强密码）
+./scripts/run-binary.sh 1080 --expose
+./scripts/run-docker.sh 1080 --expose
+
+# 公网对外 + 自带密码
+./scripts/run-binary.sh 1080 --expose --user me --pass 'MyVeryStrong16Pass'
+./scripts/run-docker.sh 1080 --expose --user me --pass 'MyVeryStrong16Pass'
+```
+
+---
+
+## 📦 直接下载预编译二进制（不用 cargo）
+
+去 [GitHub Releases](https://github.com/Shannon-x/cf-warp-rust/releases) 下载对应平台的 tar.gz：
+
+| 平台 | 文件名 |
+| --- | --- |
+| Linux x86_64（musl，静态链接，适合任何发行版） | `warp-rust-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64（musl，树莓派/Graviton 等） | `warp-rust-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `warp-rust-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon（M1/M2/M3+） | `warp-rust-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+
+每个包都附带 `.sha256` 校验文件。解压后内含 `warp-rust` 二进制、`config.toml.example`、`scripts/` 与文档。
+
+```bash
+# 例：M1 Mac
+curl -sSL -O https://github.com/Shannon-x/cf-warp-rust/releases/latest/download/warp-rust-v0.1.0-aarch64-apple-darwin.tar.gz
+tar xzf warp-rust-v0.1.0-aarch64-apple-darwin.tar.gz
+cd warp-rust-v0.1.0-aarch64-apple-darwin
+
+# 仍然可以用一键脚本（脚本会检测到二进制已存在，跳过 cargo build）
+./scripts/run-binary.sh
+
+# 或直接跑
+cp config.toml.example config.toml
+./warp-rust --config config.toml
+```
+
+---
+
+## 🐳 Docker 镜像
+
+多架构镜像自动发布到 GitHub Container Registry：
+
+```bash
+# 拉取最新 latest（main 分支构建）
+docker pull ghcr.io/shannon-x/cf-warp-rust:latest
+
+# 或指定版本
+docker pull ghcr.io/shannon-x/cf-warp-rust:v0.1.0
+
+# 直接 docker run（参考脚本的等价写法）
+docker run -d \
+  --name warp-rust \
+  --restart unless-stopped \
+  -p 127.0.0.1:1080:1080 \
+  -p 127.0.0.1:9090:9090 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/config.toml:/app/config.toml:ro \
+  ghcr.io/shannon-x/cf-warp-rust:latest
+```
+
+镜像内默认 `bind = 0.0.0.0:1080`，对外是否暴露由宿主 `-p` 决定。强烈建议 `-p 127.0.0.1:1080:1080` 只绑 loopback，外部访问通过 SSH/Tailscale 转发更安全。
+
+---
+
+## 手动编译
 
 ```bash
 cp config.toml.example config.toml
 cargo build --release
 ./target/release/warp-rust --config config.toml
 ```
-
-另开终端：
-
-```bash
-curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace
-# 期望看到：warp=on （如果设置了 license_key 还会有 warp=plus）
-```
-
-UDP 链路验证可用任意支持 SOCKS5 UDP 的客户端；本仓库 `tests/` 目录里有一个小 Python 脚本，通过代理对 1.1.1.1:53 发 DNS 查询。
 
 ## 配置项
 
@@ -37,16 +217,16 @@ UDP 链路验证可用任意支持 SOCKS5 UDP 的客户端；本仓库 `tests/` 
 | 表段 | 字段 | 说明 |
 | --- | --- | --- |
 | `[server]` | `bind` | SOCKS5 监听地址。默认 `127.0.0.1:1080` |
-| `[server.auth]` | `username` / `password` | 可选；整个表段省略则无认证（仅 loopback 推荐） |
+| `[server.auth]` | `username` / `password` | 可选；整个表段省略则无认证（loopback 推荐） |
 | `[warp]` | `license_key` | WARP+ 订阅密钥，可选 |
-| `[warp]` | `refresh_interval` | 周期刷新 WireGuard 配置间隔。默认 24h |
+| `[warp]` | `refresh_interval` | 周期刷新 WireGuard 配置的间隔。默认 24h |
 | `[warp]` | `register_cooldown` | 两次重注册之间的最小间隔。默认 10m |
 | `[health]` | `interval` / `timeout` | 探针节奏（隧道内拨号 1.1.1.1:443） |
-| `[recovery]` | `reconnect_after`、`rebuild_config_after`、`reregister_after`、`rotate_identity_after` | 触发每一级恢复动作的连续失败次数阈值 |
+| `[recovery]` | `reconnect_after` 等四档 | 触发每一级恢复动作的连续失败次数阈值 |
 | `[metrics]` | `enabled` / `bind` | Prometheus `/metrics` 端点 |
 | `[hot_reload]` | `enabled` | 是否监听配置文件变化 |
 
-所有字段也可以用环境变量提供：`WARP_RUST_SERVER__BIND=0.0.0.0:1080`、`WARP_RUST_WARP__LICENSE_KEY=...`，以此类推（`__` 分隔表段与字段名）。
+所有字段都可以用环境变量覆盖：`WARP_RUST_SERVER__BIND=0.0.0.0:1080`、`WARP_RUST_WARP__LICENSE_KEY=...`（`__` 分隔表段与字段名）。
 
 ## 身份池（多账号轮转）
 
@@ -69,7 +249,7 @@ done
 
 ## 部署
 
-### systemd
+### systemd（Linux 长驻）
 
 ```ini
 [Unit]
@@ -90,7 +270,7 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 ```
 
-### Docker
+### Docker Compose
 
 ```bash
 docker compose up -d
@@ -111,7 +291,7 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 
 - **仅支持 IPv4。** `wireguard-netstack` 目前不支持 IPv6。SOCKS5 客户端给我们 v6 目标地址时会得到 `HostUnreachable` 回复。
 - **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。
-- **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE`。
+- **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE` 与 [SECURITY.md](SECURITY.md)。
 
 ## 代码结构
 
@@ -138,8 +318,22 @@ src/
 
 vendor/
 └── wireguard-netstack/      上游 fork：新增 smoltcp UDP socket 暴露（见 Cargo.toml）
+
+scripts/
+├── quickstart.sh            一键交互式启动
+├── run-binary.sh            一键二进制启动（参数化）
+└── run-docker.sh            一键容器启动（参数化）
+
+.github/workflows/
+├── ci.yml                   fmt + clippy + test + release build
+├── docker.yml               多架构镜像构建（amd64 + arm64）推 GHCR
+└── release.yml              多平台二进制构建 + 发布到 Releases
 ```
 
 ## 许可证
 
 GPL-3.0-or-later，详见 `LICENSE`。
+
+## 安全
+
+详细安全模型（零侵入网络、对宿主路由的影响、强密码策略、漏洞报告渠道）见 [SECURITY.md](SECURITY.md)。

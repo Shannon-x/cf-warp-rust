@@ -27,8 +27,7 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(dir)?;
     std::io::Write::write_all(&mut tmp, &bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|e| Error::Io(e.error))?;
+    tmp.persist(path).map_err(|e| Error::Io(e.error))?;
 
     // Unix 下把权限锁到 0600，避免凭据被其他用户读取
     #[cfg(unix)]
