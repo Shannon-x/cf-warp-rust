@@ -122,8 +122,13 @@ async fn forward_client_to_tunnel(
         UdpTarget::V4(sa) => SocketAddr::V4(sa),
         UdpTarget::V6(sa) => SocketAddr::V6(sa),
         UdpTarget::Domain(host, port) => {
-            // v0.2.0：通过 Resolver 解析，先返 v4；后续可加 happy eyeballs
-            SocketAddr::V4(resolver.resolve_v4(&host, port).await?)
+            // v0.2.1：双栈解析；列表 v6 优先，UDP 不做 happy eyeballs（无握手语义），
+            // 直接挑第一个 (v6 优先) 发包
+            let candidates = resolver.resolve_dual(&host, port).await?;
+            candidates
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::other(format!("no candidates for {host}")))?
         }
     };
     tunnel_udp.send_to(parsed.payload, dest).await?;
