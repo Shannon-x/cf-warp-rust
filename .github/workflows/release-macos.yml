@@ -1,0 +1,82 @@
+name: release-macos
+
+# 异步构建 macOS 二进制，追加到现有 GitHub Release。
+# 单独拆出来是因为 GitHub Actions 的 macOS runner（尤其 macos-13 Intel）
+# 排队时间常常 10-30 分钟，会拖慢 Linux 发布。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '手动发布标签'
+        required: true
+        default: 'v0.0.0-manual'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runs-on: macos-13      # Intel runner
+          - target: aarch64-apple-darwin
+            runs-on: macos-latest  # Apple Silicon runner
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          NAME="warp-rust-${TAG}-${{ matrix.target }}"
+          mkdir -p dist "$NAME"
+          cp "target/${{ matrix.target }}/release/warp-rust" "$NAME/"
+          cp README.md LICENSE SECURITY.md config.toml.example "$NAME/"
+          mkdir -p "$NAME/scripts"
+          cp scripts/*.sh "$NAME/scripts/"
+          chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
+          tar czf "dist/${NAME}.tar.gz" "$NAME"
+          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+          ls -la dist/
+
+      - name: Append to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          # 不重新生成 release body，只追加文件
+          append_body: false
+          # 如果 release 还不存在（release.yml 还没跑完）就创建草稿
+          draft: false

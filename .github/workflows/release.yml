@@ -1,7 +1,9 @@
 name: release
 
-# 多平台预编译二进制。Linux 用原生 runner（amd64/arm64 各自 ubuntu-*）+ musl
-# 静态链接；macOS 用对应原生 runner。完全不用 cross / QEMU 模拟，速度快。
+# Linux 二进制发布——优先级最高，最快路径。
+# macOS 二进制由 release-macos.yml 异步追加到同一个 GitHub Release。
+# 拆分原因：macOS runner（尤其 macos-13）排队常超过 10 分钟，会拖累 Linux
+# 二进制的发布；而 99% 的部署场景都是 Linux 服务器。
 
 on:
   push:
@@ -9,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '手动发布标签（仅 workflow_dispatch）'
+        description: '手动发布标签'
         required: true
         default: 'v0.0.0-manual'
 
@@ -18,7 +20,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-linux-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,19 +33,9 @@ jobs:
           # Linux x86_64 musl — ubuntu-latest 原生
           - target: x86_64-unknown-linux-musl
             runs-on: ubuntu-latest
-            kind: linux
           # Linux aarch64 musl — GitHub 2025 公开提供的 ARM 原生 runner
           - target: aarch64-unknown-linux-musl
             runs-on: ubuntu-24.04-arm
-            kind: linux
-          # macOS Intel
-          - target: x86_64-apple-darwin
-            runs-on: macos-13
-            kind: macos
-          # macOS Apple Silicon
-          - target: aarch64-apple-darwin
-            runs-on: macos-latest
-            kind: macos
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
@@ -53,8 +45,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools (Linux)
-        if: matrix.kind == 'linux'
+      - name: Install musl-tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -84,11 +75,7 @@ jobs:
           cp scripts/*.sh "$NAME/scripts/"
           chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
           tar czf "dist/${NAME}.tar.gz" "$NAME"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
-          else
-            (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
-          fi
+          sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
           ls -la dist/
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
@@ -101,7 +88,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: publish release
+    name: publish release (linux)
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -125,23 +112,27 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           draft: false
+          # 关键：append_body=true 让 release-macos.yml 之后能追加文件
+          # 而不覆盖这里已经写好的 release body
+          append_body: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           body: |
             ## warp-rust ${{ github.ref_name }}
 
             通过 Cloudflare WARP 出口的 SOCKS5 + UDP ASSOCIATE 代理。
 
-            ### 一键启动
+            ### 一键启动（Linux）
 
             ```bash
-            # 解压（以 Linux x86_64 为例）
+            # x86_64
+            curl -sSL -O https://github.com/Shannon-x/cf-warp-rust/releases/download/${{ github.ref_name }}/warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
             tar xzf warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
             cd warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl
 
-            # 本机自用（无密码）
+            # 本机自用，无密码
             ./scripts/run-binary.sh
 
-            # 对外暴露（自动生成强密码）
+            # 对外暴露，自动生成强密码
             ./scripts/run-binary.sh 1080 --expose
             ```
 
@@ -152,6 +143,15 @@ jobs:
             # 或 :latest
             ```
 
-            详细使用方式见 [README](https://github.com/Shannon-x/cf-warp-rust#readme) 与 [SECURITY.md](https://github.com/Shannon-x/cf-warp-rust/blob/main/SECURITY.md)。
+            ### 产物清单
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Linux x86_64（musl，静态链接） | `warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux aarch64（musl，ARM 服务器/树莓派） | `warp-rust-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz` |
+            | Docker | `ghcr.io/shannon-x/cf-warp-rust:${{ github.ref_name }}` |
+
+            macOS 预编译二进制由独立的 `release-macos` workflow 异步发布到本页面，
+            通常会在 Linux 发布后几分钟到半小时内追加。
 
             ### 变更摘要
