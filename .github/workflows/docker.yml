@@ -22,7 +22,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/cf-warp-rust
+  # 硬编码小写：GHCR 要求 repository 名全小写，而 github.repository_owner
+  # 可能含大写（本仓库 owner 是 "Shannon-x"），直接拼会触发：
+  #   invalid reference format: repository name must be lowercase
+  IMAGE_NAME: shannon-x/cf-warp-rust
 
 jobs:
   build:
