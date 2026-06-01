@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# warp-rust install.sh  schema=6  (quieter log defaults + systemd LogRateLimit)
+# warp-rust install.sh  schema=7  (auto interactive by default, /dev/tty 局部重定向，curl|bash 也能交互)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -96,48 +96,64 @@ USER_NAME=""
 PASS=""
 VERSION=""
 ACTION="install"
-INTERACTIVE=0      # 默认非交互（curl|bash 模式最稳）
+# v0.2.3 / schema=7：默认 auto —— /dev/tty 可达就交互，cron/CI 自动走默认非交互
+# (auto | yes | no)
+INTERACTIVE_MODE="auto"
+# 是否传入了任何 install 参数；传了就强制非交互，免得 curl|bash --port 8964 还问一遍
+EXPLICIT_INSTALL_ARG=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port)              PORT="${2:?}"; shift ;;
-    --expose)            EXPOSE=1 ;;
-    --no-expose)         EXPOSE=0 ;;
-    --user)              USER_NAME="${2:?}"; shift ;;
-    --pass)              PASS="${2:?}"; shift ;;
+    --port)              PORT="${2:?}"; shift; EXPLICIT_INSTALL_ARG=1 ;;
+    --expose)            EXPOSE=1; EXPLICIT_INSTALL_ARG=1 ;;
+    --no-expose)         EXPOSE=0; EXPLICIT_INSTALL_ARG=1 ;;
+    --user)              USER_NAME="${2:?}"; shift; EXPLICIT_INSTALL_ARG=1 ;;
+    --pass)              PASS="${2:?}"; shift; EXPLICIT_INSTALL_ARG=1 ;;
     --version)           VERSION="${2:?}"; shift ;;
-    --interactive|-i)    INTERACTIVE=1 ;;
-    --yes|-y)            INTERACTIVE=0 ;;
+    --interactive|-i)    INTERACTIVE_MODE="yes" ;;
+    --yes|-y)            INTERACTIVE_MODE="no" ;;
+    --noninteractive)    INTERACTIVE_MODE="no" ;;
     --uninstall)         ACTION="uninstall" ;;
     --update)            ACTION="update" ;;
     --status)            ACTION="status" ;;
-    -h|--help)           sed -n '2,42p' "$0" 2>/dev/null; exit 0 ;;
+    -h|--help)           sed -n '2,46p' "$0" 2>/dev/null; exit 0 ;;
     *) die "未知参数：$1（用 --help 看帮助）" ;;
   esac
   shift
 done
 
-# 自动启用交互模式的条件：用户用本地 bash 跑（stdin 是 tty），不是 curl|bash
-# 这样：
-#   - `curl ... | sudo bash`  → stdin 不是 tty → 走非交互默认（秒装）
-#   - `wget install.sh; sudo bash install.sh` → stdin 是 tty → 自动交互
-#   - `curl ... | sudo bash -s -- -i` → 显式要求交互
-if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 0 ] && [ -t 0 ]; then
-  INTERACTIVE=1
-fi
+# 探测 /dev/tty 是否可读 —— curl|bash 时 stdin 是 pipe，但 /dev/tty 通常仍指向
+# 真实终端；只有 cron、systemd run、纯无 tty 容器才会探不到。
+tty_reachable() {
+  [ -r /dev/tty ] && [ -w /dev/tty ]
+}
 
-# ── 交互向导（显式 -i 或本地 bash 时启用）──────────────────────────────────
-if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
-  # 显式 -i 但 stdin 不是 tty 时，尝试从 /dev/tty 拿（curl|bash -i 场景）
-  if [ ! -t 0 ]; then
-    if [ -e /dev/tty ] && exec 0</dev/tty 2>/dev/null; then
-      :  # OK
-    else
-      warn "-i 启用但 /dev/tty 不可用，自动回退到非交互默认安装"
-      INTERACTIVE=0
-    fi
-  fi
+# 决定最终是否进交互
+final_interactive=0
+if [ "$ACTION" = "install" ]; then
+  case "$INTERACTIVE_MODE" in
+    yes)
+      if tty_reachable; then
+        final_interactive=1
+      else
+        warn "-i 启用但 /dev/tty 不可达（cron/CI/纯容器环境？），回退非交互默认"
+        final_interactive=0
+      fi
+      ;;
+    no)
+      final_interactive=0
+      ;;
+    auto)
+      # 没传任何 install 参数 + tty 可达 → 自动交互
+      if [ "$EXPLICIT_INSTALL_ARG" = 0 ] && tty_reachable; then
+        final_interactive=1
+      else
+        final_interactive=0
+      fi
+      ;;
+  esac
 fi
+INTERACTIVE="$final_interactive"
 
 if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   echo
@@ -149,8 +165,11 @@ if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   echo "  · 对外暴露（0.0.0.0）会${BOLD}强制${RESET}启用强密码鉴权"
   echo
 
+  # 关键：用局部 `< /dev/tty` 重定向，而非 exec </dev/tty
+  # 局部模式只影响这一次 read，更稳健、ssh+sudo+curl|bash 大多数环境都通
+
   while :; do
-    read -r -p "  SOCKS5 监听端口 [1080]: " ans || ans=""
+    read -r -p "  SOCKS5 监听端口 [1080]: " ans < /dev/tty || ans=""
     PORT="${ans:-1080}"
     [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] && break
     warn "端口非法，请输入 1-65535"
@@ -159,7 +178,7 @@ if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   while :; do
     echo
     echo "  绑定范围：L=仅本机 127.0.0.1（推荐）  E=对外 0.0.0.0（强制密码）"
-    read -r -p "  选择 [L/e]: " ans || ans="L"
+    read -r -p "  选择 [L/e]: " ans < /dev/tty || ans="L"
     case "${ans:-L}" in
       L|l|"")        EXPOSE=0; break ;;
       E|e|external)  EXPOSE=1; break ;;
@@ -169,11 +188,11 @@ if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
 
   if [ "$EXPOSE" = 1 ]; then
     echo
-    read -r -p "  SOCKS5 用户名 [warp]: " ans || ans=""
+    read -r -p "  SOCKS5 用户名 [warp]: " ans < /dev/tty || ans=""
     USER_NAME="${ans:-warp}"
     while :; do
       echo "  密码：直接回车 = 自动生成 24 位；或手输 ≥16 位含大小写+数字"
-      read -r -s -p "  密码: " pw || pw=""
+      read -r -s -p "  密码: " pw < /dev/tty || pw=""
       echo
       if [ -z "$pw" ]; then PASS=""; break; fi
       if [ "${#pw}" -ge 16 ] && [[ "$pw" =~ [A-Z] ]] && [[ "$pw" =~ [a-z] ]] && [[ "$pw" =~ [0-9] ]]; then
