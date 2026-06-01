@@ -325,13 +325,125 @@ docker compose up -d
 
 ## 可观测性
 
+### 查看日志
+
+`install.sh` 安装后服务跑在 systemd 下，日志走 **systemd-journald**（不是文件），用 `journalctl` 看：
+
+```bash
+# 实时跟随（推荐排错用，Ctrl-C 退出）
+sudo journalctl -u warp-rust -f
+
+# 最近 100 行
+sudo journalctl -u warp-rust -n 100
+
+# 看某个时间窗口
+sudo journalctl -u warp-rust --since '1 hour ago'
+sudo journalctl -u warp-rust --since today
+sudo journalctl -u warp-rust --since '2026-06-01 06:00' --until '2026-06-01 07:00'
+
+# 只看错误及以上级别
+sudo journalctl -u warp-rust -p err
+
+# 看 boot 以来的日志
+sudo journalctl -u warp-rust -b
+
+# 持续占用磁盘多少
+sudo journalctl --disk-usage
+```
+
+**手动跑二进制时**（开发场景，不用 systemd），日志直接打到 stdout/stderr，用 `tee` 落盘：
+
+```bash
+RUST_LOG=info,warp_rust=info ./target/release/warp-rust --config config.toml 2>&1 | tee warp-rust.log
+```
+
+### 日志级别 / 格式
+
+`config.toml` 的 `[logging]` 段：
+
+```toml
+[logging]
+# tracing env-filter 表达式；RUST_LOG 环境变量优先于此
+level = "warn,warp_rust=info"
+# 输出格式：compact（默认精简）/ pretty（开发友好彩色）/ json（机器友好）
+format = "compact"
+```
+
+**install.sh 安装的服务**默认是 `warn,warp_rust=info`——第三方依赖只 warn 以上，自己模块 info，正常运行几乎不写日志，每天通常 <100 KB。要更详细：
+
+```bash
+sudo sed -i 's|^level = .*|level = "info,warp_rust=debug,wireguard_netstack=info"|' /etc/warp-rust/config.toml
+sudo systemctl restart warp-rust
+sudo journalctl -u warp-rust -f
+```
+
+**JSON 格式**（导入 Loki/ELK）：
+
+```toml
+[logging]
+level = "info,warp_rust=info"
+format = "json"
+```
+
+### Prometheus 指标
+
 ```bash
 curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 ```
 
-关键指标：`warp_rust_conns_opened_total`、`warp_rust_bytes_up_total`、`warp_rust_probe_failure_total`、`warp_rust_tunnel_rebuild_total`、`warp_rust_reregister_total`、`warp_rust_rotate_identity_total`、`warp_rust_udp_associates_active`。
+关键指标：
 
-日志格式为 tracing 结构化输出；想看详细内部状态时设置 `RUST_LOG=info,warp_rust=debug`。
+| 指标 | 类型 | 含义 |
+| --- | --- | --- |
+| `warp_rust_conns_opened_total` / `conns_closed_total` | counter | SOCKS5 TCP 累计开/关数 |
+| `warp_rust_conns_rejected_total` | counter | 因并发上限被拒数 |
+| `warp_rust_bytes_up_total` / `bytes_down_total` | counter | 上下行累计字节 |
+| `warp_rust_probe_success_total` / `probe_failure_total` | counter | 健康探针成败数 |
+| `warp_rust_tunnel_rebuild_total` | counter | 隧道重建数（自愈触发） |
+| `warp_rust_reregister_total` | counter | WARP 重注册数 |
+| `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
+| `warp_rust_udp_associates_active` | gauge | 当前活跃 UDP ASSOCIATE |
+| `warp_rust_dns_query_total` / `dns_cache_hit_total` | counter | DNS 查询 / 缓存命中 |
+| `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道因满丢的包（高负载预警） |
+| `warp_rust_handshake_timeout_total` / `idle_timeout_total` / `auth_fail_total` | counter | DoS 防护各类拦截 |
+
+加上 `metrics-exporter-prometheus` 自动导出的 `process_*` 系列（RSS / CPU / 文件描述符），就能在 Grafana 里画完整曲线。
+
+### 内存 / CPU 速查
+
+```bash
+# systemctl 自带（最简单）
+sudo systemctl status warp-rust   # 直接显示 Memory + CPU
+
+# 即时一行
+ps -o pid,user,%cpu,%mem,rss,etime -p $(pgrep warp-rust)
+
+# 30s 间隔持续观察（含 RSS 历史峰值）
+while :; do
+  PID=$(pgrep warp-rust) && printf '%s  RSS=%6sKB  HWM=%6sKB  CPU=%s%%\n' \
+    "$(date +%H:%M:%S)" \
+    "$(awk '/^VmRSS/{print $2}' /proc/$PID/status)" \
+    "$(awk '/^VmHWM/{print $2}' /proc/$PID/status)" \
+    "$(ps -p $PID -o %cpu= | tr -d ' ')"
+  sleep 30
+done
+```
+
+### 几个常用排查命令
+
+```bash
+# 服务整体状态（含最近 10 行日志）
+sudo systemctl status warp-rust
+
+# 看上次启动失败原因
+sudo journalctl -u warp-rust --since '5 min ago' -p warning
+
+# 验证流量真的走 WARP
+curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace | grep -E '^(ip|warp|colo)='
+
+# 看 SOCKS5 端口监听状态
+ss -tlnp | grep warp-rust
+```
 
 ## 已知限制与注意事项
 
