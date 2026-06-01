@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# warp-rust install.sh  schema=5  (default non-interactive for curl|bash; -i for wizard)
+# warp-rust install.sh  schema=6  (quieter log defaults + systemd LogRateLimit)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -427,7 +427,10 @@ echo "  · 生成配置 $CONF_FILE"
   cat <<EOF
 
 [logging]
-level = "info,warp_rust=info"
+# 第三方依赖（wireguard_netstack 等）默认只打 warn 以上，
+# 自己模块 warp_rust 保持 info；这样正常运行几乎无日志，
+# 只有异常或自愈动作才会落 journald，一个月日志通常 <10MB
+level = "warn,warp_rust=info"
 format = "compact"
 
 [warp]
@@ -477,6 +480,14 @@ WorkingDirectory=$DATA_DIR
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
+
+# 日志：走 systemd-journald（journalctl -u $SERVICE_NAME）
+# journald 自带 rotation（默认上限磁盘 10% 或 4GB）；这里再加 rate-limit
+# 防异常时日志洪水把 journald 自身刷爆
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=500
 
 # 安全加固（systemd sandboxing）
 NoNewPrivileges=true
@@ -565,10 +576,13 @@ echo "  数据        : $DATA_DIR"
 echo "  metrics     : http://127.0.0.1:9090/metrics"
 echo
 echo "${BOLD}常用命令${RESET}"
-echo "  ● 状态  : sudo systemctl status $SERVICE_NAME"
-echo "  ● 日志  : sudo journalctl -u $SERVICE_NAME -f"
-echo "  ● 重启  : sudo systemctl restart $SERVICE_NAME"
-echo "  ● 停止  : sudo systemctl stop $SERVICE_NAME"
+echo "  ● 状态        : sudo systemctl status $SERVICE_NAME"
+echo "  ● 实时日志    : sudo journalctl -u $SERVICE_NAME -f"
+echo "  ● 最近日志    : sudo journalctl -u $SERVICE_NAME -n 100"
+echo "  ● 重启        : sudo systemctl restart $SERVICE_NAME"
+echo "  ● 停止        : sudo systemctl stop $SERVICE_NAME"
+echo "  ● 日志占用    : sudo journalctl --disk-usage"
+echo "  ● 清理旧日志  : sudo journalctl --vacuum-time=30d"
 echo
 echo "${BOLD}验证流量真的走 WARP${RESET}"
 echo "  curl --socks5-hostname 127.0.0.1:$PORT https://1.1.1.1/cdn-cgi/trace"
