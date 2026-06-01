@@ -181,8 +181,9 @@ impl WgConfigFile {
             peer_public_key: self.peer_public_key,
             peer_endpoint,
             tunnel_ip: self.address,
+            tunnel_ipv6: None, // 通过 WgConfigFile 这条路径暂不解析 v6（v0.2.0 主要由 warp-wireguard-gen 设置）
             preshared_key: self.preshared_key,
-            keepalive_seconds: self.persistent_keepalive.or(Some(25)), // Default to 25s if not specified
+            keepalive_seconds: self.persistent_keepalive.or(Some(25)),
             mtu: self.mtu,
         })
     }

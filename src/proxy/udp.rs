@@ -17,7 +17,7 @@
 use crate::dns::Resolver;
 use crate::error::{Error, Result};
 use crate::tunnel::Tunnel;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -81,7 +81,7 @@ pub async fn run_relay(
                     .recv_from(&mut buf, Duration::from_millis(200))
                     .await
                 {
-                    Ok((n, src_v4)) => {
+                    Ok((n, src)) => {
                         let dst = match *client_addr.lock().await {
                             Some(a) => a,
                             None => {
@@ -89,7 +89,7 @@ pub async fn run_relay(
                                 continue;
                             }
                         };
-                        let framed = wrap_socks5_udp(src_v4, &buf[..n]);
+                        let framed = wrap_socks5_udp(src, &buf[..n]);
                         if let Err(e) = relay_bind.send_to(&framed, dst).await {
                             warn!(error = %e, "tunnel→client send failed");
                             break;
@@ -118,9 +118,13 @@ async fn forward_client_to_tunnel(
     resolver: &Resolver,
 ) -> Result<()> {
     let parsed = parse_socks5_udp_header(packet)?;
-    let dest = match parsed.target {
-        UdpTarget::V4(sa) => sa,
-        UdpTarget::Domain(host, port) => resolver.resolve_v4(&host, port).await?,
+    let dest: SocketAddr = match parsed.target {
+        UdpTarget::V4(sa) => SocketAddr::V4(sa),
+        UdpTarget::V6(sa) => SocketAddr::V6(sa),
+        UdpTarget::Domain(host, port) => {
+            // v0.2.0：通过 Resolver 解析，先返 v4；后续可加 happy eyeballs
+            SocketAddr::V4(resolver.resolve_v4(&host, port).await?)
+        }
     };
     tunnel_udp.send_to(parsed.payload, dest).await?;
     Ok(())
@@ -128,6 +132,7 @@ async fn forward_client_to_tunnel(
 
 enum UdpTarget {
     V4(SocketAddrV4),
+    V6(SocketAddrV6),
     Domain(String, u16),
 }
 
@@ -175,16 +180,42 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
                 payload: &rest[1 + dlen + 2..],
             })
         }
-        0x04 => Err(Error::other("SOCKS5 UDP IPv6 not supported")),
+        0x04 => {
+            // v0.2.0：IPv6（16 字节地址 + 2 字节端口）
+            if rest.len() < 18 {
+                return Err(Error::other("SOCKS5 UDP v6 header truncated"));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&rest[..16]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([rest[16], rest[17]]);
+            Ok(ParsedUdp {
+                target: UdpTarget::V6(SocketAddrV6::new(ip, port, 0, 0)),
+                payload: &rest[18..],
+            })
+        }
         other => Err(Error::other(format!("unknown ATYP 0x{other:02x}"))),
     }
 }
 
-fn wrap_socks5_udp(src: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + payload.len());
-    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-    out.extend_from_slice(&src.ip().octets());
-    out.extend_from_slice(&src.port().to_be_bytes());
-    out.extend_from_slice(payload);
-    out
+/// v0.2.0：双栈版 wrap，自动按 src 类型选 ATYP=0x01 或 0x04
+fn wrap_socks5_udp(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    match src {
+        SocketAddr::V4(sa) => {
+            let mut out = Vec::with_capacity(10 + payload.len());
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // RSV RSV FRAG ATYP=v4
+            out.extend_from_slice(&sa.ip().octets());
+            out.extend_from_slice(&sa.port().to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+        SocketAddr::V6(sa) => {
+            let mut out = Vec::with_capacity(22 + payload.len());
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // RSV RSV FRAG ATYP=v6
+            out.extend_from_slice(&sa.ip().octets());
+            out.extend_from_slice(&sa.port().to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+    }
 }

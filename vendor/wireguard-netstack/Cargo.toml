@@ -20,10 +20,11 @@ categories = ["network-programming", "asynchronous"]
 # WireGuard implementation
 gotatun = "0.2"
 
-# 用户态 TCP/IP 栈。`socket-udp` 是本 fork 新增的
+# 用户态 TCP/IP 栈。`socket-udp` 是本 fork 新增的；`proto-ipv6` v0.2.0 新增。
 smoltcp = { version = "0.12", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
+    "proto-ipv6",
     "socket-tcp",
     "socket-udp",
     "std",

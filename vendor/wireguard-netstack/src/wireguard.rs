@@ -10,7 +10,7 @@ use gotatun::packet::Packet;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use parking_lot::Mutex;
 use zerocopy::IntoBytes;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -27,8 +27,10 @@ pub struct WireGuardConfig {
     pub peer_public_key: [u8; 32],
     /// Peer's endpoint (IP:port).
     pub peer_endpoint: SocketAddr,
-    /// Our IP address inside the tunnel.
+    /// Our IPv4 address inside the tunnel.
     pub tunnel_ip: Ipv4Addr,
+    /// Our IPv6 address inside the tunnel (v0.2.0：可选；Cloudflare WARP 双栈下会给）
+    pub tunnel_ipv6: Option<Ipv6Addr>,
     /// Optional preshared key for additional security.
     pub preshared_key: Option<[u8; 32]>,
     /// Keepalive interval in seconds (0 = disabled).
@@ -45,8 +47,10 @@ pub struct WireGuardTunnel {
     udp_socket: Arc<UdpSocket>,
     /// Peer's endpoint address.
     peer_endpoint: SocketAddr,
-    /// Our tunnel IP address.
+    /// Our tunnel IPv4 address.
     tunnel_ip: Ipv4Addr,
+    /// Our tunnel IPv6 address (v0.2.0：双栈）
+    tunnel_ipv6: Option<Ipv6Addr>,
     /// MTU for the tunnel interface.
     mtu: u16,
     /// Channel to send received IP packets.
@@ -109,6 +113,7 @@ impl WireGuardTunnel {
             udp_socket: Arc::new(udp_socket),
             peer_endpoint: config.peer_endpoint,
             tunnel_ip: config.tunnel_ip,
+            tunnel_ipv6: config.tunnel_ipv6,
             mtu: config.mtu.unwrap_or(460), // Default MTU
             incoming_tx,
             incoming_rx: Mutex::new(Some(incoming_rx)),
@@ -119,9 +124,14 @@ impl WireGuardTunnel {
         Ok(tunnel)
     }
 
-    /// Get our tunnel IP address.
+    /// Get our tunnel IPv4 address.
     pub fn tunnel_ip(&self) -> Ipv4Addr {
         self.tunnel_ip
+    }
+
+    /// Get our tunnel IPv6 address（v0.2.0：双栈支持）.
+    pub fn tunnel_ipv6(&self) -> Option<Ipv6Addr> {
+        self.tunnel_ipv6
     }
 
     /// Get the MTU for the tunnel.

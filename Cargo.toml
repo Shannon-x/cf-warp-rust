@@ -1,6 +1,6 @@
 [package]
 name = "warp-rust"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Long-running SOCKS5 proxy through Cloudflare WARP, with auto-register and self-healing"
@@ -57,7 +57,9 @@ lto = "thin"
 strip = "symbols"
 codegen-units = 1
 
-# Redirect both our direct dependency AND warp-wireguard-gen's transitive
-# dependency to our fork (which exposes UdpHandle).
+# 重定向到本地 vendor fork：
+#   wireguard-netstack：暴露 UdpHandle、TcpConnection::Drop 修复泄漏、IPv6 支持
+#   warp-wireguard-gen：API 解析 v6 字段
 [patch.crates-io]
 wireguard-netstack = { path = "vendor/wireguard-netstack" }
+warp-wireguard-gen = { path = "vendor/warp-wireguard-gen" }
