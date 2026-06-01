@@ -49,6 +49,9 @@ rand = "0.10"
 base64 = "0.22"
 log = "0.4"
 
+# v0.2.2：作为 metrics facade 消费者；只有当主程序装上 exporter 时才生效
+metrics = "0.24"
+
 # Config parsing
 serde = { version = "1", features = ["derive"] }
 serde_ini = "0.2"
