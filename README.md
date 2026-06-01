@@ -15,23 +15,66 @@
 
 ---
 
-## 🚀 一键脚本（推荐用法）
+## ⚡️ 一行命令安装（Linux + systemd 服务器，最推荐）
 
-仓库 `scripts/` 下有三个脚本，按你想要的「省心程度」挑一个：
+不用 git clone、不用装 cargo、不用编译——脚本自动检测 x86_64 / aarch64，从 GitHub Release 下载预编译二进制，装 systemd 服务，开机自启。**默认绑 `127.0.0.1` 不需要密码**。
+
+```bash
+# === 本机使用（默认 127.0.0.1:1080，无密码）===
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install.sh | sudo bash
+
+# === 对外暴露端口（自动生成 24 位强密码并打印）===
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install.sh \
+  | sudo bash -s -- --port 1080 --expose
+
+# === 对外暴露 + 自己指定强密码（≥16 位，含大小写+数字）===
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install.sh \
+  | sudo bash -s -- --port 1080 --expose --user me --pass 'MyVeryStrong16Pass'
+
+# === 更新到最新版（保留配置）===
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install.sh \
+  | sudo bash -s -- --update
+
+# === 卸载（保留配置文件，方便重装；要彻底清理脚本最后会提示）===
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install.sh \
+  | sudo bash -s -- --uninstall
+```
+
+安装后会有：
+- 二进制在 `/usr/local/bin/warp-rust`
+- 配置在 `/etc/warp-rust/config.toml`（权限 0640，仅 root 与服务用户可读）
+- 数据在 `/var/lib/warp-rust/`（含 WARP 凭据，权限 0750）
+- systemd 服务 `warp-rust.service`，已 `enable --now`，带完整安全 hardening
+
+常用命令：
+
+```bash
+sudo systemctl status warp-rust          # 看状态
+sudo systemctl restart warp-rust         # 重启
+sudo journalctl -u warp-rust -f          # 跟日志
+curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace   # 验证（期望 warp=on）
+```
+
+---
+
+## 🛠 仓库内脚本（开发场景）
+
+如果你 `git clone` 了仓库，`scripts/` 下另有三个脚本，按场景挑：
 
 | 脚本 | 用法 | 适合场景 |
 | --- | --- | --- |
-| **`quickstart.sh`** | 全交互式，逐步问你端口 / 暴露范围 / 鉴权 | 第一次用、不熟悉参数 |
-| **`run-binary.sh`** | 一行命令带参数，自动 `cargo build` | 本机或服务器跑二进制 |
-| **`run-docker.sh`** | 一行命令带参数，自动 `docker pull` 或 build | 想要容器隔离、systemd 友好 |
+| **`install.sh`** | 一行 `curl …\| sudo bash` 装 systemd 服务 | **生产 Linux 部署（推荐）** |
+| **`quickstart.sh`** | 全交互式，逐步问你端口 / 暴露范围 / 鉴权 | 第一次跑、本机调试 |
+| **`run-binary.sh`** | 一行带参数；有 `cargo` 就编译，没有就自动下载 release | 本机 / 服务器前台跑 |
+| **`run-docker.sh`** | 一行带参数；自动 `docker pull` 或 build | 想用容器隔离 |
 
-### 30 秒上手：最简模式（本机自用，**无需密码**）
+### 30 秒上手：本机自用、**无需密码**
 
 ```bash
 git clone https://github.com/Shannon-x/cf-warp-rust.git
 cd cf-warp-rust
 
-# 二进制方式（前台跑）
+# 二进制方式（前台跑；没装 cargo 会自动从 Release 拉对应平台二进制）
 ./scripts/run-binary.sh
 # → 监听 127.0.0.1:1080，无任何鉴权（loopback only，外人到不了）
 

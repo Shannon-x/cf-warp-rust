@@ -101,9 +101,53 @@ EOF
 chmod 600 "$CFG"
 
 if [ ! -x ./target/release/warp-rust ]; then
-  command -v cargo >/dev/null 2>&1 || { echo "未安装 cargo，请先装 Rust" >&2; exit 4; }
-  echo "▸ 编译 release 二进制（首次较慢）..." >&2
-  cargo build --release --quiet
+  if command -v cargo >/dev/null 2>&1; then
+    echo "▸ 编译 release 二进制（首次较慢）..." >&2
+    cargo build --release --quiet
+  else
+    # 没装 cargo —— 自动从 GitHub Release 下载预编译二进制
+    REPO="${REPO:-Shannon-x/cf-warp-rust}"
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    case "$(uname -m)" in
+      x86_64|amd64)  ARCH="x86_64" ;;
+      aarch64|arm64) ARCH="aarch64" ;;
+      *) echo "未装 cargo，且不支持的架构 $(uname -m)" >&2; exit 4 ;;
+    esac
+    case "$OS" in
+      linux)
+        TARGET="${ARCH}-unknown-linux-musl"
+        EXT="tar.gz"
+        BIN="warp-rust"
+        ;;
+      darwin)
+        TARGET="${ARCH}-apple-darwin"
+        EXT="tar.gz"
+        BIN="warp-rust"
+        ;;
+      *) echo "未装 cargo，且不支持的系统 $OS（请用 install.sh 或手动下载 release）" >&2; exit 4 ;;
+    esac
+
+    command -v curl >/dev/null 2>&1 || { echo "缺 curl，无法下载 release 二进制" >&2; exit 4; }
+
+    VERSION="${VERSION:-}"
+    if [ -z "$VERSION" ]; then
+      echo "▸ 查询 GitHub Release 最新版..." >&2
+      VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+                  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+      [ -n "$VERSION" ] || { echo "无法查到最新版本号" >&2; exit 4; }
+    fi
+    NAME="warp-rust-${VERSION}-${TARGET}"
+    URL="https://github.com/${REPO}/releases/download/${VERSION}/${NAME}.${EXT}"
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+    echo "▸ 下载 ${URL}" >&2
+    curl -fSL --progress-bar "$URL" -o "$TMP/$NAME.$EXT" \
+      || { echo "下载失败" >&2; exit 4; }
+    tar xzf "$TMP/$NAME.$EXT" -C "$TMP"
+    mkdir -p ./target/release
+    install -m 0755 "$TMP/$NAME/$BIN" "./target/release/warp-rust"
+    echo "▸ 已安装预编译二进制到 ./target/release/warp-rust" >&2
+  fi
 fi
 
 echo "▸ SOCKS5 监听：$BIND" >&2
