@@ -1,9 +1,8 @@
 name: release
 
-# Linux 二进制发布——优先级最高，最快路径。
-# macOS 二进制由 release-macos.yml 异步追加到同一个 GitHub Release。
-# 拆分原因：macOS runner（尤其 macos-13）排队常超过 10 分钟，会拖累 Linux
-# 二进制的发布；而 99% 的部署场景都是 Linux 服务器。
+# 常用二进制平台发布——Linux x86_64/aarch64 (musl 静态) + Windows x86_64。
+# 全部用原生 runner，build 完直接 publish GitHub Release。
+# macOS（仅 Apple Silicon）由 release-macos.yml 异步追加。
 
 on:
   push:
@@ -20,7 +19,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: release-linux-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -30,12 +29,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 musl — ubuntu-latest 原生
           - target: x86_64-unknown-linux-musl
             runs-on: ubuntu-latest
-          # Linux aarch64 musl — GitHub 2025 公开提供的 ARM 原生 runner
+            kind: linux
+            archive: tar.gz
           - target: aarch64-unknown-linux-musl
             runs-on: ubuntu-24.04-arm
+            kind: linux
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runs-on: windows-latest
+            kind: windows
+            archive: zip
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +50,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools
+      - name: Install musl-tools (Linux)
+        if: matrix.kind == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -58,8 +64,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
-        id: pkg
+      - name: Package (Linux)
+        if: matrix.kind == 'linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -77,18 +83,37 @@ jobs:
           tar czf "dist/${NAME}.tar.gz" "$NAME"
           sha256sum "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
           ls -la dist/
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = "${{ inputs.tag }}"
+          }
+          $name = "warp-rust-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist", $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/warp-rust.exe" "$name/"
+          Copy-Item README.md, LICENSE, SECURITY.md, config.toml.example "$name/"
+          # scripts/ 在 Windows 下不可执行（git-bash 用户可以跑，PowerShell 用户读 README）
+          New-Item -ItemType Directory -Force -Path "$name/scripts" | Out-Null
+          Copy-Item scripts/*.sh "$name/scripts/"
+          Compress-Archive -Path "$name" -DestinationPath "dist/$name.zip" -Force
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ASCII "dist/$name.zip.sha256"
+          Get-ChildItem dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pkg.outputs.name }}
+          name: warp-rust-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: publish release (linux)
+    name: publish release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -108,13 +133,11 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
           draft: false
-          # 关键：append_body=true 让 release-macos.yml 之后能追加文件
-          # 而不覆盖这里已经写好的 release body
-          append_body: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           body: |
             ## warp-rust ${{ github.ref_name }}
@@ -124,16 +147,12 @@ jobs:
             ### 一键启动（Linux）
 
             ```bash
-            # x86_64
             curl -sSL -O https://github.com/Shannon-x/cf-warp-rust/releases/download/${{ github.ref_name }}/warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
             tar xzf warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
             cd warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl
 
-            # 本机自用，无密码
-            ./scripts/run-binary.sh
-
-            # 对外暴露，自动生成强密码
-            ./scripts/run-binary.sh 1080 --expose
+            ./scripts/run-binary.sh                    # 本机自用，无密码
+            ./scripts/run-binary.sh 1080 --expose      # 对外暴露，自动生成强密码
             ```
 
             ### 容器镜像（多架构）
@@ -143,15 +162,25 @@ jobs:
             # 或 :latest
             ```
 
+            ### Windows 启动
+
+            ```powershell
+            # 解压后
+            cd warp-rust-${{ github.ref_name }}-x86_64-pc-windows-msvc
+            cp config.toml.example config.toml
+            .\warp-rust.exe --config config.toml
+            ```
+
             ### 产物清单
 
             | 平台 | 文件 |
             | --- | --- |
-            | Linux x86_64（musl，静态链接） | `warp-rust-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz` |
-            | Linux aarch64（musl，ARM 服务器/树莓派） | `warp-rust-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz` |
-            | Docker | `ghcr.io/shannon-x/cf-warp-rust:${{ github.ref_name }}` |
+            | Linux x86_64（musl 静态链接，任意发行版） | `*-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux aarch64（musl 静态，ARM 服务器/树莓派） | `*-aarch64-unknown-linux-musl.tar.gz` |
+            | Windows x86_64（MSVC） | `*-x86_64-pc-windows-msvc.zip` |
+            | macOS Apple Silicon（M 系列） | `*-aarch64-apple-darwin.tar.gz` ⏳ 由 release-macos 异步追加 |
+            | Docker 镜像 | `ghcr.io/shannon-x/cf-warp-rust:${{ github.ref_name }}` |
 
-            macOS 预编译二进制由独立的 `release-macos` workflow 异步发布到本页面，
-            通常会在 Linux 发布后几分钟到半小时内追加。
+            老旧平台（macOS Intel、Linux glibc 等）按需用 `cargo build --release` 自行编译。
 
             ### 变更摘要

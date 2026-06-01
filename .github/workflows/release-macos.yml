@@ -1,8 +1,8 @@
 name: release-macos
 
-# 异步构建 macOS 二进制，追加到现有 GitHub Release。
-# 单独拆出来是因为 GitHub Actions 的 macOS runner（尤其 macos-13 Intel）
-# 排队时间常常 10-30 分钟，会拖慢 Linux 发布。
+# 异步构建 macOS 二进制（仅 Apple Silicon），追加到现有 GitHub Release。
+# 拆出来的原因：macOS runner 排队不可控；不让它阻塞 Linux/Windows 发布。
+# 老 Intel Mac 不再支持——按需自己 `cargo build --release`。
 
 on:
   push:
@@ -23,34 +23,25 @@ concurrency:
 
 jobs:
   build:
-    name: build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runs-on: macos-13      # Intel runner
-          - target: aarch64-apple-darwin
-            runs-on: macos-latest  # Apple Silicon runner
-    runs-on: ${{ matrix.runs-on }}
+    name: build (aarch64-apple-darwin)
+    runs-on: macos-latest    # GitHub 默认 macos-latest = Apple Silicon (M 系列)
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: aarch64-apple-darwin
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Package
-        id: pkg
         shell: bash
         run: |
           set -euo pipefail
@@ -58,9 +49,9 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           fi
-          NAME="warp-rust-${TAG}-${{ matrix.target }}"
+          NAME="warp-rust-${TAG}-aarch64-apple-darwin"
           mkdir -p dist "$NAME"
-          cp "target/${{ matrix.target }}/release/warp-rust" "$NAME/"
+          cp "target/aarch64-apple-darwin/release/warp-rust" "$NAME/"
           cp README.md LICENSE SECURITY.md config.toml.example "$NAME/"
           mkdir -p "$NAME/scripts"
           cp scripts/*.sh "$NAME/scripts/"
@@ -78,5 +69,4 @@ jobs:
           fail_on_unmatched_files: true
           # 不重新生成 release body，只追加文件
           append_body: false
-          # 如果 release 还不存在（release.yml 还没跑完）就创建草稿
           draft: false
