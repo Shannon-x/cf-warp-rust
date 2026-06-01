@@ -137,9 +137,9 @@ async fn handle(
         }
     }
 
-    // 解析目标 → IPv4（走 Resolver，可隧道内或宿主）
-    let upstream_addr = match resolve_target(&resolver, &target).await {
-        Ok(a) => a,
+    // v0.2.1：解析为候选列表（v6 优先，v4 兜底）
+    let candidates = match resolve_target(&resolver, &target).await {
+        Ok(c) => c,
         Err(e) => {
             warn!(%peer, %target, error = %e, "address resolution failed");
             proto.reply_error(&ReplyError::HostUnreachable).await?;
@@ -147,11 +147,11 @@ async fn handle(
         }
     };
 
-    // 通过 WireGuard 隧道拨号
-    let upstream = match tunnel.dial_tcp(upstream_addr).await {
-        Ok(c) => c,
+    // v0.2.1：候选列表通过 happy eyeballs 拨号；upstream_addr 是实际胜出的地址
+    let (upstream_addr, upstream) = match happy_eyeballs_dial(&tunnel, candidates).await {
+        Ok(v) => v,
         Err(e) => {
-            warn!(%peer, %upstream_addr, error = %e, "tunnel dial failed");
+            warn!(%peer, %target, error = %e, "all upstream candidates failed");
             let reply = match &e {
                 Error::TunnelNotReady => ReplyError::GeneralFailure,
                 _ => ReplyError::HostUnreachable,
@@ -254,16 +254,94 @@ async fn handle_udp_associate(
     Ok(())
 }
 
-/// v0.2.0：双栈解析。
-/// - IP 类型目标：原样返回（v4 或 v6 都可）
-/// - Domain：当前先解析为 v4（happy eyeballs 留 v0.2.1）
-async fn resolve_target(resolver: &Resolver, target: &TargetAddr) -> Result<SocketAddr> {
+/// v0.2.1：双栈解析，返回候选 SocketAddr 列表（v6 优先在前）。
+/// - IP 类型目标：原样单条
+/// - Domain：并发查 A + AAAA，按 happy-eyeballs 顺序排
+async fn resolve_target(resolver: &Resolver, target: &TargetAddr) -> Result<Vec<SocketAddr>> {
     match target {
-        TargetAddr::Ip(sa) => Ok(*sa),
-        TargetAddr::Domain(host, port) => {
-            let sa4 = resolver.resolve_v4(host, *port).await?;
-            Ok(SocketAddr::V4(sa4))
+        TargetAddr::Ip(sa) => Ok(vec![*sa]),
+        TargetAddr::Domain(host, port) => resolver.resolve_dual(host, *port).await,
+    }
+}
+
+/// v0.2.1：Happy Eyeballs Phase 1 风格拨号。
+///
+/// 候选列表 v6 先 v4 后；试 v6 → 250ms 内没拿到结果，**并发**起 v4 拨号；
+/// 任一成功返回，另一个 abort。
+///
+/// 极简对照 RFC 8305：
+/// - 不做地址排序（我们的列表已经 v6 优先）
+/// - 单 v6 + 单 v4 双线程而不是逐个全开
+/// - 适合 SOCKS5 的快速首字节场景
+async fn happy_eyeballs_dial(
+    tunnel: &Tunnel,
+    candidates: Vec<SocketAddr>,
+) -> Result<(SocketAddr, wireguard_netstack::TcpConnection)> {
+    if candidates.is_empty() {
+        return Err(Error::other("no upstream candidates"));
+    }
+    if candidates.len() == 1 {
+        let addr = candidates[0];
+        let conn = tunnel.dial_tcp(addr).await?;
+        return Ok((addr, conn));
+    }
+
+    // 拆 v6 / v4
+    let (v6, v4): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|a| matches!(a, SocketAddr::V6(_)));
+    let v6_addr = v6.into_iter().next();
+    let v4_addr = v4.into_iter().next();
+
+    // 同时拨；最先成功的赢
+    match (v6_addr, v4_addr) {
+        (Some(v6), Some(v4)) => {
+            let tunnel_clone = tunnel as *const Tunnel;
+            // 注意：Tunnel 是 Arc 间接，我们这里通过引用借用，不能 send 给 task。
+            // 改成 tokio::select! 同步 await，不 spawn —— 这样不需要 'static。
+            let v6_fut = tunnel.dial_tcp(v6);
+            let v4_delay = tokio::time::sleep(Duration::from_millis(250));
+            tokio::pin!(v6_fut);
+            tokio::pin!(v4_delay);
+            let _ = tunnel_clone;
+
+            // 先等 v6 250ms；超时就并发 v4
+            tokio::select! {
+                biased;
+                r = &mut v6_fut => {
+                    match r {
+                        Ok(c) => return Ok((v6, c)),
+                        Err(e) => {
+                            warn!(%v6, error = %e, "v6 dial failed quickly, fallback v4");
+                            return tunnel.dial_tcp(v4).await.map(|c| (v4, c));
+                        }
+                    }
+                }
+                _ = &mut v4_delay => {}
+            }
+
+            // v6 仍未返回 → 并发 v4
+            let v4_fut = tunnel.dial_tcp(v4);
+            tokio::pin!(v4_fut);
+            tokio::select! {
+                biased;
+                r = &mut v6_fut => {
+                    match r {
+                        Ok(c) => Ok((v6, c)),
+                        Err(_) => v4_fut.await.map(|c| (v4, c)),
+                    }
+                }
+                r = &mut v4_fut => {
+                    match r {
+                        Ok(c) => Ok((v4, c)),
+                        Err(_) => v6_fut.await.map(|c| (v6, c)),
+                    }
+                }
+            }
         }
+        (Some(v6), None) => tunnel.dial_tcp(v6).await.map(|c| (v6, c)),
+        (None, Some(v4)) => tunnel.dial_tcp(v4).await.map(|c| (v4, c)),
+        (None, None) => Err(Error::other("no upstream candidates")),
     }
 }
 
