@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# warp-rust install.sh  schema=2  (sha256-by-hash-compare, interactive)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -178,15 +179,29 @@ ok_pw() {
   [ "${#p}" -ge 16 ] && [[ "$p" =~ [A-Z] ]] && [[ "$p" =~ [a-z] ]] && [[ "$p" =~ [0-9] ]]
 }
 verify_sha256() {
-  # release.yml 在某些版本里 sha256sum 是在 dist/ 外面跑的，文件名带 dist/ 前缀。
-  # 这里把前缀都剥掉再用当前目录校验，兼容两种格式。
-  local sha_file="$1"
-  local cleaned
-  cleaned="$(sed 's|^\([0-9a-fA-F]\{64\}\)  .*/|\1  |' "$sha_file")"
+  # 不用 `sha256sum -c`（它会按 sha 文件里写的路径去找文件，路径前缀就会出错）。
+  # 直接抽出 sha 文件里的 hash 跟实际文件的 hash 对比 —— 无论 sha 文件里
+  # 写的是 `file`、`dist/file`、`./xxx/file` 都不影响。
+  local sha_file="$1" target_file="$2"
+  local expected actual
+  expected="$(awk 'NR==1 {print tolower($1)}' "$sha_file")"
+  if [ -z "$expected" ] || [ "${#expected}" -ne 64 ]; then
+    echo "sha256 文件格式异常：$(head -1 "$sha_file")" >&2
+    return 1
+  fi
   if command -v sha256sum >/dev/null; then
-    echo "$cleaned" | sha256sum -c -
+    actual="$(sha256sum "$target_file" | awk '{print tolower($1)}')"
   else
-    echo "$cleaned" | shasum -a 256 -c -
+    actual="$(shasum -a 256 "$target_file" | awk '{print tolower($1)}')"
+  fi
+  if [ "$expected" = "$actual" ]; then
+    echo "$target_file: OK"
+    return 0
+  else
+    echo "sha256 不匹配" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual  : $actual" >&2
+    return 1
   fi
 }
 
@@ -237,7 +252,7 @@ curl -fsSL "$URL_SHA" -o "$TMP/$ASSET.sha256" \
   || die "下载 sha256 失败"
 
 info "校验 sha256..."
-(cd "$TMP" && verify_sha256 "$ASSET.sha256" >/dev/null) \
+verify_sha256 "$TMP/$ASSET.sha256" "$TMP/$ASSET" >/dev/null \
   || die "sha256 校验失败 —— 文件可能损坏或被篡改"
 
 info "解压..."
