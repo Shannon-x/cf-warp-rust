@@ -55,7 +55,7 @@ impl Tunnel {
             })
     }
 
-    /// 在隧道 netstack 内分配一个用户态 UDP socket（ephemeral 端口）。
+    /// 在隧道 netstack 内分配一个用户态 IPv4 UDP socket（ephemeral 端口）。
     pub fn bind_udp(&self) -> Result<UdpHandle> {
         let snapshot = self.inner.load_full();
         let tunnel = match snapshot.as_ref() {
@@ -63,6 +63,20 @@ impl Tunnel {
             None => return Err(Error::TunnelNotReady),
         };
         Ok(tunnel.netstack().create_udp_socket(0)?)
+    }
+
+    /// v0.2.2：在隧道 netstack 内分配一个用户态 IPv6 UDP socket。
+    /// 如果 WARP 未提供 IPv6 tunnel 地址（即非双栈），返回 `Ok(None)`。
+    pub fn bind_udp_v6(&self) -> Result<Option<UdpHandle>> {
+        let snapshot = self.inner.load_full();
+        let tunnel = match snapshot.as_ref() {
+            Some(t) => t.clone(),
+            None => return Err(Error::TunnelNotReady),
+        };
+        if tunnel.wg_tunnel().tunnel_ipv6().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(tunnel.netstack().create_udp_socket_with(0, true)?))
     }
 
     /// 释放内部隧道（主要供优雅停机调用）。

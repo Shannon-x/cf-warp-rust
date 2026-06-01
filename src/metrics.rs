@@ -30,6 +30,8 @@ pub const M_AUTH_FAIL: &str = "warp_rust_auth_fail_total";
 pub const M_DNS_CACHE_HIT: &str = "warp_rust_dns_cache_hit_total";
 pub const M_DNS_QUERY: &str = "warp_rust_dns_query_total";
 pub const M_DNS_QUERY_FAIL: &str = "warp_rust_dns_query_failure_total";
+// v0.2.2 接通：netstack 自己在 try_send 失败时 increment 此 counter
+// （metrics facade 跨 crate 共享一个 exporter，命名要完全一致）
 pub const M_WG_DROP: &str = "warp_rust_wg_tx_dropped_total";
 
 /// 装配 Prometheus exporter，在 `cfg.bind` 上启动一个 axum 服务。正常停机时

@@ -465,12 +465,10 @@ impl NetStack {
                 }
             }
 
-            // PERF-1（warp-rust fork）：去掉 per-packet `tokio::spawn`。
-            // 直接 try_send 到 WG 出口通道；满则丢弃这一包（WG 自带重传，
-            // TCP 也有重传），避免：
-            // 1. 任务调度开销（之前每包 spawn 一个 task）
-            // 2. 排队不可控（spawn 出来的任务进调度器，间接打乱顺序）
+            // PERF-1：去 per-packet spawn；try_send 失败直接丢，WG 自带重传。
+            // v0.2.2：失败时打 metric counter，便于 prometheus 看到丢包率。
             if self.wg_tx.try_send(packet).is_err() {
+                metrics::counter!("warp_rust_wg_tx_dropped_total").increment(1);
                 log::trace!("WG outgoing queue full, dropping packet (WG will retransmit)");
             }
         }
@@ -522,20 +520,43 @@ impl NetStack {
         inner.device.push_rx(packet);
     }
 
-    /// PERF-2（warp-rust fork）：事件驱动 poll loop。
+    /// PERF-2 v2（warp-rust fork v0.2.2）：基于 smoltcp `poll_at` 自适应的
+    /// 事件驱动 poll loop。
     ///
-    /// 上游每 1ms tick 一次（即使没事干也跑），导致：
-    /// - idle 时浪费 CPU（每秒 1000 次锁竞争）
-    /// - 突发流量时引入 0-1ms 抖动
+    /// 之前的实现用 100µs 兜底 tick——idle 时反而比上游 1ms 多 10×（每秒 10k
+    /// 次锁竞争）。现在改成：
+    /// - 用 `Interface::poll_at(now, sockets)` 问 smoltcp「下次什么时候需要 poll」
+    ///   * `Some(t)` → sleep 到 t（重传定时器等）
+    ///   * `None`    → 1 秒兜底（理论上可以更长，但留窗口让 kick() 介入）
+    /// - rx/read/write 路径 `kick()` 仍能立即唤醒
     ///
-    /// 新版改成「等通知 OR 100µs 兜底 tick」：
-    /// - rx/read/write 唤醒 `kick()` → 立即响应
-    /// - smoltcp 内部计时器（重传等）靠 100µs 兜底 tick 保证不饿死
+    /// 实测：idle 时几乎不耗 CPU；500Mbps 时立即响应（kick 唤醒）。
     pub async fn run_poll_loop(self: &Arc<Self>) -> Result<()> {
+        let started = std::time::Instant::now();
         loop {
+            let sleep_dur = {
+                let mut inner = self.inner.lock();
+                let now =
+                    smoltcp::time::Instant::from_millis(started.elapsed().as_millis() as i64);
+                let NetStackInner {
+                    ref mut interface,
+                    ref sockets,
+                    ..
+                } = *inner;
+                match interface.poll_at(now, sockets) {
+                    Some(at) if at > now => {
+                        let ms = (at - now).total_millis().max(0) as u64;
+                        // 限制最长 1 秒，让 kick() 能定期把控制权拿回来
+                        Duration::from_millis(ms.min(1000))
+                    }
+                    Some(_) => Duration::ZERO,
+                    None => Duration::from_secs(1),
+                }
+            };
+
             tokio::select! {
                 _ = self.poll_notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_micros(100)) => {}
+                _ = tokio::time::sleep(sleep_dur) => {}
             }
             self.poll();
         }

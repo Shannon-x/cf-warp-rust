@@ -90,7 +90,7 @@ impl Resolver {
         // 全缓存命中
         if cached_v4.is_some() || cached_v6.is_some() {
             counter!(M_DNS_CACHE_HIT).increment(1);
-            return Ok(merge_dual(cached_v6, cached_v4, port, host)?);
+            return merge_dual(cached_v6, cached_v4, port, host);
         }
 
         counter!(M_DNS_QUERY).increment(1);
@@ -283,23 +283,19 @@ fn parse_dns_answer(reply: &[u8], qtype: u16) -> Result<IpAddr> {
             return Err(Error::other("DNS rdata truncated"));
         }
         if rtype == qtype {
-            match qtype {
-                QTYPE_A => {
-                    if rdlen == 4 {
-                        return Ok(IpAddr::V4(Ipv4Addr::new(
-                            reply[off],
-                            reply[off + 1],
-                            reply[off + 2],
-                            reply[off + 3],
-                        )));
-                    }
+            match (qtype, rdlen) {
+                (QTYPE_A, 4) => {
+                    return Ok(IpAddr::V4(Ipv4Addr::new(
+                        reply[off],
+                        reply[off + 1],
+                        reply[off + 2],
+                        reply[off + 3],
+                    )));
                 }
-                QTYPE_AAAA => {
-                    if rdlen == 16 {
-                        let mut o = [0u8; 16];
-                        o.copy_from_slice(&reply[off..off + 16]);
-                        return Ok(IpAddr::V6(Ipv6Addr::from(o)));
-                    }
+                (QTYPE_AAAA, 16) => {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&reply[off..off + 16]);
+                    return Ok(IpAddr::V6(Ipv6Addr::from(o)));
                 }
                 _ => {}
             }
