@@ -30,6 +30,11 @@ pub const M_AUTH_FAIL: &str = "warp_rust_auth_fail_total";
 pub const M_DNS_CACHE_HIT: &str = "warp_rust_dns_cache_hit_total";
 pub const M_DNS_QUERY: &str = "warp_rust_dns_query_total";
 pub const M_DNS_QUERY_FAIL: &str = "warp_rust_dns_query_failure_total";
+// v0.3.x：DNS 负缓存 + singleflight
+pub const M_DNS_SINGLEFLIGHT_DEDUP: &str = "warp_rust_dns_singleflight_dedup_total";
+pub const M_DNS_NEGATIVE_CACHE_HIT: &str = "warp_rust_dns_negative_cache_hit_total";
+// v0.3.x：容器内 0.0.0.0 + 无 auth 放行时的警告计数（聚合后可触发告警）
+pub const M_CONTAINER_OPEN_PROXY_WARN: &str = "warp_rust_container_open_proxy_warn_total";
 /// 装配 Prometheus exporter，在 `cfg.bind` 上启动一个 axum 服务。正常停机时
 /// 返回 Ok(())。
 pub async fn serve(cfg: MetricsConfig, cancel: CancellationToken) -> Result<()> {

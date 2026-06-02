@@ -353,6 +353,11 @@ async fn happy_eyeballs_dial(
 }
 
 /// 带 idle 超时的双向 relay。任一方向到达 idle 超时（无字节传输）即中断。
+///
+/// v0.3.1 修复（Bug #3）：两个方向通过 `CancellationToken` 协调，任一方向
+/// EOF / 错误 / idle 超时都会立刻 cancel 对端并 shutdown 自己的写半边——
+/// 对端从阻塞的 read 上立刻返回 0 字节并退出，不再苦等满 idle_timeout。
+/// 主线用 `tokio::try_join!` 并发等两侧（不再串行 await）。
 async fn relay_with_idle_timeout(
     client: TcpStream,
     upstream: TcpConnection,
@@ -364,29 +369,40 @@ async fn relay_with_idle_timeout(
     let up_for_send = upstream.clone();
     let up_for_recv = upstream;
 
+    let token = CancellationToken::new();
+    let send_token = token.clone();
+    let recv_token = token.clone();
+
     // client → upstream
     let send = tokio::spawn(async move {
         let mut buf = vec![0u8; buf_size];
         let mut total: u64 = 0;
         loop {
-            let read_fut = client_r.read(&mut buf);
-            let n = match tokio::time::timeout(idle, read_fut).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    counter!(M_IDLE_TIMEOUT).increment(1);
-                    break;
+            tokio::select! {
+                biased;
+                _ = send_token.cancelled() => break,
+                r = tokio::time::timeout(idle, client_r.read(&mut buf)) => {
+                    let n = match r {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) => break, // 读出错（含对端 reset）
+                        Err(_) => {
+                            counter!(M_IDLE_TIMEOUT).increment(1);
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if up_for_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    total += n as u64;
                 }
-            };
-            if n == 0 {
-                break;
             }
-            up_for_send
-                .write_all(&buf[..n])
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            total += n as u64;
         }
+        // 关 upstream 写半边——让对端 recv read 立刻拿到 0
         up_for_send.shutdown();
+        send_token.cancel();
         Ok::<u64, std::io::Error>(total)
     });
 
@@ -395,25 +411,58 @@ async fn relay_with_idle_timeout(
         let mut buf = vec![0u8; buf_size];
         let mut total: u64 = 0;
         loop {
-            let read_fut = up_for_recv.read(&mut buf);
-            let n = match tokio::time::timeout(idle, read_fut).await {
-                Ok(r) => r.map_err(|e| std::io::Error::other(e.to_string()))?,
-                Err(_) => {
-                    counter!(M_IDLE_TIMEOUT).increment(1);
-                    break;
+            tokio::select! {
+                biased;
+                _ = recv_token.cancelled() => break,
+                r = tokio::time::timeout(idle, up_for_recv.read(&mut buf)) => {
+                    let n = match r {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            counter!(M_IDLE_TIMEOUT).increment(1);
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if client_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    total += n as u64;
                 }
-            };
-            if n == 0 {
-                break;
             }
-            client_w.write_all(&buf[..n]).await?;
-            total += n as u64;
         }
+        // 关 client 写半边——让对端 send 的 client_r.read 立刻拿到 0
         let _ = client_w.shutdown().await;
+        recv_token.cancel();
         Ok::<u64, std::io::Error>(total)
     });
 
-    let up = send.await.map_err(|e| Error::other(e.to_string()))??;
-    let down = recv.await.map_err(|e| Error::other(e.to_string()))??;
-    Ok((up, down))
+    // 并发等两侧；任一侧退出会经 token + shutdown 把对端踢醒。
+    // 短 grace 兜底：极端情况下（例如 client 半关但不 reset）对端可能还要
+    // 让 read 真正返回 0；500ms 足够，再卡就 abort 对应 task。
+    let (up_res, down_res) = match tokio::time::timeout(idle + Duration::from_millis(500), async {
+        tokio::try_join!(
+            async {
+                send.await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+            },
+            async {
+                recv.await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(Error::other(e.to_string())),
+        Err(_) => {
+            // 真出现某侧永久卡住——最后兜底，按 0 字节统计该方向，主流程继续
+            counter!(M_IDLE_TIMEOUT).increment(1);
+            (0, 0)
+        }
+    };
+    Ok((up_res, down_res))
 }

@@ -1,13 +1,15 @@
-# 本地 fork：wireguard-netstack v0.3.0 + UDP 扩展
+# 本地 fork：wireguard-netstack v0.3.1 + UDP 扩展
 # 上游 base commit：7e6ea79e241feb177c3fb3cfed4e793b1a594584
 # 相对上游的改动：
 #   - 去掉了 workspace 相对引用，让本 crate 可以独立编译
 #   - 在 smoltcp 中启用了 `socket-udp` feature
 #   - 新增用户态 UDP socket 支持（见 src/netstack.rs 里的 UdpHandle）
 #   - 在 lib.rs 中重新导出 UdpHandle
+#   - v0.3.1：netstack 锁瓶颈优化（buffer alloc 出锁、recv/send_with_state 合并取锁、
+#             UDP recv_from 改 state_notify 唤醒）
 [package]
 name = "wireguard-netstack"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "GPL-3.0"
 authors = ["Lorenzo Rizzotti <dev@dreaming.codes>", "warp-rust contributors"]

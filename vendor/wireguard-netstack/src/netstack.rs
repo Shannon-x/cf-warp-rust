@@ -2,6 +2,54 @@
 //!
 //! This module provides a TCP/IP stack that runs entirely in userspace,
 //! routing packets through our WireGuard tunnel.
+//!
+//! # LOCK DISCIPLINE（warp-rust fork v0.3.1，Bug #5 (A)）
+//!
+//! `NetStackInner` 被一把全局 `parking_lot::Mutex` 守着。这把锁是高并发下
+//! 最大的串行化瓶颈 —— **每条连接的 read / write / poll / push_rx 都要争
+//! 这同一把锁**。规则：
+//!
+//! 1. 锁内**只允许** smoltcp 状态机操作：socket get/get_mut、`interface.poll`、
+//!    `interface.context`、`sockets.add/remove`、`rx_queue.push/pop`、
+//!    `tx_queue.drain` 等。
+//! 2. **不允许在锁内做**：
+//!    - 任何 `Vec::new` / `vec![..; N]` 等 heap alloc（尤其是 MB 级 socket buffer）
+//!    - IP / TCP packet 解析（`Ipv4Packet::new_checked` 等）—— 这只是日志用
+//!    - `format!`、`String::push_str`
+//!    - 任何 `.await` / 阻塞调用 / 跨线程 channel send
+//! 3. 对小操作（can_send/recv + send/recv + may_send/recv）**优先用
+//!    `send_with_state` / `recv_with_state` 等组合 API**，一次拿锁做完
+//!    多件事，避免一个 hot path 三次进出锁。
+//!
+//! 长期目标（v0.4）：sharded NetStack —— 按 5-tuple hash 到多个独立
+//! NetStack，每个有自己的 SocketSet + Interface。本次（v0.3.1）暂不做
+//! 因为 (a) Cloudflare WARP 单 keypair 多 session 兼容性未验证，
+//! (b) smoltcp 的 `Interface::poll` 要 `&mut SocketSet`，单 stack 内无法
+//! 进一步细化锁。
+//!
+//! # LOCK DISCIPLINE（warp-rust fork v0.3.1，Bug #5 (A)）
+//!
+//! `NetStackInner` 被一把全局 `parking_lot::Mutex` 守着。这把锁是高并发下
+//! 最大的串行化瓶颈 —— **每条连接的 read / write / poll / push_rx 都要争
+//! 这同一把锁**。规则：
+//!
+//! 1. 锁内**只允许** smoltcp 状态机操作：socket get/get_mut、`interface.poll`、
+//!    `interface.context`、`sockets.add/remove`、`rx_queue.push/pop`、
+//!    `tx_queue.drain` 等。
+//! 2. **不允许在锁内做**：
+//!    - 任何 `Vec::new` / `vec![..; N]` 等 heap alloc（尤其是 MB 级 socket buffer）
+//!    - IP / TCP packet 解析（`Ipv4Packet::new_checked` 等）—— 这只是日志用
+//!    - `format!`、`String::push_str`
+//!    - 任何 `.await` / 阻塞调用 / 跨线程 channel send
+//! 3. 对小操作（can_send/recv + send/recv + may_send/recv）**优先用
+//!    `send_with_state` / `recv_with_state` 等组合 API**，一次拿锁做完
+//!    多件事，避免一个 hot path 三次进出锁。
+//!
+//! 长期目标（v0.4）：sharded NetStack —— 按 5-tuple hash 到多个独立
+//! NetStack，每个有自己的 SocketSet + Interface。本次（v0.3.1）暂不做
+//! 因为 (a) Cloudflare WARP 单 keypair 多 session 兼容性未验证，
+//! (b) smoltcp 的 `Interface::poll` 要 `&mut SocketSet`，单 stack 内无法
+//! 进一步细化锁。
 
 use crate::error::{Error, Result};
 use crate::wireguard::WireGuardTunnel;
@@ -257,15 +305,28 @@ impl NetStack {
     }
 
     /// Create a new TCP socket and return its handle.
+    ///
+    /// PERF（warp-rust fork v0.3.1，Bug #5 (A)）：
+    /// 在 1MiB tcp_buffer_size 配置下，rx+tx 总共要分配 2MiB。如果把
+    /// `vec![0u8; ...]` 放在 `inner.lock()` 之内，新连接建立时这把全局锁
+    /// 至少要被持有一次 ~毫秒级 alloc + zeroing 的时长，**严重阻塞**正在
+    /// 跑流量的所有其它连接 + poll loop。
+    ///
+    /// 修复：alloc / SocketBuffer 构造 / TcpSocket 配置全部在锁外完成，
+    /// 锁内只剩 `sockets.add(socket)` 一次 O(1) slab 插入。
+    ///
+    /// **锁内只允许 smoltcp state machine 操作；任何 alloc / 日志解析
+    /// 都必须在锁外做。** 见模块顶部 LOCK DISCIPLINE 注释。
     pub fn create_tcp_socket(&self) -> SocketHandle {
-        let mut inner = self.inner.lock();
-
+        // ---- 锁外：分配 buffer + 构造 socket ----
         let rx_buffer = SocketBuffer::new(vec![0u8; self.tcp_buffer_size]);
         let tx_buffer = SocketBuffer::new(vec![0u8; self.tcp_buffer_size]);
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
 
+        // ---- 锁内：仅做 slab 插入 ----
+        let mut inner = self.inner.lock();
         inner.sockets.add(socket)
     }
 
@@ -390,6 +451,51 @@ impl NetStack {
         socket.state()
     }
 
+    /// PERF（warp-rust fork v0.3.1，Bug #5 (A)）：组合 recv —— 单次取锁完成
+    /// `can_recv` → `recv_slice` → `may_recv` 三件事，给热路径的
+    /// `TcpConnection::read` 用。
+    ///
+    /// 返回 `(n, may_recv)`：
+    /// - `n > 0`：成功读到数据
+    /// - `n == 0, may_recv == true`：socket 还活着但暂无数据，调用方应等
+    ///   状态通知后重试
+    /// - `n == 0, may_recv == false`：对端已 FIN / RST，调用方应返回 EOF
+    pub fn recv_with_state(&self, handle: SocketHandle, buf: &mut [u8]) -> Result<(usize, bool)> {
+        let mut inner = self.inner.lock();
+        let socket = inner.sockets.get_mut::<TcpSocket>(handle);
+        let n = if socket.can_recv() {
+            socket
+                .recv_slice(buf)
+                .map_err(|e| Error::TcpRecv(e.to_string()))?
+        } else {
+            0
+        };
+        let may = socket.may_recv();
+        Ok((n, may))
+    }
+
+    /// PERF（warp-rust fork v0.3.1，Bug #5 (A)）：组合 send —— 单次取锁完成
+    /// `can_send` → `send_slice` → `may_send`。
+    ///
+    /// 返回 `(written, may_send)`：
+    /// - `written > 0`：放进 tx_buffer 的字节数（调用方应紧接着 `kick()`
+    ///   叫醒 poll loop 把包发出去）
+    /// - `written == 0, may_send == true`：tx_buffer 满，调用方等通知重试
+    /// - `written == 0, may_send == false`：连接已关闭
+    pub fn send_with_state(&self, handle: SocketHandle, data: &[u8]) -> Result<(usize, bool)> {
+        let mut inner = self.inner.lock();
+        let socket = inner.sockets.get_mut::<TcpSocket>(handle);
+        let n = if socket.can_send() {
+            socket
+                .send_slice(data)
+                .map_err(|e| Error::TcpSend(e.to_string()))?
+        } else {
+            0
+        };
+        let may = socket.may_send();
+        Ok((n, may))
+    }
+
     /// Send data on a TCP socket.
     pub fn send(&self, handle: SocketHandle, data: &[u8]) -> Result<usize> {
         let mut inner = self.inner.lock();
@@ -426,35 +532,38 @@ impl NetStack {
     /// Poll the network stack, processing packets and updating socket states.
     /// Returns true if there was any activity.
     pub fn poll(&self) -> bool {
-        let mut inner = self.inner.lock();
+        // v0.3.1（Bug #5 (A)）：锁内**只做** smoltcp 状态机推进 +
+        // device queue 操作。所有 trace 日志移到锁外（length 已经预先取出）。
+        let (processed, tx_packets, rx_queue_len) = {
+            let mut inner = self.inner.lock();
+            let timestamp = Instant::now();
 
-        let timestamp = Instant::now();
+            // Destructure to allow split borrows
+            let NetStackInner {
+                ref mut interface,
+                ref mut device,
+                ref mut sockets,
+            } = *inner;
 
-        // Destructure to allow split borrows
-        let NetStackInner {
-            ref mut interface,
-            ref mut device,
-            ref mut sockets,
-        } = *inner;
+            let rx_queue_len = device.rx_queue.len();
 
-        // Check if there are packets waiting
-        let rx_queue_len = device.rx_queue.len();
+            // Poll the interface
+            let poll_result = interface.poll(timestamp, device, sockets);
+            let processed = poll_result != PollResult::None;
+
+            // Drain transmitted packets and send through WireGuard
+            let tx_packets = device.drain_tx();
+            (processed, tx_packets, rx_queue_len)
+        }; // <- lock released here
+
         if rx_queue_len > 0 {
             log::trace!("NetStack poll: {} packets in rx_queue", rx_queue_len);
         }
-
-        // Poll the interface
-        let poll_result = interface.poll(timestamp, device, sockets);
-        let processed = poll_result != PollResult::None;
-
         if processed {
             log::trace!("NetStack poll processed packets");
         }
 
-        // Drain transmitted packets and send through WireGuard
-        let tx_packets = device.drain_tx();
         let tx_count = tx_packets.len();
-        drop(inner); // Release lock before async operations
 
         if tx_count > 0 {
             log::trace!("NetStack poll sending {} packets", tx_count);
@@ -675,21 +784,18 @@ impl TcpConnection {
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
         // v0.3.0：无硬超时（由上层 idle_timeout 控制），并用 poll loop 的
         // state_notify 唤醒，避免每条连接 100µs 忙轮询抢同一把 netstack 锁。
+        //
+        // v0.3.1（Bug #5 (A)）：用 `recv_with_state` 把 can_recv + recv +
+        // may_recv 合成单次取锁。原版每轮要进出锁 2-3 次，对高并发场景
+        // 是显著的争用。
         loop {
-            // 直接读：smoltcp socket 状态由 poll loop 推进，我们这里不 poll
-            // 避免抢锁。第一次循环若没数据则等待状态变化。
-            if self.netstack.can_recv(self.handle) {
-                match self.netstack.recv(self.handle, buf) {
-                    Ok(n) if n > 0 => return Ok(n),
-                    Ok(_) => {}
-                    Err(e) => return Err(e),
-                }
+            let (n, may_recv) = self.netstack.recv_with_state(self.handle, buf)?;
+            if n > 0 {
+                return Ok(n);
             }
-
-            if !self.netstack.may_recv(self.handle) {
+            if !may_recv {
                 return Ok(0); // 对端关闭
             }
-
             self.netstack.wait_for_activity().await;
         }
     }
@@ -698,27 +804,23 @@ impl TcpConnection {
     pub async fn write(&self, data: &[u8]) -> Result<usize> {
         let mut written = 0;
 
+        // v0.3.1（Bug #5 (A)）：`send_with_state` 把 can_send + send +
+        // may_send 合成单次取锁；写出非零字节后再叫一次 `kick()`（在锁外）
+        // 让 poll loop 立即把包发出去。
         while written < data.len() {
-            if self.netstack.can_send(self.handle) {
-                match self.netstack.send(self.handle, &data[written..]) {
-                    Ok(n) => {
-                        written += n;
-                        // 写入了数据 → 唤醒 poll loop 让它立刻把包发出去
-                        if n > 0 {
-                            self.netstack.kick();
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
+            let (n, may_send) = self
+                .netstack
+                .send_with_state(self.handle, &data[written..])?;
+            if n > 0 {
+                written += n;
+                self.netstack.kick();
+                continue;
             }
-
-            if !self.netstack.may_send(self.handle) {
+            if !may_send {
                 return Err(Error::ConnectionClosed);
             }
-
-            if written < data.len() {
-                self.netstack.wait_for_activity().await;
-            }
+            // tx_buffer 满或暂时不可发送：等状态通知
+            self.netstack.wait_for_activity().await;
         }
         Ok(written)
     }
@@ -794,8 +896,10 @@ impl NetStack {
             local_port
         };
 
-        let mut inner = self.inner.lock();
-
+        // PERF（warp-rust fork v0.3.1，Bug #5 (A)）：buffer alloc 留在锁外，
+        // 锁内只做 `bind` + `sockets.add` 这两个 smoltcp state machine 操作。
+        // UDP payload buffer 是 1500 × 32 = 48KB × 2，比 TCP 的 1MB×2 小得多，
+        // 但同一规则照旧 —— 不在锁内做任何 alloc。
         let rx_buffer = UdpPacketBuffer::new(
             vec![UdpPacketMetadata::EMPTY; UDP_PKT_SLOTS],
             vec![0u8; UDP_PAYLOAD_BYTES],
@@ -837,11 +941,16 @@ impl NetStack {
             port,
         };
 
+        // bind 只改 socket 自身状态，无需 SocketSet，可以在锁外做。
         socket
             .bind(listen)
             .map_err(|e| Error::TcpConnectGeneric(format!("UDP bind failed: {}", e)))?;
 
-        let handle = inner.sockets.add(socket);
+        // 锁内：仅做 slab 插入。
+        let handle = {
+            let mut inner = self.inner.lock();
+            inner.sockets.add(socket)
+        };
         log::debug!("UDP socket bound to {}:{}", log_str, port);
 
         Ok(UdpHandle {
@@ -938,19 +1047,31 @@ impl UdpHandle {
         Ok(())
     }
 
-    /// 接收一个数据报。1ms 节奏忙轮询，最多等待 `timeout`；超时返回
-    /// `Err(ReadTimeout)`。v0.2.0：返回 SocketAddr（v4/v6）。
+    /// 接收一个数据报。最多等待 `timeout`；超时返回 `Err(ReadTimeout)`。
+    /// v0.3.x：与 TCP read 对齐 —— 不再 1ms 忙轮询，也不在 hot path 主动
+    /// `poll()`（会跟 poll loop 抢 inner 锁）。改成先 try_recv，无数据时挂
+    /// 在 `state_notify` 上等 poll loop 唤醒；用一个总 deadline 控制超时。
+    /// v0.2.0：返回 SocketAddr（v4/v6）。
     pub async fn recv_from(&self, buf: &mut [u8], timeout: Duration) -> Result<(usize, SocketAddr)> {
-        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            self.netstack.poll();
             if let Some(got) = self.netstack.udp_try_recv(self.handle, buf)? {
                 return Ok(got);
             }
-            if start.elapsed() > timeout {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Err(Error::ReadTimeout);
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // 等到 poll loop 处理过 rx（state_notify）或到 deadline 为止。
+            // wait_for_activity 自身带 1ms fallback 防 notify 漏掉，这里再加
+            // 一个 deadline sleep 用于上层 cancel 检查。
+            tokio::select! {
+                _ = self.netstack.wait_for_activity() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    // 让出后下一轮 try_recv + 再判 deadline，避免 sleep 与
+                    // 通知 race 时直接 ReadTimeout 漏一次数据。
+                }
+            }
         }
     }
 }

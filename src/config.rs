@@ -7,10 +7,13 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
     Figment,
 };
+use metrics::counter;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::metrics::M_CONTAINER_OPEN_PROXY_WARN;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -240,6 +243,15 @@ pub struct DnsConfig {
     /// LRU 缓存 TTL；命中跳过 DNS 查询
     #[serde(with = "humantime_serde")]
     pub cache_ttl: Duration,
+    /// Negative cache TTL：解析失败（NXDOMAIN / 超时 / 无该 qtype 记录）后的短暂缓存
+    /// 时间。防止失败域名被反复打 DNS。建议很短（默认 5s），故意失败的客户端最多
+    /// 5s 后能恢复。
+    #[serde(with = "humantime_serde", default = "default_dns_negative_ttl")]
+    pub negative_ttl: Duration,
+}
+
+fn default_dns_negative_ttl() -> Duration {
+    Duration::from_secs(5)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +268,7 @@ impl Default for DnsConfig {
             servers: vec!["1.1.1.1:53".parse().unwrap(), "1.0.0.1:53".parse().unwrap()],
             timeout: Duration::from_secs(3),
             cache_ttl: Duration::from_secs(60),
+            negative_ttl: default_dns_negative_ttl(),
         }
     }
 }
@@ -275,23 +288,40 @@ impl Config {
     /// 启动前安全校验：拒绝公网（非 loopback）+ 无鉴权组合。
     /// 用户若清楚自己在做什么，可设环境变量 `WARP_RUST_ALLOW_OPEN_PROXY=1` 跳过。
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_container(detect_container())
+    }
+
+    /// 与 [`Self::validate`] 等价，但容器探测结果作为参数注入，便于单测覆盖两条分支。
+    pub fn validate_with_container(&self, is_container: bool) -> Result<(), String> {
         let ip = self.server.bind.ip();
         if !ip.is_loopback() && self.server.auth.is_none() {
+            // 1) 用户显式声明接受风险，最高优先级
             if std::env::var("WARP_RUST_ALLOW_OPEN_PROXY").ok().as_deref() == Some("1") {
                 tracing::warn!(
                     bind = %self.server.bind,
                     "WARP_RUST_ALLOW_OPEN_PROXY=1：跳过开放代理校验（你已显式接受高风险）"
                 );
-                return Ok(());
+            // 2) 容器内 + 0.0.0.0 是常见且必需的姿势（宿主 -p 127.0.0.1:port:1080）
+            //    只 warn 不拒绝；同时 +1 counter 方便日志/指标聚合时告警
+            //    注：仅放行 IPv4 0.0.0.0；IPv6 :: 仍按原策略拒绝（双栈公网监听意图不在此例外里）
+            } else if is_container && ip == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+                tracing::warn!(
+                    bind = %self.server.bind,
+                    "容器内监听 0.0.0.0 + 无 [server.auth]：假设宿主 -p 已限定到 loopback \
+                     （如 -p 127.0.0.1:1080:1080）；若用 -p 0.0.0.0:1080:1080 或 -p 1080:1080 \
+                     暴露到公网，请额外配置 [server.auth] username/password，否则等于开放代理"
+                );
+                counter!(M_CONTAINER_OPEN_PROXY_WARN).increment(1);
+            } else {
+                return Err(format!(
+                    "拒绝启动：server.bind = {} 不是 loopback，但 [server.auth] 为空。\n  \
+                     这等于把无鉴权的 SOCKS5 暴露给互联网。\n  \
+                     · 改回本机：把 bind 改成 127.0.0.1:<port>\n  \
+                     · 启用鉴权：在 config.toml 加 [server.auth] username/password（≥16 位强密码）\n  \
+                     · 显式覆盖（不推荐）：设置环境变量 WARP_RUST_ALLOW_OPEN_PROXY=1",
+                    self.server.bind,
+                ));
             }
-            return Err(format!(
-                "拒绝启动：server.bind = {} 不是 loopback，但 [server.auth] 为空。\n  \
-                 这等于把无鉴权的 SOCKS5 暴露给互联网。\n  \
-                 · 改回本机：把 bind 改成 127.0.0.1:<port>\n  \
-                 · 启用鉴权：在 config.toml 加 [server.auth] username/password（≥16 位强密码）\n  \
-                 · 显式覆盖（不推荐）：设置环境变量 WARP_RUST_ALLOW_OPEN_PROXY=1",
-                self.server.bind,
-            ));
         }
         // metrics 端口同样校验：含运营信息，公网暴露不可（无 metrics 鉴权机制）
         let m = self.metrics.bind.ip();
@@ -335,6 +365,27 @@ impl Config {
     }
 }
 
+/// 容器环境探测：用于把 validate 的开放代理拒绝放宽为 warn。
+///
+/// 命中任一即认为是容器：
+/// - 存在 `/.dockerenv`（Docker / 多数 OCI runtime 都会写）
+/// - `/proc/1/cgroup` 含 `docker` / `containerd` / `kubepods` / `podman` / `lxc`
+///
+/// 故意不读 env（PID/HOSTNAME 之类太脆），有 io；测试请走 `validate_with_container`。
+fn detect_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    if let Ok(cg) = std::fs::read_to_string("/proc/1/cgroup") {
+        for marker in ["docker", "containerd", "kubepods", "podman", "lxc"] {
+            if cg.contains(marker) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +424,39 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.contains("password"));
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+
+    fn cfg(bind: &str) -> Config {
+        let mut c = Config::default();
+        c.server.bind = bind.parse().unwrap();
+        c.server.auth = None;
+        c
+    }
+
+    #[test]
+    fn validate_container_v4_no_auth_warns() {
+        // 容器内 0.0.0.0 + 无 auth → 放行（warn + counter），其它项默认值合法
+        assert!(cfg("0.0.0.0:1080").validate_with_container(true).is_ok());
+    }
+
+    #[test]
+    fn validate_non_container_v4_no_auth_still_rejected() {
+        // 同样配置，非容器环境必须拒绝（保住主机直跑场景的安全保护）
+        let err = cfg("0.0.0.0:1080")
+            .validate_with_container(false)
+            .unwrap_err();
+        assert!(err.contains("拒绝启动"));
+    }
+
+    #[test]
+    fn validate_container_v6_unspecified_still_rejected() {
+        // 容器例外仅覆盖 IPv4 0.0.0.0；:: 仍走原策略
+        let err = cfg("[::]:1080").validate_with_container(true).unwrap_err();
+        assert!(err.contains("拒绝启动"));
     }
 }

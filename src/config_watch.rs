@@ -4,6 +4,10 @@
 //! WARN。**不主动改 running state** —— 因为大部分非平凡设置（监听地址、日志
 //! 级别、探针间隔）热改都涉及子系统重启，会让生命周期复杂化。这里的价值
 //! 是：你改错配置文件能立刻在日志里看到，不必等到重启时才发现。
+//!
+//! **重要：配置变化不会自动应用，需 `systemctl restart warp-rust`**（或重启
+//! 进程）才会让新值生效。本模块仅做 lint / 早期发现错配，不要把它当成
+//! 热重载机制来设计上游调用。
 
 use crate::config::Config;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};

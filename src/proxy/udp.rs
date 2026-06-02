@@ -106,31 +106,47 @@ pub async fn run_relay(
         tokio::spawn(async move {
             let v4 = pair.v4.clone();
             let v6 = pair.v6.clone();
+            // Bug #6：buffer 提到 loop 外复用，避免每轮 65KiB 分配。
+            // select! 同时拿 v4/v6 时两个 future 需要互不重叠的可变借用，
+            // 所以保留两块独立 buffer。
+            let mut buf_v4 = vec![0u8; 65_535];
+            let mut buf_v6 = vec![0u8; 65_535];
+            enum Pick {
+                V4(usize, SocketAddr),
+                V6(usize, SocketAddr),
+                Timeout,
+            }
             loop {
                 if parent.is_cancelled() {
                     break;
                 }
-                let mut buf_v4 = vec![0u8; 65_535];
-                let mut buf_v6 = vec![0u8; 65_535];
 
                 // 同时等 v4 / v6，谁先有谁先发。无 v6 时仅 v4。
-                let result: Option<(usize, SocketAddr, Vec<u8>)> = if let Some(v6h) = &v6 {
+                // 用 enum 标记来源，避免把 buffer 移出 select! arm。
+                let pick: Pick = if let Some(v6h) = &v6 {
                     let fut_v4 = v4.recv_from(&mut buf_v4, Duration::from_millis(200));
                     let fut_v6 = v6h.recv_from(&mut buf_v6, Duration::from_millis(200));
                     tokio::select! {
-                        r = fut_v4 => r.ok().map(|(n, sa)| (n, sa, buf_v4)),
-                        r = fut_v6 => r.ok().map(|(n, sa)| (n, sa, buf_v6)),
+                        r = fut_v4 => match r {
+                            Ok((n, sa)) => Pick::V4(n, sa),
+                            Err(_) => Pick::Timeout,
+                        },
+                        r = fut_v6 => match r {
+                            Ok((n, sa)) => Pick::V6(n, sa),
+                            Err(_) => Pick::Timeout,
+                        },
                     }
                 } else {
-                    v4.recv_from(&mut buf_v4, Duration::from_millis(200))
-                        .await
-                        .ok()
-                        .map(|(n, sa)| (n, sa, buf_v4))
+                    match v4.recv_from(&mut buf_v4, Duration::from_millis(200)).await {
+                        Ok((n, sa)) => Pick::V4(n, sa),
+                        Err(_) => Pick::Timeout,
+                    }
                 };
 
-                let (n, src, buf) = match result {
-                    Some(x) => x,
-                    None => continue, // 两边都 timeout，循环检查 cancel
+                let (n, src, buf): (usize, SocketAddr, &[u8]) = match pick {
+                    Pick::V4(n, sa) => (n, sa, &buf_v4[..n]),
+                    Pick::V6(n, sa) => (n, sa, &buf_v6[..n]),
+                    Pick::Timeout => continue, // 两边都 timeout，循环检查 cancel
                 };
 
                 let dst = match *client_addr.lock().await {
@@ -140,7 +156,8 @@ pub async fn run_relay(
                         continue;
                     }
                 };
-                let framed = wrap_socks5_udp(src, &buf[..n]);
+                let framed = wrap_socks5_udp(src, buf);
+                let _ = n; // n 已经反映在 buf 切片长度里
                 if let Err(e) = relay_bind.send_to(&framed, dst).await {
                     warn!(error = %e, "tunnel→client send failed");
                     break;

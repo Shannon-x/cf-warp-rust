@@ -36,12 +36,19 @@ VOLUME ["/app/data"]
 EXPOSE 1080 9090
 
 # 1080 = SOCKS5；9090 = Prometheus /metrics
-# 默认容器内绑 127.0.0.1（与 install.sh 默认一致，开箱即安全）。
-# 想对外暴露：docker run -e WARP_RUST_SERVER__BIND=0.0.0.0:1080 \
-#                       -e WARP_RUST_SERVER__AUTH__USERNAME=me \
-#                       -e WARP_RUST_SERVER__AUTH__PASSWORD='<强密码>' ...
-# 不设 AUTH 直接改 BIND=0.0.0.0 启动会被 Config::validate 拒绝（安全网）
-ENV WARP_RUST_SERVER__BIND=127.0.0.1:1080 \
-    WARP_RUST_METRICS__BIND=127.0.0.1:9090
+#
+# 安全模型：
+#   · 容器内 server.bind / metrics.bind 一律由挂载进来的 config.toml 决定，
+#     推荐写 0.0.0.0:1080 / 0.0.0.0:9090 —— 容器命名空间内的 0.0.0.0 不等于
+#     宿主公网，对外暴露范围完全由宿主侧 `docker run -p` 限定。
+#   · 默认 scripts/run-docker.sh 用 `-p 127.0.0.1:1080:1080` 仅绑 loopback；
+#     传 --expose 才会改成 `-p 0.0.0.0:1080:1080` 并强制启用 [server.auth]。
+#   · 不设 AUTH 又把 server.bind 改成非 loopback 时会被 Config::validate 拒绝
+#     （容器场景下 0.0.0.0 + 无 auth 会 warn 但不阻塞，假设宿主 -p 已限定）。
+#
+# 故意不在镜像里设 ENV WARP_RUST_SERVER__BIND / METRICS__BIND：
+#   figment 的 env 优先级高于 toml，固定 ENV 会反过来把挂载的 config.toml 覆盖掉，
+#   导致容器内仍只监听 127.0.0.1，宿主 -p 转发不通（issue: bug #1）。
+# 如需临时覆盖，仍可在 `docker run` 时显式传 `-e WARP_RUST_SERVER__BIND=...`。
 
 ENTRYPOINT ["/usr/local/bin/warp-rust", "--config", "/app/config.toml"]
