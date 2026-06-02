@@ -51,14 +51,16 @@ valid_port() {
 generate_password() {
   # 24 位字母数字混合，约 143 bits 熵；只用 alphanumeric 是为了避免在 TOML
   # 和命令行里因转义产生奇怪 bug。
-  # 注意：set -o pipefail 下 `tr ... </dev/urandom | head` 会因 head 提前关
-  # pipe 让 tr 收到 SIGPIPE，导致整条管道失败。所以先一次性读固定长度的
-  # 随机字节，再过滤，再截取 —— 三步都不会触发 SIGPIPE。
+  # pipefail-safe：先把随机字节全部读入 shell 变量，再过滤，再用 bash
+  # substring 截取，全程不存在「下游 head 提前关 pipe → 上游 SIGPIPE」的风险。
+  local raw chars
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 36 | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(openssl rand -base64 36) || return 1
   else
-    head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(head -c 512 /dev/urandom) || return 1
   fi
+  chars=$(printf '%s' "$raw" | LC_ALL=C tr -dc 'A-Za-z0-9')
+  printf '%s\n' "${chars:0:24}"
 }
 
 validate_password() {
@@ -242,6 +244,7 @@ main() {
         -v "$(pwd)/data:/app/data" \
         -v "$(pwd)/$cfg:/app/config.toml:ro" \
         -e WARP_RUST_SERVER__BIND="0.0.0.0:$container_port" \
+        -e WARP_RUST_TRUSTED_HOST_NET=1 \
         "$image"
       echo
       echo "  SOCKS5：$bind  → 容器内 0.0.0.0:$container_port"

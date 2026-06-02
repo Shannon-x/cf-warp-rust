@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::metrics::M_CONTAINER_OPEN_PROXY_WARN;
+use crate::metrics::{M_CONTAINER_OPEN_PROXY_WARN, M_OPEN_PROXY_ALLOWED};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -211,10 +211,18 @@ pub struct LimitsConfig {
     /// 鉴权失败后延迟，缓解暴破
     #[serde(with = "humantime_serde")]
     pub auth_fail_sleep: Duration,
+    /// v0.3.2：双向 relay 中一侧退出后，给对端的「优雅退出」窗口；超时则 abort。
+    /// 默认 500ms（对端正常会在毫秒级响应 CancellationToken + shutdown，grace 只是兜底）。
+    #[serde(with = "humantime_serde", default = "default_relay_close_grace")]
+    pub relay_close_grace: Duration,
 }
 
 fn default_relay_buffer_size() -> usize {
     256 * 1024
+}
+
+fn default_relay_close_grace() -> Duration {
+    Duration::from_millis(500)
 }
 
 impl Default for LimitsConfig {
@@ -225,6 +233,7 @@ impl Default for LimitsConfig {
             idle_timeout: Duration::from_secs(300),
             relay_buffer_size: default_relay_buffer_size(),
             auth_fail_sleep: Duration::from_secs(1),
+            relay_close_grace: default_relay_close_grace(),
         }
     }
 }
@@ -275,51 +284,95 @@ impl Default for DnsConfig {
 
 impl Config {
     /// 按 默认值 → `config.toml`（存在时）→ `WARP_RUST_*` 环境变量 三层叠加加载。
-    pub fn load(path: Option<&Path>) -> Result<Self, figment::Error> {
+    ///
+    /// 返回 `crate::error::Result<Self>` 而非 `Result<Self, figment::Error>`：
+    ///   1) figment::Error 大小 208 B，直接当 Err 类型会让本函数签名触发
+    ///      clippy::result_large_err（默认阈值 128 B），与 Error::Figment 是否 Box
+    ///      无关；
+    ///   2) 不再向 caller 泄漏配置后端实现细节；
+    ///   3) main.rs / config_watch.rs 里原本就是 `?` 立刻转 crate Error，所以
+    ///      caller 端零改动、行为不变。
+    pub fn load(path: Option<&Path>) -> crate::error::Result<Self> {
         let mut fig = Figment::from(Serialized::defaults(Config::default()));
         if let Some(p) = path {
             if p.exists() {
                 fig = fig.merge(Toml::file(p));
             }
         }
-        fig.merge(Env::prefixed("WARP_RUST_").split("__")).extract()
+        Ok(fig
+            .merge(Env::prefixed("WARP_RUST_").split("__"))
+            .extract()?)
     }
 
     /// 启动前安全校验：拒绝公网（非 loopback）+ 无鉴权组合。
     /// 用户若清楚自己在做什么，可设环境变量 `WARP_RUST_ALLOW_OPEN_PROXY=1` 跳过。
+    ///
+    /// v0.3.2 起，容器内 `0.0.0.0` 例外**额外**需要 `WARP_RUST_TRUSTED_HOST_NET=1`
+    /// —— 语义即「部署方已用宿主 `-p 127.0.0.1:...` 限定，对宿主网络栈安全负责」。
+    /// 仓库 `scripts/run-docker.sh`、`docker-compose.yml`、`scripts/quickstart.sh`
+    /// 都显式注入此 env；走仓库脚本的用户完全无感。手搓 `docker run -p 1080:1080
+    /// ghcr.io/...` 且不带 auth 的高危姿势会被堵住（v0.3.2 BREAKING change）。
     pub fn validate(&self) -> Result<(), String> {
         self.validate_with_container(detect_container())
     }
 
     /// 与 [`Self::validate`] 等价，但容器探测结果作为参数注入，便于单测覆盖两条分支。
+    /// 内部读取 `WARP_RUST_TRUSTED_HOST_NET` env 后转交 [`Self::validate_with`]。
     pub fn validate_with_container(&self, is_container: bool) -> Result<(), String> {
+        let trusted_host_net =
+            std::env::var("WARP_RUST_TRUSTED_HOST_NET").ok().as_deref() == Some("1");
+        self.validate_with(is_container, trusted_host_net)
+    }
+
+    /// 纯函数版校验：容器探测与「是否信任宿主网络」均由参数注入，**不读任何 env**。
+    /// 单测直接调这个版本，避免 process-global env 在并行 cargo test 中互相污染。
+    /// （ALLOW_OPEN_PROXY env 仍读，但作为显式 escape hatch，测试默认不触发该路径。）
+    pub fn validate_with(&self, is_container: bool, trusted_host_net: bool) -> Result<(), String> {
         let ip = self.server.bind.ip();
         if !ip.is_loopback() && self.server.auth.is_none() {
-            // 1) 用户显式声明接受风险，最高优先级
+            // 1) 用户显式声明接受风险，最高优先级（保留 v0.1.1 起的公共契约）
             if std::env::var("WARP_RUST_ALLOW_OPEN_PROXY").ok().as_deref() == Some("1") {
                 tracing::warn!(
                     bind = %self.server.bind,
                     "WARP_RUST_ALLOW_OPEN_PROXY=1：跳过开放代理校验（你已显式接受高风险）"
                 );
-            // 2) 容器内 + 0.0.0.0 是常见且必需的姿势（宿主 -p 127.0.0.1:port:1080）
-            //    只 warn 不拒绝；同时 +1 counter 方便日志/指标聚合时告警
-            //    注：仅放行 IPv4 0.0.0.0；IPv6 :: 仍按原策略拒绝（双栈公网监听意图不在此例外里）
-            } else if is_container && ip == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+                counter!(M_OPEN_PROXY_ALLOWED).increment(1);
+            // 2) 容器内 + 0.0.0.0 + 显式声明信任宿主网络 → 放行（warn + counter）。
+            //    代码看不到宿主 -p，必须由部署方对宿主 loopback 限定负责。
+            //    仅放行 IPv4 0.0.0.0；IPv6 :: 仍按原策略拒绝（双栈公网监听不在此例外里）。
+            } else if is_container
+                && ip == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                && trusted_host_net
+            {
                 tracing::warn!(
                     bind = %self.server.bind,
-                    "容器内监听 0.0.0.0 + 无 [server.auth]：假设宿主 -p 已限定到 loopback \
-                     （如 -p 127.0.0.1:1080:1080）；若用 -p 0.0.0.0:1080:1080 或 -p 1080:1080 \
-                     暴露到公网，请额外配置 [server.auth] username/password，否则等于开放代理"
+                    trusted_host_net = true,
+                    "容器内监听 0.0.0.0 + 无 [server.auth] + WARP_RUST_TRUSTED_HOST_NET=1：\
+                     放行；假设宿主 -p 已限定到 loopback（如 -p 127.0.0.1:1080:1080）。\
+                     若实际用 -p 0.0.0.0:1080:1080 或 -p 1080:1080 暴露到公网，等于开放代理"
                 );
                 counter!(M_CONTAINER_OPEN_PROXY_WARN).increment(1);
+                counter!(M_OPEN_PROXY_ALLOWED).increment(1);
             } else {
+                // 容器场景下额外提示 trusted-host-net 这条出路；非容器场景不提（无意义）。
+                let container_hint = if is_container
+                    && ip == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                {
+                    "\n  · 容器场景（v0.3.2+）：若宿主侧已用 `-p 127.0.0.1:<port>:<port>` 限定到 loopback，\
+                     可设环境变量 WARP_RUST_TRUSTED_HOST_NET=1 表示你对宿主网络栈负责。\
+                     仓库 scripts/run-docker.sh / docker-compose.yml / scripts/quickstart.sh 已默认注入；\
+                     裸 `docker run` 或自定义部署需自己加。"
+                } else {
+                    ""
+                };
                 return Err(format!(
                     "拒绝启动：server.bind = {} 不是 loopback，但 [server.auth] 为空。\n  \
                      这等于把无鉴权的 SOCKS5 暴露给互联网。\n  \
                      · 改回本机：把 bind 改成 127.0.0.1:<port>\n  \
                      · 启用鉴权：在 config.toml 加 [server.auth] username/password（≥16 位强密码）\n  \
-                     · 显式覆盖（不推荐）：设置环境变量 WARP_RUST_ALLOW_OPEN_PROXY=1",
+                     · 显式覆盖（不推荐）：设置环境变量 WARP_RUST_ALLOW_OPEN_PROXY=1{}",
                     self.server.bind,
+                    container_hint,
                 ));
             }
         }
@@ -438,25 +491,43 @@ mod container_tests {
         c
     }
 
+    // 所有测试都走 validate_with(is_container, trusted_host_net) 直接传参，
+    // 不动 process-global env —— 这样和 cargo 默认并行 test 完美兼容，
+    // 也不需要 Mutex 串行（参见 v0.3.2 regression review 的核心要求）。
+
     #[test]
-    fn validate_container_v4_no_auth_warns() {
-        // 容器内 0.0.0.0 + 无 auth → 放行（warn + counter），其它项默认值合法
-        assert!(cfg("0.0.0.0:1080").validate_with_container(true).is_ok());
+    fn validate_container_v4_no_auth_with_trust_ok() {
+        // 容器 + 0.0.0.0 + 无 auth + 显式信任宿主网络 → 放行（warn + counter）
+        assert!(cfg("0.0.0.0:1080").validate_with(true, true).is_ok());
+    }
+
+    #[test]
+    fn validate_container_v4_no_auth_without_trust_rejected() {
+        // 关键回归（v0.3.2 新增）：容器 + 0.0.0.0 + 无 auth + 未信任 → 拒绝。
+        // 这条直接堵住裸 `docker run -p 1080:1080 ghcr.io/...` 把无鉴权 SOCKS5
+        // 挂到宿主 INADDR_ANY 的开放代理姿势（用户决策：Dockerfile 不设默认 ENV，
+        // 强制部署方显式 opt-in，BREAKING change）。
+        let err = cfg("0.0.0.0:1080").validate_with(true, false).unwrap_err();
+        assert!(err.contains("拒绝启动"));
+        assert!(
+            err.contains("WARP_RUST_TRUSTED_HOST_NET"),
+            "容器场景的错误消息必须提示 trusted-host-net 这条出路；实际：{err}"
+        );
+        // 同时保留 ALLOW_OPEN_PROXY 这条已发布契约的提示
+        assert!(err.contains("WARP_RUST_ALLOW_OPEN_PROXY"));
     }
 
     #[test]
     fn validate_non_container_v4_no_auth_still_rejected() {
-        // 同样配置，非容器环境必须拒绝（保住主机直跑场景的安全保护）
-        let err = cfg("0.0.0.0:1080")
-            .validate_with_container(false)
-            .unwrap_err();
+        // 主机直跑：即便 trusted=true 也必须拒绝 —— trust 只对容器+0.0.0.0 组合生效。
+        let err = cfg("0.0.0.0:1080").validate_with(false, true).unwrap_err();
         assert!(err.contains("拒绝启动"));
     }
 
     #[test]
     fn validate_container_v6_unspecified_still_rejected() {
-        // 容器例外仅覆盖 IPv4 0.0.0.0；:: 仍走原策略
-        let err = cfg("[::]:1080").validate_with_container(true).unwrap_err();
+        // 容器例外仅覆盖 IPv4 0.0.0.0；:: 仍走原策略，即便 trusted=true 也拒
+        let err = cfg("[::]:1080").validate_with(true, true).unwrap_err();
         assert!(err.contains("拒绝启动"));
     }
 }

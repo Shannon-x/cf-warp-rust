@@ -52,7 +52,7 @@ jobs:
           NAME="warp-rust-${TAG}-aarch64-apple-darwin"
           mkdir -p dist "$NAME"
           cp "target/aarch64-apple-darwin/release/warp-rust" "$NAME/"
-          cp README.md LICENSE SECURITY.md config.toml.example "$NAME/"
+          cp README.md LICENSE SECURITY.md config.toml.example config.toml.docker.example "$NAME/"
           mkdir -p "$NAME/scripts"
           cp scripts/*.sh "$NAME/scripts/"
           chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"

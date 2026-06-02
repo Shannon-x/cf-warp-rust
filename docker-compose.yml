@@ -1,15 +1,37 @@
 # 个人使用的最小 compose 配置：将 SOCKS5 与 metrics 绑定到宿主机 loopback
-# 凭据持久化到 ./data，配置文件以只读方式挂入
+# 凭据持久化到 ./data，配置文件以只读方式挂入。
+#
+# 配置语义（v0.3.2 起）：
+#   · 容器内必须监听 0.0.0.0（loopback 在容器命名空间内宿主 -p 无法转发进来）
+#   · 宿主对外暴露由下方 ports 段决定，默认仅 127.0.0.1（最安全姿势）
+#   · 想自定义鉴权/端口：`cp config.toml.docker.example config.toml` 再改
+#     —— 注意是 *.docker.example，不是 config.toml.example；后者默认 127.0.0.1
+#     在容器内拿不到 -p 转发，是 bug3 根因
+#   · v0.3.2 起新增 WARP_RUST_TRUSTED_HOST_NET=1：声明「宿主已用 -p 127.0.0.1 限定」
+#     —— 容器内 0.0.0.0 + 无 [server.auth] 时必须设此 env 才能启动，否则被 reject
+#
+# 从 v0.3.0 / v0.3.1 升级：如果你之前 `cp config.toml.example config.toml`，请改用
+# `cp config.toml.docker.example config.toml`（或删除该文件让容器用镜像内置默认），
+# 否则容器升级后仍 bind 127.0.0.1，宿主 -p 转不通。同时确认 environment 段含
+# WARP_RUST_TRUSTED_HOST_NET=1（已在下方默认列出），否则 v0.3.2 启动会被 validate 拒绝。
+#
+# 首次启动前请确保 ./config.toml 存在（哪怕是空文件 cp 自模板），否则 docker 会把
+# 它当成空目录挂入，容器启动会失败。
 services:
   warp-rust:
     build: .
     container_name: warp-rust
     restart: unless-stopped
     ports:
-      - "127.0.0.1:1080:1080"   # SOCKS5
+      - "127.0.0.1:1080:1080"   # SOCKS5；想公网暴露改 0.0.0.0:1080:1080 时务必在 config 配 [server.auth]
       - "127.0.0.1:9090:9090"   # Prometheus
     volumes:
       - ./data:/app/data
+      # 用户自有 config.toml（建议从 config.toml.docker.example 拷出来再改）；
+      # 不挂这一行就用镜像内置默认（bind=0.0.0.0:1080，无 auth，仅在 -p 限定 127.0.0.1 时安全）
       - ./config.toml:/app/config.toml:ro
     environment:
       - RUST_LOG=info,warp_rust=info
+      # v0.3.2+：声明宿主已用 -p 127.0.0.1 限定，容器内 0.0.0.0 + 无 auth 才放行
+      # 想公网暴露并强制 auth？删此行 + 在 config.toml 配 [server.auth]
+      - WARP_RUST_TRUSTED_HOST_NET=1

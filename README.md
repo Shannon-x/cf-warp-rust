@@ -13,7 +13,7 @@
 - **配置变更检测（解析校验，不热应用）** — `config.toml` 改动会被监听并立即重新解析，TOML 语法错或字段错会马上在日志里报告；**但新配置不会自动应用到运行中的进程**，改完后需 `sudo systemctl restart warp-rust` 才生效。`systemd restart` 不会动 `data/account.json`，正在跑的 WARP 凭据/身份轮转状态都会保留。
 - **高吞吐默认值**（v0.3.0）：默认 MTU 1420、1MB smoltcp TCP 窗口、256KB SOCKS relay buffer，减少 WARP SOCKS 出站的单连接限速。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
-- **开放代理保护**（v0.1.1）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动（需 `WARP_RUST_ALLOW_OPEN_PROXY=1` 才能跳过）
+- **开放代理保护**（v0.1.1 + v0.3.2 收紧）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动。可通过 `WARP_RUST_ALLOW_OPEN_PROXY=1` 整体跳过校验（高风险）；**容器场景**还可通过 `WARP_RUST_TRUSTED_HOST_NET=1` 仅放行「容器内 0.0.0.0 + 宿主 `-p 127.0.0.1:...` 限定」这一窄场景。仓库 `scripts/run-docker.sh` / `docker-compose.yml` / `scripts/quickstart.sh` 已默认注入；**裸 `docker run -p 1080:1080 ghcr.io/...` 启动失败**（v0.3.2 BREAKING：必须显式 opt-in，杜绝意外把无鉴权 SOCKS5 挂到宿主 INADDR_ANY）。
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
 - **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl / Linux aarch64-musl / Windows x86_64 / macOS Apple Silicon）。
 
@@ -242,10 +242,22 @@ docker run -d \
   -p 127.0.0.1:9090:9090 \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/config.toml:/app/config.toml:ro \
+  -e WARP_RUST_TRUSTED_HOST_NET=1 \
   ghcr.io/shannon-x/cf-warp-rust:latest
 ```
 
-镜像内默认 `bind = 0.0.0.0:1080`，对外是否暴露由宿主 `-p` 决定。强烈建议 `-p 127.0.0.1:1080:1080` 只绑 loopback，外部访问通过 SSH/Tailscale 转发更安全。
+> 提示：v0.3.2 起若 `config.toml` 里 `[server].bind = 0.0.0.0:...` 且无 `[server.auth]`，必须显式 `-e WARP_RUST_TRUSTED_HOST_NET=1` 才能启动（声明宿主已用 `-p` 限定 loopback）。仓库脚本会自动注入；裸 `docker run` 需要自己加。或者改用 `[server.auth]` username/password 方式，则不再需要 trust env。
+>
+> 提示：如果 `./config.toml` 不存在又传了 `-v $(pwd)/config.toml:/app/config.toml:ro`，docker 会把它当空目录挂入，容器启动会失败。先 `cp config.toml.docker.example config.toml`，或者干脆不传那行 `-v config.toml` 让容器用镜像内置默认。
+
+镜像内默认 `bind = 0.0.0.0:1080`（来自 `config.toml.docker.example`，是**容器命名空间内**的 0.0.0.0，不等于宿主公网）。对外是否暴露完全由宿主 `docker run -p` 决定：
+
+- `-p 127.0.0.1:1080:1080`（**推荐的默认安全姿势**）→ 仅本机可访问，外部用 SSH/Tailscale 转发；
+- `-p 0.0.0.0:1080:1080` 或 `-p 1080:1080` → 暴露到所有网卡。此时**强烈建议**在 `config.toml` 配 `[server.auth]`（≥16 位强密码）。
+
+v0.3.2 起新增 `WARP_RUST_TRUSTED_HOST_NET=1`：声明「宿主已用 `-p 127.0.0.1` 限定，我对宿主网络负责」。容器内 `0.0.0.0` + 无 `[server.auth]` 时**必须**设此 env 才能启动，否则被 `Config::validate` 拒绝（启动失败、stderr 明示）。仓库自带的 `scripts/run-docker.sh`、`docker-compose.yml`、`scripts/quickstart.sh` 已自动注入。
+
+如果想自定义配置：`cp config.toml.docker.example config.toml`（**不要**用 `config.toml.example`，那份是给宿主直跑的，默认 `127.0.0.1` 在容器内拿不到 `-p` 转发，正是 bug3 根因），改完再 `docker run -e WARP_RUST_TRUSTED_HOST_NET=1 -v $(pwd)/config.toml:/app/config.toml:ro ...`。
 
 ---
 
@@ -271,6 +283,7 @@ cargo build --release
 | `[warp]` | `mtu` | WireGuard MTU。默认 1420；PMTU 不稳时可回退 1280 |
 | `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 1048576；每连接约占 2 倍内存 |
 | `[limits]` | `relay_buffer_size` | SOCKS TCP relay buffer。默认 262144 |
+| `[limits]` | `relay_close_grace` | v0.3.2：双向 relay 中一侧退出后给对端的优雅窗口；超时 abort 兜底。默认 `500ms` |
 | `[health]` | `interval` / `timeout` | 探针节奏（隧道内拨号 1.1.1.1:443） |
 | `[recovery]` | `reconnect_after` 等四档 | 触发每一级恢复动作的连续失败次数阈值 |
 | `[metrics]` | `enabled` / `bind` | Prometheus `/metrics` 端点 |

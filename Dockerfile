@@ -28,7 +28,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
 COPY --from=builder /src/target/release/warp-rust /usr/local/bin/warp-rust
-COPY config.toml.example /app/config.toml
+# 注意：这里复制的是 **docker 专用** example（bind = 0.0.0.0:1080 / 0.0.0.0:9090），
+# 不是 config.toml.example。config.toml.example 默认 127.0.0.1 是给宿主直跑用的，
+# 在容器命名空间内绑 loopback 会让宿主 `-p` 转不通（issue: bug3）。
+# 容器命名空间里的 0.0.0.0 不等于宿主公网，对外暴露范围完全由宿主 `docker run -p`
+# 决定；推荐挂载用户自己改过的 config（从 `config.toml.docker.example` 拷贝而来）。
+# 详见 README『Docker 镜像』一节。
+COPY config.toml.docker.example /app/config.toml
 
 # data/ 用于持久化身份与凭据
 VOLUME ["/app/data"]
@@ -43,8 +49,20 @@ EXPOSE 1080 9090
 #     宿主公网，对外暴露范围完全由宿主侧 `docker run -p` 限定。
 #   · 默认 scripts/run-docker.sh 用 `-p 127.0.0.1:1080:1080` 仅绑 loopback；
 #     传 --expose 才会改成 `-p 0.0.0.0:1080:1080` 并强制启用 [server.auth]。
-#   · 不设 AUTH 又把 server.bind 改成非 loopback 时会被 Config::validate 拒绝
-#     （容器场景下 0.0.0.0 + 无 auth 会 warn 但不阻塞，假设宿主 -p 已限定）。
+#   · 不设 AUTH 又把 server.bind 改成非 loopback 时会被 Config::validate 拒绝。
+#
+# v0.3.2 BREAKING（issue: bug4）：容器内 0.0.0.0 + 无 [server.auth] 时**额外**
+# 要求 `-e WARP_RUST_TRUSTED_HOST_NET=1` 才能启动 —— 语义即「部署方已用宿主
+# -p 127.0.0.1 限定，对宿主网络栈安全负责」。
+#   · 镜像故意**不设**这个 ENV 默认值：若设了默认值，裸 `docker run -p 1080:1080
+#     ghcr.io/...` 仍然能启动并把无鉴权 SOCKS5 挂到宿主 INADDR_ANY，等同于
+#     v0.3.1 的开放代理姿势，本次修复就白做了。
+#   · 走仓库 scripts/run-docker.sh / docker-compose.yml / scripts/quickstart.sh
+#     的用户无感（这三个调用方都显式注入 -e WARP_RUST_TRUSTED_HOST_NET=1）。
+#   · 手搓 `docker run` 的用户必须自己选：
+#       a) 加 -e WARP_RUST_TRUSTED_HOST_NET=1（前提：你确实用 -p 127.0.0.1: 限定），或
+#       b) 在 config.toml 配 [server.auth]，或
+#       c) -e WARP_RUST_ALLOW_OPEN_PROXY=1（整体绕过，含弱密码等其它校验，不推荐）
 #
 # 故意不在镜像里设 ENV WARP_RUST_SERVER__BIND / METRICS__BIND：
 #   figment 的 env 优先级高于 toml，固定 ENV 会反过来把挂载的 config.toml 覆盖掉，

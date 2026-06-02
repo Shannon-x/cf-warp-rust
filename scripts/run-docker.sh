@@ -40,13 +40,17 @@ done
 
 command -v docker >/dev/null 2>&1 || { echo "未安装 docker" >&2; exit 4; }
 
-# pipefail-safe：先一次性读固定字节再过滤再截取，避免 tr 收 SIGPIPE
+# pipefail-safe：先把随机字节全部读入 shell 变量，再过滤，再用 bash substring
+# 截取，全程无下游管道 → 不可能触发 SIGPIPE。
 gen_pw() {
+  local raw chars
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 36 | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(openssl rand -base64 36) || return 1
   else
-    head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(head -c 512 /dev/urandom) || return 1
   fi
+  chars=$(printf '%s' "$raw" | LC_ALL=C tr -dc 'A-Za-z0-9')
+  printf '%s\n' "${chars:0:24}"
 }
 ok_pw()  { local p="$1"; [ "${#p}" -ge 16 ] && [[ "$p" =~ [A-Z] ]] && [[ "$p" =~ [a-z] ]] && [[ "$p" =~ [0-9] ]]; }
 
@@ -130,6 +134,10 @@ fi
 
 mkdir -p ./data
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# 本脚本对宿主 -p 完全可控（默认 127.0.0.1，--expose 才放公网且强制 auth），
+# 因此可以代表用户对宿主网络栈安全负责 —— 注入 WARP_RUST_TRUSTED_HOST_NET=1
+# 解锁 v0.3.2+ 的容器内 0.0.0.0 + 无 auth 放行。镜像默认**不**设此 ENV
+# （v0.3.2 BREAKING 收紧）：裸 `docker run` 用户必须自己加 -e 或加 auth。
 docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
@@ -137,6 +145,7 @@ docker run -d \
   -p "127.0.0.1:9090:9090" \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/$CFG:/app/config.toml:ro" \
+  -e WARP_RUST_TRUSTED_HOST_NET=1 \
   "$IMAGE" >/dev/null
 
 echo "✓ 容器已启动：$CONTAINER ($IMAGE)" >&2

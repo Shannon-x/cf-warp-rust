@@ -23,7 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, trace, warn};
 
 /// 缓存项：单条记录类型的解析结果。
@@ -36,7 +36,20 @@ struct CacheEntry {
     expires: Instant,
 }
 
-/// 解析器实例，跨 SOCKS5 连接 / UDP 会话共享（`Arc<Resolver>`）。
+/// Singleflight 共享给所有 waiter 的结果载荷。
+///
+/// `Error` 不实现 Clone，所以这里只承载 `IpAddr | ()`（用 `Result<IpAddr, ()>`）：
+/// waiter 取到 `Err(())` 后调用 `neg_err(host, qtype)` 重建与 cache hit 路径完全
+/// 一致的 `Error` 变体（`DnsNoIpv4` / `Other("no AAAA …")`），从而保留对外的错误
+/// 变体类型语义——外部 `matches!(err, Error::DnsNoIpv4(_))` 等模式匹配不受影响。
+type SingleflightResult = std::result::Result<IpAddr, ()>;
+
+/// `in_flight` map value：leader 派生出的 Receiver 模板，waiter clone 后独立 await。
+/// 类型展开后是 `watch::Receiver<Option<Arc<Result<IpAddr, ()>>>>`，三层嵌套触发
+/// clippy::type_complexity；起 alias 让结构体定义可读。
+type SingleflightSlot = watch::Receiver<Option<Arc<SingleflightResult>>>;
+
+/// 解析器实例,跨 SOCKS5 连接 / UDP 会话共享（`Arc<Resolver>`）。
 pub struct Resolver {
     mode: DnsMode,
     servers: Vec<SocketAddr>,
@@ -47,11 +60,16 @@ pub struct Resolver {
     /// 缓存按 (host, qtype) 分键。qtype=1 (A) / 28 (AAAA)
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
     /// Singleflight 去重：同一 (host, qtype) 的并发查询共用一次实际 DNS 请求。
-    /// 后到的等待 `Notify`，醒来后从 cache 读结果。
+    ///
+    /// map value 是 leader 持有的 `watch::Sender` 派生出的 `Receiver` 模板，**仅**
+    /// 供 waiter clone 出独立 Receiver 使用；leader 自己另持 owned Sender 发布结果，
+    /// 永远不从 map 回读 Receiver。watch 的 `wait_for` 保证：即使 leader 在 waiter
+    /// clone Receiver *之前* 就 send，新 Receiver 仍能立刻读到当前值——这从根本上
+    /// 消除了旧 `Arc<Notify>` 方案的丢通知窗口（`notify_waiters` 不保留 permit）。
     ///
     /// 持锁原则：**绝不**跨 await 持有此 Mutex（parking_lot 不可重入，跨 await
     /// 会死锁/阻塞 executor）。只在短临界区里 get/insert/remove，然后释放再 await。
-    in_flight: Mutex<HashMap<(String, u16), Arc<Notify>>>,
+    in_flight: Mutex<HashMap<(String, u16), SingleflightSlot>>,
     /// 测试 hook：若 Some，则 `query_record` 走 mock，不再调用真实 DNS。
     #[cfg(test)]
     mock: Option<Arc<tests::MockBackend>>,
@@ -194,55 +212,90 @@ impl Resolver {
 
     /// Singleflight 包装：同一 (host, qtype) 并发请求合并成一次实际查询。
     ///
-    /// 协议：
-    /// 1. 进来先短锁查 `in_flight`：若已有 entry → 我们是 waiter，克隆 Notify，**释放锁**后 await。
-    /// 2. 否则我们是 leader：插入新 Notify，**释放锁**，调用底层 query_record，
-    ///    完成后把结果（含负缓存）写入 `cache`，**短锁**移除 in_flight，最后 notify_waiters。
-    /// 3. waiter 醒来后从 cache 读结果；理论上 leader 一定已写入，但极端竞争（cache 立刻被
-    ///    回收）下退化为直接调用 query_record，不会卡死。
+    /// 协议（watch::channel 版，消除旧 `Notify` 实现的丢通知 race）：
+    /// 1. 进来短锁查 `in_flight`：若已有 entry → waiter，clone Receiver 模板，**释放锁**
+    ///    后 `rx.wait_for(|v| v.is_some()).await`。watch 语义保证：sender 提前 send
+    ///    也能被刚 clone 出来的新 Receiver 立刻读到，不会丢醒。
+    /// 2. 否则 → leader：构造 `watch::channel(None)`，把 Receiver 模板插入 in_flight，
+    ///    自己持 owned Sender，**释放锁**调用底层 `query_record`。
+    /// 3. leader 完成：写 cache → `tx.send(Some(Arc<SingleflightResult>))` →
+    ///    短锁 remove in_flight。send 必然成功（map 里仍持一份 Receiver 模板）。
+    /// 4. 退化路径：sender 异常 drop（leader panic）→ waiter `wait_for` 返回 `Err(_)`
+    ///    → 兜底自查一次 `query_record`，绝不死等。
+    ///
+    /// 关键：`watch::Ref` 借用了 channel 的 RwLock，是 `!Send`；跨 `.await` 持有
+    /// 会让整个 future 变 `!Send` → `tokio::spawn` 失败编译。所以 waiter 路径在
+    /// `wait_for().await` 拿到 guard 后**立刻**clone Arc + drop guard，再做后续匹配。
     async fn query_record_dedup(&self, host: &str, qtype: u16) -> Result<IpAddr> {
         let k = (host.to_owned(), qtype);
+
+        // 角色 enum 定义为函数局部：依赖 watch 通道类型，无外部使用者。
+        enum Role {
+            Leader(watch::Sender<Option<Arc<SingleflightResult>>>),
+            Waiter(watch::Receiver<Option<Arc<SingleflightResult>>>),
+        }
 
         // 阶段 1：短锁，决定角色
         let role = {
             let mut g = self.in_flight.lock();
-            if let Some(n) = g.get(&k) {
-                Role::Waiter(n.clone())
+            if let Some(rx) = g.get(&k) {
+                Role::Waiter(rx.clone())
             } else {
-                let n = Arc::new(Notify::new());
-                g.insert(k.clone(), n.clone());
-                Role::Leader(n)
+                let (tx, rx) = watch::channel::<Option<Arc<SingleflightResult>>>(None);
+                g.insert(k.clone(), rx);
+                Role::Leader(tx)
             }
         };
 
         match role {
-            Role::Waiter(n) => {
+            Role::Waiter(mut rx) => {
                 counter!(M_DNS_SINGLEFLIGHT_DEDUP).increment(1);
-                // 必须先创建 notified() future 再 await，避免 leader 在我们 await
-                // 之前 notify_waiters 导致丢醒。这是 Notify 的标准用法。
-                let fut = n.notified();
-                fut.await;
-                // leader 已把结果写入 cache，从这里读出
-                match self.lookup_cache(host, qtype) {
-                    Some(Some(ip)) => Ok(ip),
-                    Some(None) => Err(neg_err(host, qtype)),
-                    None => {
-                        // 极少见：cache 在 leader 写入到我们读取之间被清空（>1024 触发 clear）。
-                        // 退化为直接查一次，不再 dedup，避免无限等待。
-                        self.query_record(host, qtype).await
+                // 关键：`wait_for` 返回的 `watch::Ref` 借用 channel 的 RwLock，
+                // 是 `!Send`；跨 `.await` 持有会让整个 future 变 `!Send`，所有
+                // caller 的 `tokio::spawn(resolver.resolve_*(…))` 编译失败。
+                //
+                // 这里**先**把结果从 guard 抽出（clone 一份 Option<Arc<…>>），
+                // 然后**显式 drop** guard / 让整个 match scrutinee 的 temporary
+                // 销毁，再 await 下游 `query_record`。避免任何 Ref 跨 await。
+                let extracted: Option<Option<Arc<SingleflightResult>>> = {
+                    match rx.wait_for(|v| v.is_some()).await {
+                        Ok(guard) => Some(guard.clone()), // 立即 deep clone Option<Arc>
+                        Err(_closed) => None,             // sender 异常 drop
                     }
+                    // ↑ block 结束：scrutinee + guard 全部 drop
+                };
+                match extracted {
+                    Some(Some(arc)) => match arc.as_ref() {
+                        Ok(ip) => Ok(*ip),
+                        // leader 发布的是 Err 标记；用 neg_err 重建与 cache hit 路径
+                        // 完全一致的 Error 变体（DnsNoIpv4 / Other("no AAAA …")），
+                        // 不退化为 Error::Other(string)——保留对外错误变体语义。
+                        Err(()) => Err(neg_err(host, qtype)),
+                    },
+                    // predicate 保证 is_some()，理论不可能；兜底自查不死等。
+                    Some(None) => self.query_record(host, qtype).await,
+                    // leader sender 异常 drop（panic 等），未 send 任何值 → 自查兜底
+                    None => self.query_record(host, qtype).await,
                 }
             }
-            Role::Leader(n) => {
+            Role::Leader(tx) => {
                 let result = self.query_record(host, qtype).await;
                 // 写入缓存：成功 → 正向；任何失败 → 负缓存
                 self.store_cache(host.to_owned(), qtype, result.as_ref().ok().copied());
-                // 短锁移除自己，再 wake 所有 waiter
+                // 把可共享版本（Err 折叠为单位标记）广播给所有 waiter。
+                let shared: SingleflightResult = match &result {
+                    Ok(ip) => Ok(*ip),
+                    Err(_) => Err(()),
+                };
+                // send 失败仅当所有 Receiver 都 drop——in_flight map 还持有一份
+                // Receiver 模板（remove 在这之后），所以 send 必然成功。
+                let _ = tx.send(Some(Arc::new(shared)));
+                // 短锁移除自己。tx 在函数返回时 drop；map 中那份 Receiver 模板被丢弃，
+                // 已 clone 出去的 waiter Receiver 不受影响（仍能读到最后一次值）。
                 {
                     let mut g = self.in_flight.lock();
                     g.remove(&k);
                 }
-                n.notify_waiters();
                 result
             }
         }
@@ -322,12 +375,6 @@ impl Resolver {
         let (n, _src) = sock.recv_from(&mut buf, self.timeout).await?;
         parse_dns_answer(&buf[..n], qtype)
     }
-}
-
-/// Singleflight 角色：要么是 leader（实际发起查询），要么是 waiter（等 leader）。
-enum Role {
-    Leader(Arc<Notify>),
-    Waiter(Arc<Notify>),
 }
 
 /// 负缓存命中或错误路径的统一错误构造。
@@ -669,6 +716,62 @@ mod tests {
             parse_dns_answer(&r, QTYPE_A).unwrap(),
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn singleflight_does_not_lose_notification() {
+        // 回归测试：bug2-dns-notify-race。
+        //
+        // 旧实现（Arc<Notify>）：leader 在 waiter 调到 `n.notified()` 之前完成、
+        // 调 `notify_waiters` → waiter 永久阻塞在 `fut.await`（notify_waiters 不保留 permit）。
+        //
+        // 新实现（watch::channel）：waiter 在锁内 clone Receiver，wait_for 看到
+        // sender 已发布的当前值即返回，永不死等。
+        //
+        // 构造手段：leader 的 backend 零延迟（mock delay = ZERO）+ 多线程 runtime +
+        // 大量并发 → 大量轮次会触发 "leader 在部分 waiter 进入 wait_for 之前已 send"。
+        // 外层 tokio::time::timeout(3s, ...) 兜底，3 秒内未完成判定为死等（旧 bug 表现）。
+        for iter in 0..50u32 {
+            let host = format!("race-{iter}.test");
+            let mock = MockBackend::new(Duration::ZERO);
+            mock.set(
+                &host,
+                QTYPE_A,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, iter as u8)),
+            );
+            let resolver = Arc::new(Resolver::new_for_test(
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+                mock.clone(),
+            ));
+
+            let n = 200usize;
+            let mut handles = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = resolver.clone();
+                let h = host.clone();
+                handles.push(tokio::spawn(async move { r.resolve_v4(&h, 80).await }));
+            }
+
+            let expected = Ipv4Addr::new(10, 0, 0, iter as u8);
+            let all = async {
+                for h in handles {
+                    let v = h.await.unwrap().expect("resolve_v4 must succeed");
+                    assert_eq!(*v.ip(), expected);
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(3), all)
+                .await
+                .unwrap_or_else(|_| panic!("iter {iter}: waiter dead-locked (lost notification)"));
+
+            // singleflight 应把 N 次并发合并到极少数次 backend 调用。
+            // 允许 race-in 多 1~2 次，但绝不应等于 N。
+            let calls = mock.call_count.load(Ordering::SeqCst);
+            assert!(
+                calls <= 4,
+                "iter {iter}: expected singleflight dedup, got {calls} backend calls"
+            );
+        }
     }
 
     #[test]

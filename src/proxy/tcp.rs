@@ -22,6 +22,7 @@ use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{ReplyError, Socks5Command};
 use metrics::{counter, gauge};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -173,6 +174,7 @@ async fn handle(
         upstream,
         limits.idle_timeout,
         limits.relay_buffer_size,
+        limits.relay_close_grace,
     )
     .await?;
     counter!(M_BYTES_UP).increment(bytes_up);
@@ -352,17 +354,36 @@ async fn happy_eyeballs_dial(
     }
 }
 
-/// 带 idle 超时的双向 relay。任一方向到达 idle 超时（无字节传输）即中断。
+/// 带 idle 超时的双向 relay。每个方向 read 已经包了 `tokio::time::timeout(idle, ..)`，
+/// 因此整条连接不会无限挂；不再额外加「连接总生命周期」timeout。
 ///
 /// v0.3.1 修复（Bug #3）：两个方向通过 `CancellationToken` 协调，任一方向
 /// EOF / 错误 / idle 超时都会立刻 cancel 对端并 shutdown 自己的写半边——
-/// 对端从阻塞的 read 上立刻返回 0 字节并退出，不再苦等满 idle_timeout。
-/// 主线用 `tokio::try_join!` 并发等两侧（不再串行 await）。
+/// 对端从阻塞的 read 上立刻返回 0 字节并退出。
+///
+/// v0.3.2 修复（Bug #1 outer-timeout）：原版的 `timeout(idle + 500ms, try_join!)`
+/// 按「连接总生命周期」墙钟计时，任何活过 idle 窗的正常连接都会被错杀；并且
+/// 兜底分支 drop 两个 JoinHandle 不会 abort task（tokio 语义：drop = detach），
+/// 这两个 task 会带着 socket 继续 detach 跑到 idle 才退，期间还在占 fd 与并发槽。
+/// 现在改成：
+///   1) 字节计数走 Arc<AtomicU64>，被 abort 也能拿回 partial；
+///   2) 不再 try_join!（任一 Err 会丢另一侧）；
+///   3) `coordinate_relay` 等第一侧退出 → 给对端 `grace` → 还不退就 abort
+///      并 await 回收 JoinError，绝不让 task 泄漏。
+///
+/// 行为变化（v0.3.2）：不再有「连接总生命周期上限」。长连接（HTTP/2、SSH、
+/// WebSocket）只要持续有数据/keepalive 落在 idle 窗内就会一直保活。
+///
+/// 返回 `(bytes_up, bytes_down)` 是 atomic-snapshot：极端情况下若对端在 grace
+/// 超时后被 abort，对应方向可能少计已经写到 socket 但 fetch_add 未发生的字节
+/// （write_all 不是 cancel 检测点；只有 write_all Ok 才 fetch_add，所以 atomic
+/// 严格 ≤ 实际写出字节，metric 不会虚高）。
 async fn relay_with_idle_timeout(
     client: TcpStream,
     upstream: TcpConnection,
     idle: Duration,
     buf_size: usize,
+    grace: Duration,
 ) -> Result<(u64, u64)> {
     let (mut client_r, mut client_w) = tokio::io::split(client);
     let upstream = Arc::new(upstream);
@@ -373,10 +394,17 @@ async fn relay_with_idle_timeout(
     let send_token = token.clone();
     let recv_token = token.clone();
 
+    // 字节计数：放在 atomic，task 被 abort 仍能拿回已经传输的 partial 值。
+    // Ordering::Relaxed 足够——`JoinHandle::await` 自身提供 happens-before，
+    // load 在两个 task 都 join 完成之后才发生，单调累加无需 SeqCst。
+    let up_bytes = Arc::new(AtomicU64::new(0));
+    let down_bytes = Arc::new(AtomicU64::new(0));
+    let up_bytes_t = up_bytes.clone();
+    let down_bytes_t = down_bytes.clone();
+
     // client → upstream
     let send = tokio::spawn(async move {
         let mut buf = vec![0u8; buf_size];
-        let mut total: u64 = 0;
         loop {
             tokio::select! {
                 biased;
@@ -396,20 +424,18 @@ async fn relay_with_idle_timeout(
                     if up_for_send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                    total += n as u64;
+                    up_bytes_t.fetch_add(n as u64, Ordering::Relaxed);
                 }
             }
         }
         // 关 upstream 写半边——让对端 recv read 立刻拿到 0
         up_for_send.shutdown();
         send_token.cancel();
-        Ok::<u64, std::io::Error>(total)
     });
 
     // upstream → client
     let recv = tokio::spawn(async move {
         let mut buf = vec![0u8; buf_size];
-        let mut total: u64 = 0;
         loop {
             tokio::select! {
                 biased;
@@ -429,40 +455,158 @@ async fn relay_with_idle_timeout(
                     if client_w.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                    total += n as u64;
+                    down_bytes_t.fetch_add(n as u64, Ordering::Relaxed);
                 }
             }
         }
         // 关 client 写半边——让对端 send 的 client_r.read 立刻拿到 0
         let _ = client_w.shutdown().await;
         recv_token.cancel();
-        Ok::<u64, std::io::Error>(total)
     });
 
-    // 并发等两侧；任一侧退出会经 token + shutdown 把对端踢醒。
-    // 短 grace 兜底：极端情况下（例如 client 半关但不 reset）对端可能还要
-    // 让 read 真正返回 0；500ms 足够，再卡就 abort 对应 task。
-    let (up_res, down_res) = match tokio::time::timeout(idle + Duration::from_millis(500), async {
-        tokio::try_join!(
-            async {
-                send.await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
-            },
-            async {
-                recv.await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
-            },
-        )
-    })
-    .await
-    {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(Error::other(e.to_string())),
-        Err(_) => {
-            // 真出现某侧永久卡住——最后兜底，按 0 字节统计该方向，主流程继续
-            counter!(M_IDLE_TIMEOUT).increment(1);
-            (0, 0)
+    // 不再有外层「连接生命周期」总超时；inner per-read idle 超时已经兜底。
+    coordinate_relay(send, recv, grace).await;
+
+    Ok((
+        up_bytes.load(Ordering::Relaxed),
+        down_bytes.load(Ordering::Relaxed),
+    ))
+}
+
+/// 等任一 JoinHandle 完成；之后给对端 `grace`，到点再 abort 并 await 回收。
+///
+/// 调用约定：两个 task 自身在退出前已经把对端的 CancellationToken cancel 掉、
+/// 把自己写半边 shutdown 掉，所以 `grace` 只是兜底（对端通常在毫秒级就响应）。
+/// 被 abort 的 task 仍然会被 `await` 一次——这是 tokio 文档要求的，否则
+/// `JoinError` 不会被消费、cleanup 不会跑完。
+///
+/// 区分 `JoinError`：`is_cancelled()` 是预期的 abort 路径（静默）；`is_panic()`
+/// 表示 relay loop 里 panic 了，必须 `warn!` 出来，否则运维不可见。
+///
+/// 提取成 `pub(crate)` 泛型 helper 是为了单元测试——它不依赖 TcpStream /
+/// TcpConnection，可以用普通 `tokio::spawn` 的 `JoinHandle<()>` 直接覆盖。
+pub(crate) async fn coordinate_relay(
+    mut a: tokio::task::JoinHandle<()>,
+    mut b: tokio::task::JoinHandle<()>,
+    grace: Duration,
+) {
+    // v0.3.2 修复：原版 select! 用 `_ =` 把 first-completes 的 JoinResult 吞掉了，
+    // 若先完成那侧自己 panic（不是被 abort）panic 信息会被 drop，运维不可见。
+    // 改成 `r =` 拿到 JoinResult 再 surface panic；对端的 panic 在它 grace
+    // 内完成路径（timeout Ok(Err)）和 abort 路径（timeout Err → await reap）
+    // 两条都要 check。`warn_if_panic` helper 把 4 个调用点收敛成一个。
+    fn warn_if_panic(r: std::result::Result<(), tokio::task::JoinError>) {
+        if let Err(e) = r {
+            if e.is_panic() {
+                warn!(panic = ?e, "relay task panicked");
+            }
         }
-    };
-    Ok((up_res, down_res))
+    }
+
+    tokio::select! {
+        biased;
+        ra = &mut a => {
+            warn_if_panic(ra);
+            // 等 b 退出；grace 内完成 → check panic；超时 → abort + reap
+            match tokio::time::timeout(grace, &mut b).await {
+                Ok(rb) => warn_if_panic(rb),
+                Err(_) => {
+                    b.abort();
+                    warn_if_panic(b.await);
+                }
+            }
+        }
+        rb = &mut b => {
+            warn_if_panic(rb);
+            match tokio::time::timeout(grace, &mut a).await {
+                Ok(ra) => warn_if_panic(ra),
+                Err(_) => {
+                    a.abort();
+                    warn_if_panic(a.await);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AOrdering};
+    use tokio::sync::Notify;
+
+    /// 一侧 EOF（立刻退出），另一侧合作（监听 notify 后退出）→ 应在 grace 内退出，
+    /// 远低于原版 idle+500ms (≈300s) 的错杀窗口。
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinate_relay_peer_exits_within_grace() {
+        let notify = Arc::new(Notify::new());
+        let n2 = notify.clone();
+
+        let a = tokio::spawn(async move { /* 立刻 EOF */ });
+        let b = tokio::spawn(async move {
+            // 模拟「被对端踢醒后立刻退出」：等 notify
+            n2.notified().await;
+        });
+
+        // 让 a 先调度完成；模拟 token.cancel() 通知
+        tokio::task::yield_now().await;
+        notify.notify_one();
+
+        let start = tokio::time::Instant::now();
+        coordinate_relay(a, b, Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "peer should exit well under 1s, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 一侧 EOF，另一侧死循环不响应 → coordinate_relay 必须 abort 它。
+    /// 验证三条不变量：
+    ///   1) 进入 task body（entered=true，证明 task 真的被 scheduled 了）
+    ///   2) elapsed ∈ [grace, grace+200ms]（abort 时机正确）
+    ///   3) abort 之后 100ms 内 ticks 不再增长（证明 abort 真的生效，task 不再跑）
+    /// 这套 sentinel 比原方案（loop sleep 之后写 unreachable_code）严格得多——
+    /// 旧方案里 sentinel store 是 dead code，alive 恒为 true，witnesses nothing。
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinate_relay_aborts_stuck_peer() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let entered_t = entered.clone();
+        let ticks_t = ticks.clone();
+
+        let a = tokio::spawn(async move { /* 立刻 EOF */ });
+        let b = tokio::spawn(async move {
+            entered_t.store(true, AOrdering::Relaxed);
+            loop {
+                ticks_t.fetch_add(1, AOrdering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let grace = Duration::from_millis(100);
+        let start = tokio::time::Instant::now();
+        coordinate_relay(a, b, grace).await;
+        let elapsed = start.elapsed();
+
+        // 不变量 1：task 真的 enter 了（spawn 之后被 scheduled）
+        assert!(
+            entered.load(AOrdering::Relaxed),
+            "b task should have entered its body before abort"
+        );
+        // 不变量 2：elapsed 在 grace 附近（用 250ms 上界容忍调度抖动）
+        assert!(
+            elapsed >= grace && elapsed < grace + Duration::from_millis(250),
+            "abort should happen right after grace, got {:?}",
+            elapsed
+        );
+        // 不变量 3：abort 之后 task 真的不再跑——再等 100ms，ticks 不应继续累加
+        let ticks_after_abort = ticks.load(AOrdering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ticks_now = ticks.load(AOrdering::Relaxed);
+        assert_eq!(
+            ticks_now, ticks_after_abort,
+            "task should be aborted, but still ticking: {ticks_after_abort} → {ticks_now}"
+        );
+    }
 }

@@ -35,6 +35,13 @@ pub const M_DNS_SINGLEFLIGHT_DEDUP: &str = "warp_rust_dns_singleflight_dedup_tot
 pub const M_DNS_NEGATIVE_CACHE_HIT: &str = "warp_rust_dns_negative_cache_hit_total";
 // v0.3.x：容器内 0.0.0.0 + 无 auth 放行时的警告计数（聚合后可触发告警）
 pub const M_CONTAINER_OPEN_PROXY_WARN: &str = "warp_rust_container_open_proxy_warn_total";
+// v0.3.2：任何「未鉴权 + 非 loopback 仍被放行」的统一计数器，覆盖两条路径：
+//   · WARP_RUST_ALLOW_OPEN_PROXY=1（显式 escape hatch）
+//   · 容器 + 0.0.0.0 + WARP_RUST_TRUSTED_HOST_NET=1（容器例外）
+// 命名与同模块其它 counter 一致：动作（_allowed）而非程度（_risk）。
+// 单条 Prometheus 告警 `increase(warp_rust_open_proxy_allowed_total[5m]) > 0`
+// 即可监听全部高风险放行姿势。
+pub const M_OPEN_PROXY_ALLOWED: &str = "warp_rust_open_proxy_allowed_total";
 /// 装配 Prometheus exporter，在 `cfg.bind` 上启动一个 axum 服务。正常停机时
 /// 返回 Ok(())。
 pub async fn serve(cfg: MetricsConfig, cancel: CancellationToken) -> Result<()> {

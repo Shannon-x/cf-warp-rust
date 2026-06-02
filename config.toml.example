@@ -68,6 +68,7 @@ handshake_timeout = "10s"           # SOCKS5 握手 + read_command 总超时
 idle_timeout = "300s"               # 双向 relay 的 idle 超时
 relay_buffer_size = 262144          # TCP relay buffer；对齐 wireproxy 的 256KB buffer pool
 auth_fail_sleep = "1s"              # 鉴权失败后强制延迟，防暴破
+relay_close_grace = "500ms"         # v0.3.2：一侧退出后给对端的优雅窗口；超时 abort 兜底
 
 [dns]
 # Domain ATYP 的 DNS 解析策略：

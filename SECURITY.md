@@ -39,6 +39,8 @@ bind = "127.0.0.1:1080"
 
 **只有本机进程能用**。任何其他机器、容器、Wi-Fi 邻居都无法到达。这是默认推荐姿态。
 
+> 容器例外：`config.toml.docker.example`（Dockerfile 复制为镜像内置 `/app/config.toml`）默认 `bind = 0.0.0.0:1080`——这是**容器命名空间内**的 0.0.0.0，不等于宿主公网，对外暴露范围完全由宿主 `docker run -p` 决定。v0.3.2 起容器场景下 0.0.0.0 + 无 `[server.auth]` 时**必须**显式 `WARP_RUST_TRUSTED_HOST_NET=1` 才能启动；详见 README『Docker 镜像』一节。
+
 ## 3. 对外暴露：**强制强密码鉴权**
 
 如果你确实要把代理对外提供（脚本里 `--expose`，或手动改 `bind = "0.0.0.0:..."`），脚本会**强制**启用 SOCKS5 用户名/密码鉴权，且密码必须满足：
@@ -67,6 +69,7 @@ bind = "127.0.0.1:1080"
 ## 3.1 v0.1.1 新增的运行时强约束
 
 - **启动前校验 `Config::validate()`**：`server.bind` 是非 loopback（含 `0.0.0.0`）且 `[server.auth]` 为空时**直接拒绝启动**，错误信息会同时打到 stderr 和 systemd journal。要绕过必须 `export WARP_RUST_ALLOW_OPEN_PROXY=1`（高风险，会有 WARN 日志）。
+  - **v0.3.2 起容器场景例外**：检测到容器内 + IPv4 `0.0.0.0` + 无 `[server.auth]` 时**额外**要求 `WARP_RUST_TRUSTED_HOST_NET=1` 才放行（语义：「我已用宿主 `-p 127.0.0.1:` 限定，对宿主网络栈负责」）。仓库的 `scripts/run-docker.sh`、`docker-compose.yml`、`scripts/quickstart.sh` 已自动注入；裸 `docker run` 用户必须自己加 `-e WARP_RUST_TRUSTED_HOST_NET=1` 或配 auth。与 `ALLOW_OPEN_PROXY` 的区别：后者完全跳过校验（含弱密码/MTU 等），前者只放行「容器 + loopback host-port」这一窄场景。
 - **`[limits]` DoS 防护**（默认值，可调）：
   - `max_concurrent_connections = 1024`：满则新连接立即关闭，记 `warp_rust_conns_rejected_total`
   - `handshake_timeout = 10s`：SOCKS5 握手+`read_command` 总超时，超时即关

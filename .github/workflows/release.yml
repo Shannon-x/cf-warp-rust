@@ -76,7 +76,7 @@ jobs:
           NAME="warp-rust-${TAG}-${{ matrix.target }}"
           mkdir -p dist "$NAME"
           cp "target/${{ matrix.target }}/release/warp-rust" "$NAME/"
-          cp README.md LICENSE SECURITY.md config.toml.example "$NAME/"
+          cp README.md LICENSE SECURITY.md config.toml.example config.toml.docker.example "$NAME/"
           mkdir -p "$NAME/scripts"
           cp scripts/*.sh "$NAME/scripts/"
           chmod +x "$NAME/scripts/"*.sh "$NAME/warp-rust"
@@ -96,7 +96,7 @@ jobs:
           $name = "warp-rust-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist", $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/warp-rust.exe" "$name/"
-          Copy-Item README.md, LICENSE, SECURITY.md, config.toml.example "$name/"
+          Copy-Item README.md, LICENSE, SECURITY.md, config.toml.example, config.toml.docker.example "$name/"
           # scripts/ 在 Windows 下不可执行（git-bash 用户可以跑，PowerShell 用户读 README）
           New-Item -ItemType Directory -Force -Path "$name/scripts" | Out-Null
           Copy-Item scripts/*.sh "$name/scripts/"

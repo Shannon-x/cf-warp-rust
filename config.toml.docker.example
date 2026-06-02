@@ -1,0 +1,92 @@
+# warp-rust 容器内配置示例（Docker / Podman / Kubernetes）
+#
+# 与宿主直跑的 config.toml.example 的区别：
+#   · bind 默认 0.0.0.0:<port> —— 容器命名空间内的 0.0.0.0 不等于宿主公网，
+#     对外暴露范围由宿主 `docker run -p` / docker-compose ports 决定；
+#     若 bind 写成 127.0.0.1 则宿主 -p 无法把流量转发进来（issue: bug3）。
+#   · data_dir 默认 /app/data —— 对应 Dockerfile 声明的 VOLUME，挂持久卷以保留
+#     account.json 与身份池（否则容器重启会触发新一轮 Cloudflare 注册）。
+#   · [hot_reload] 默认 enabled = false —— 容器场景里 config.toml 通常以 :ro 挂入，
+#     inotify 事件触发不上，热重载意义不大；如挂 :rw 想用热重载可改回 true。
+#
+# 使用方式（任一）；注意 v0.3.2 起裸 docker run 必须显式 `-e WARP_RUST_TRUSTED_HOST_NET=1`，
+# 否则 Config::validate 会拒启（见下方「安全说明」第 1 条）：
+#   1) 不显式挂载 → 使用 Dockerfile COPY 进来的本文件作为内置默认
+#      docker run -p 127.0.0.1:1080:1080 \
+#        -e WARP_RUST_TRUSTED_HOST_NET=1 \
+#        ghcr.io/shannon-x/cf-warp-rust:latest
+#   2) 拷贝再改 → 推荐给生产 / 想加 [server.auth] 的用户
+#      cp config.toml.docker.example config.toml
+#      docker run -v $(pwd)/config.toml:/app/config.toml:ro \
+#        -e WARP_RUST_TRUSTED_HOST_NET=1 \
+#        ...
+#      （配了 [server.auth] 后可以省掉 -e WARP_RUST_TRUSTED_HOST_NET）
+#
+# 安全说明：
+#   · v0.3.2 起：容器内 0.0.0.0 + 无 [server.auth] **必须**显式 `-e WARP_RUST_TRUSTED_HOST_NET=1`
+#     才能启动（声明「宿主已用 -p 127.0.0.1 限定，我对宿主网络负责」）；本仓库的
+#     scripts/run-docker.sh、docker-compose.yml、scripts/quickstart.sh 已自动注入。
+#   · 若把宿主 -p 改成 0.0.0.0:1080:1080 暴露公网，请**务必**取消下方 [server.auth]
+#     三行注释并改成 ≥16 位强密码（含大小写和数字），而不是依赖 TRUSTED_HOST_NET。
+#   · 旧版 `WARP_RUST_ALLOW_OPEN_PROXY=1` 仍可用作"完全跳过"的逃生口，但语义更宽松，
+#     不建议在容器内使用。
+
+[server]
+# 容器内一律 0.0.0.0：宿主 -p 才能把流量转发进来。
+bind = "0.0.0.0:1080"
+
+# 启用用户名/密码鉴权时取消下面三行注释；整个表段省略 = 无鉴权。
+# 公网暴露场景（宿主 -p 0.0.0.0:1080:1080 / -p 1080:1080）**必须**配。
+# [server.auth]
+# username = "warp"
+# password = "请改成 ≥16 位强密码，含大小写和数字"
+
+[logging]
+level = "warn,warp_rust=info,wireguard_netstack=warn"
+format = "pretty"
+
+[warp]
+# 容器 VOLUME 持久化目录；docker run -v $(pwd)/data:/app/data 后会把账号身份留住
+data_dir = "/app/data"
+device_model = "warp-rust"
+# license_key = "xxxxxxxx-xxxxxxxx-xxxxxxxx"
+refresh_interval = "24h"
+register_cooldown = "10m"
+mtu = 1420
+tcp_buffer_size = 1048576
+
+[health]
+interval = "30s"
+timeout = "8s"
+
+[recovery]
+reconnect_after        = 1
+rebuild_config_after   = 3
+reregister_after       = 5
+rotate_identity_after  = 10
+backoff_min = "500ms"
+backoff_max = "30s"
+
+[metrics]
+enabled = true
+# 同 server.bind：容器命名空间内的 0.0.0.0；建议宿主 -p 127.0.0.1:9090:9090
+bind = "0.0.0.0:9090"
+
+[hot_reload]
+# 容器场景里 config 通常 :ro 挂入，热重载意义不大；默认关闭节省 inotify watch
+enabled = false
+
+[limits]
+max_concurrent_connections = 1024
+handshake_timeout = "10s"
+idle_timeout = "300s"
+relay_buffer_size = 262144
+auth_fail_sleep = "1s"
+relay_close_grace = "500ms"
+
+[dns]
+mode = "system"
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+timeout = "3s"
+cache_ttl = "60s"
+negative_ttl = "5s"

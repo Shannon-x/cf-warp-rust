@@ -29,13 +29,17 @@ done
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
   || { echo "端口非法：$PORT" >&2; exit 2; }
 
-# pipefail-safe：先一次性读固定字节再过滤再截取，避免 tr 收 SIGPIPE
+# pipefail-safe：先把随机字节全部读入 shell 变量，再过滤，再用 bash substring
+# 截取，全程无下游管道 → 不可能触发 SIGPIPE。
 gen_pw() {
+  local raw chars
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 36 | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(openssl rand -base64 36) || return 1
   else
-    head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
+    raw=$(head -c 512 /dev/urandom) || return 1
   fi
+  chars=$(printf '%s' "$raw" | LC_ALL=C tr -dc 'A-Za-z0-9')
+  printf '%s\n' "${chars:0:24}"
 }
 ok_pw() {
   local p="$1"
