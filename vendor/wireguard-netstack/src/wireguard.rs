@@ -209,14 +209,24 @@ impl WireGuardTunnel {
         Ok(())
     }
 
-    /// Process a received UDP packet (decrypts and returns IP packet if any).
-    fn process_incoming_udp(&self, data: &[u8]) -> Option<BytesMut> {
+    /// Process a received UDP packet (decrypts it).
+    ///
+    /// 返回 `(inbound, outbound)`：
+    /// - `inbound`：解密出的 IP 包（需 push 进 incoming 通道），`None` 表示无；
+    /// - `outbound`：需要回发给 peer 的 WG 包（握手响应 / keepalive / 排队包）。
+    ///
+    /// warp-rust fork：原实现对每个回发包 `tokio::spawn` 一个一次性发送 task
+    /// （无并发上限 + 每包一次 socket `Arc` clone，握手风暴下会短时累积大量
+    /// detached task）。改为把回发包收集返回，由 `run_receive_loop` 在锁外顺序
+    /// `send_to().await`，消除无界 spawn 与每包 clone。`outbound` 内是 owned
+    /// `BytesMut`，不借用 `tunn`，可安全跨锁释放后发送。
+    fn process_incoming_udp(&self, data: &[u8]) -> (Option<BytesMut>, Vec<BytesMut>) {
         let packet = Packet::from_bytes(BytesMut::from(data));
         let wg_packet = match packet.try_into_wg() {
             Ok(wg) => wg,
             Err(_) => {
                 log::warn!("Received non-WireGuard packet");
-                return None;
+                return (None, Vec::new());
             }
         };
 
@@ -224,48 +234,34 @@ impl WireGuardTunnel {
         match tunn.handle_incoming_packet(wg_packet) {
             TunnResult::Done => {
                 log::trace!("WG: Packet processed (no output)");
-                None
+                (None, Vec::new())
             }
             TunnResult::Err(e) => {
                 log::warn!("WG error: {:?}", e);
-                None
+                (None, Vec::new())
             }
             TunnResult::WriteToNetwork(response) => {
                 log::trace!("WG: Sending response packet");
                 // Need to send a response (e.g., handshake response, keepalive)
                 let pkt: Packet = response.into();
-                let data = BytesMut::from(pkt.as_bytes());
-                let socket = self.udp_socket.clone();
-                let endpoint = self.peer_endpoint;
-                tokio::spawn(async move {
-                    if let Err(e) = socket.send_to(&data, endpoint).await {
-                        log::error!("Failed to send response: {}", e);
-                    }
-                });
+                let mut outbound = vec![BytesMut::from(pkt.as_bytes())];
 
-                // Also try to send any queued packets
+                // Also collect any queued packets to send.
                 for queued in tunn.get_queued_packets() {
                     let pkt: Packet = queued.into();
-                    let data = BytesMut::from(pkt.as_bytes());
-                    let socket = self.udp_socket.clone();
-                    let endpoint = self.peer_endpoint;
-                    tokio::spawn(async move {
-                        if let Err(e) = socket.send_to(&data, endpoint).await {
-                            log::error!("Failed to send queued packet: {}", e);
-                        }
-                    });
+                    outbound.push(BytesMut::from(pkt.as_bytes()));
                 }
 
-                None
+                (None, outbound)
             }
             TunnResult::WriteToTunnel(decrypted) => {
                 if decrypted.is_empty() {
                     log::trace!("WG: Received keepalive");
-                    return None;
+                    return (None, Vec::new());
                 }
                 let bytes = BytesMut::from(decrypted.as_bytes());
                 log::trace!("WG: Decrypted {} bytes", bytes.len());
-                Some(bytes)
+                (Some(bytes), Vec::new())
             }
         }
     }
@@ -284,7 +280,14 @@ impl WireGuardTunnel {
 
                     log::trace!("Received UDP packet ({} bytes) from {}", len, from);
 
-                    if let Some(ip_packet) = self.process_incoming_udp(&buf[..len]) {
+                    let (inbound, outbound) = self.process_incoming_udp(&buf[..len]);
+                    // 锁外顺序回发握手响应 / keepalive / 排队包（替代原每包一次 spawn）。
+                    for pkt in outbound {
+                        if let Err(e) = self.udp_socket.send_to(&pkt, self.peer_endpoint).await {
+                            log::error!("Failed to send response packet: {}", e);
+                        }
+                    }
+                    if let Some(ip_packet) = inbound {
                         if self.incoming_tx.send(ip_packet).await.is_err() {
                             log::error!("Incoming channel closed");
                             break;

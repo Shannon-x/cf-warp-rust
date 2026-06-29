@@ -109,8 +109,14 @@ pub async fn run_relay(
             // Bug #6：buffer 提到 loop 外复用，避免每轮 65KiB 分配。
             // select! 同时拿 v4/v6 时两个 future 需要互不重叠的可变借用，
             // 所以保留两块独立 buffer。
+            // 纯 v4 associate（v6 为 None）下 buf_v6 完全用不到——延迟到有 v6 时再分配，
+            // 省掉一块 64KiB 常驻。
             let mut buf_v4 = vec![0u8; 65_535];
-            let mut buf_v6 = vec![0u8; 65_535];
+            let mut buf_v6 = if v6.is_some() {
+                vec![0u8; 65_535]
+            } else {
+                Vec::new()
+            };
             enum Pick {
                 V4(usize, SocketAddr),
                 V6(usize, SocketAddr),

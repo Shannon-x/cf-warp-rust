@@ -326,8 +326,15 @@ impl NetStack {
         socket.set_ack_delay(None);
 
         // ---- 锁内：仅做 slab 插入 ----
-        let mut inner = self.inner.lock();
-        inner.sockets.add(socket)
+        let handle = {
+            let mut inner = self.inner.lock();
+            inner.sockets.add(socket)
+        };
+        // 可观测性：活跃 socket 数。create_tcp_socket / create_udp_socket_with 的每次
+        // 分配都 +1，remove_socket 每次 -1，严格配对。若活跃连接数平稳而此 gauge 仍
+        // 单调上升，即为 socket（含 2×tcp_buffer_size buffer）泄漏的直接信号。
+        metrics::gauge!("warp_rust_netstack_sockets_active").increment(1.0);
+        handle
     }
 
     /// Connect a TCP socket to the given address. v0.2.0：v4 与 v6 都支持。
@@ -525,8 +532,18 @@ impl NetStack {
 
     /// Remove a socket from the socket set.
     pub fn remove_socket(&self, handle: SocketHandle) {
-        let mut inner = self.inner.lock();
-        inner.sockets.remove(handle);
+        {
+            let mut inner = self.inner.lock();
+            inner.sockets.remove(handle);
+        }
+        // 与 create_*_socket 的 increment 配对，见 `warp_rust_netstack_sockets_active`。
+        metrics::gauge!("warp_rust_netstack_sockets_active").decrement(1.0);
+    }
+
+    /// 当前 SocketSet 中的 socket 数量（TCP + UDP）。用于观测与泄漏回归测试：
+    /// 稳态下应等于活跃连接数；若持续高于活跃连接数即为孤儿 socket 累积。
+    pub fn socket_count(&self) -> usize {
+        self.inner.lock().sockets.iter().count()
     }
 
     /// Poll the network stack, processing packets and updating socket states.
@@ -750,9 +767,47 @@ pub struct TcpConnection {
 
 impl TcpConnection {
     /// Create a new TCP connection.
+    ///
+    /// 取消安全（warp-rust fork：修复「connect 中途失败/取消泄漏 2×tcp_buffer_size
+    /// socket buffer」）：`create_tcp_socket()` 会**立即**把携带 rx+tx buffer 的
+    /// socket 加入 `SocketSet`。在连接进入 `Established`、`Ok(Self)` 构造成功**之前**
+    /// 的任何出口都会留下孤儿 socket：
+    ///   - `netstack.connect(handle, addr)?` 提前返回 `Err`（如无 v6 隧道时的
+    ///     `Ipv6NotSupported`，或 smoltcp 的 `InvalidState`/`Unaddressable`）；
+    ///   - 循环里 `Closed`/`TimeWait`/30s 超时的 `Err` 返回；
+    ///   - `wait_for_activity().await` 被上层取消——happy-eyeballs 败者 future 被
+    ///     `select!` drop、健康探针 `timeout()` 到期 drop 等。
+    /// `TcpConnection::Drop` 只在对象构造成功后才存在，救不了上述路径。
+    ///
+    /// 用一个栈上 RAII guard 兜底：未 disarm 时其 `Drop` 调 `remove_socket`。guard
+    /// 是本 future 的局部变量，future 在任意 `.await` 点被 drop 时它必然运行，故对
+    /// 所有取消点都安全。仅在返回 `Ok(Self)` 前 disarm，把 socket 所有权交还给
+    /// `TcpConnection::Drop`。取消时 socket 处于 `SynSent`（本端 client + ephemeral
+    /// 端口），直接 remove 即可，无需 close()+poll() 发 FIN（远端自行清理半开连接）。
     pub async fn connect(netstack: Arc<NetStack>, addr: SocketAddr) -> Result<Self> {
+        // connect 成功前兜底回收 socket 的 RAII guard（见上方文档）。
+        struct SocketGuard {
+            netstack: Arc<NetStack>,
+            handle: SocketHandle,
+            armed: bool,
+        }
+        impl Drop for SocketGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.netstack.remove_socket(self.handle);
+                }
+            }
+        }
+
         let handle = netstack.create_tcp_socket();
-        netstack.connect(handle, addr)?;
+        // guard 持一份 Arc clone（仅 refcount +1），与下面 `Self { netstack }` 的移动解耦。
+        let mut guard = SocketGuard {
+            netstack: Arc::clone(&netstack),
+            handle,
+            armed: true,
+        };
+
+        netstack.connect(handle, addr)?; // Err → guard.drop → remove_socket
         // 立即叫 poll loop 把 SYN 发出去
         netstack.kick();
 
@@ -762,21 +817,21 @@ impl TcpConnection {
         loop {
             let state = netstack.socket_state(handle);
             if state == TcpState::Established {
+                guard.armed = false; // 交棒给 TcpConnection::Drop
                 log::debug!("TCP connection established to {}", addr);
                 return Ok(Self { netstack, handle });
             }
             if state == TcpState::Closed || state == TcpState::TimeWait {
-                netstack.remove_socket(handle);
+                // guard.drop → remove_socket
                 return Err(Error::TcpConnect {
                     addr,
                     message: format!("Connection failed (state: {:?})", state),
                 });
             }
             if start.elapsed() > timeout {
-                netstack.remove_socket(handle);
-                return Err(Error::TcpTimeout);
+                return Err(Error::TcpTimeout); // guard.drop → remove_socket
             }
-            netstack.wait_for_activity().await;
+            netstack.wait_for_activity().await; // 取消 → guard.drop → remove_socket
         }
     }
 
@@ -951,6 +1006,8 @@ impl NetStack {
             let mut inner = self.inner.lock();
             inner.sockets.add(socket)
         };
+        // 与 remove_socket 的 decrement 配对，见 `warp_rust_netstack_sockets_active`。
+        metrics::gauge!("warp_rust_netstack_sockets_active").increment(1.0);
         log::debug!("UDP socket bound to {}:{}", log_str, port);
 
         Ok(UdpHandle {
@@ -1080,5 +1137,98 @@ impl Drop for UdpHandle {
     fn drop(&mut self) {
         self.netstack.remove_socket(self.handle);
         self.netstack.poll();
+    }
+}
+
+#[cfg(test)]
+mod connect_leak_tests {
+    //! 回归测试：`TcpConnection::connect` 在「成功 Established 之前」的失败/取消
+    //! 路径上必须把已分配的 socket 从 SocketSet 移除，否则每次泄漏
+    //! `2 × tcp_buffer_size`。这些测试无需真实 WARP peer：只构造 tunnel + netstack
+    //! （不跑后台 poll loop），让 connect 卡在 SynSent / 早退，再用 `socket_count()`
+    //! 断言无残留。
+    use super::*;
+    use crate::wireguard::{WireGuardConfig, WireGuardTunnel};
+    use std::net::Ipv4Addr;
+
+    async fn test_netstack() -> Arc<NetStack> {
+        let config = WireGuardConfig {
+            private_key: [7u8; 32],
+            peer_public_key: [9u8; 32],
+            peer_endpoint: "127.0.0.1:51820".parse().unwrap(),
+            tunnel_ip: Ipv4Addr::new(10, 0, 0, 2),
+            tunnel_ipv6: None, // 关键：无 v6 出口
+            preshared_key: None,
+            keepalive_seconds: None,
+            mtu: Some(1280),
+            tcp_buffer_size: Some(4096), // 测试用小 buffer
+        };
+        let wg = WireGuardTunnel::new(config)
+            .await
+            .expect("construct wg tunnel for test");
+        NetStack::new(wg)
+    }
+
+    /// 路径 A：向无 v6 隧道拨 v6 目标 → `netstack.connect` 经 `?` 返回
+    /// `Ipv6NotSupported`；guard 必须移除已 create 的 socket。
+    #[tokio::test]
+    async fn connect_ipv6_without_tunnel_v6_does_not_leak_socket() {
+        let ns = test_netstack().await;
+        assert_eq!(ns.socket_count(), 0);
+
+        let v6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let r = TcpConnection::connect(ns.clone(), v6).await;
+        assert!(r.is_err(), "v6 dial on v4-only tunnel must fail");
+        assert_eq!(
+            ns.socket_count(),
+            0,
+            "guard 必须在 `?` 早退路径(A)上移除 socket"
+        );
+    }
+
+    /// 路径 B：connect future 在 `wait_for_activity().await` 处被取消（模拟
+    /// happy-eyeballs 败者 / 探针 timeout 被 drop）→ guard 必须移除 socket。
+    #[tokio::test]
+    async fn connect_cancellation_does_not_leak_socket() {
+        let ns = test_netstack().await;
+        assert_eq!(ns.socket_count(), 0);
+
+        let ns2 = ns.clone();
+        let task = tokio::spawn(async move {
+            // 无 peer + 无 poll loop → 永停在 SynSent，connect 卡在 wait_for_activity
+            let v4: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let _ = TcpConnection::connect(ns2, v4).await;
+        });
+
+        // 给它时间分配 socket 并 park
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            ns.socket_count(),
+            1,
+            "connect 进行中应已分配 socket"
+        );
+
+        // 取消（drop future）→ guard.drop 必须 remove_socket
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            ns.socket_count(),
+            0,
+            "guard 必须在取消路径(B)上移除 socket"
+        );
+    }
+
+    /// 正常成功路径不受影响：guard disarm 后由 `TcpConnection::Drop` 接管，
+    /// 且不会 double-remove（重复 remove 会 panic）。这里只能验证早退/取消，
+    /// Established 需真实 peer，故用 UdpHandle 的对称路径间接覆盖 remove 计数正确。
+    #[tokio::test]
+    async fn udp_handle_drop_removes_socket() {
+        let ns = test_netstack().await;
+        assert_eq!(ns.socket_count(), 0);
+        {
+            let _udp = ns.create_udp_socket(0).expect("bind udp");
+            assert_eq!(ns.socket_count(), 1);
+        }
+        assert_eq!(ns.socket_count(), 0, "UdpHandle::Drop 必须移除 socket");
     }
 }

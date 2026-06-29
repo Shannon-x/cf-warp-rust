@@ -420,6 +420,7 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 | `warp_rust_reregister_total` | counter | WARP 重注册数 |
 | `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
 | `warp_rust_udp_associates_active` | gauge | 当前活跃 UDP ASSOCIATE |
+| `warp_rust_netstack_sockets_active` | gauge | 当前 netstack 内 socket 数（TCP+UDP）。**内存健康核心指标**：稳态应贴合活跃连接数；若活跃连接平稳而此值单调上升，即为 socket 泄漏（v0.3.3 已修） |
 | `warp_rust_dns_query_total` / `dns_cache_hit_total` | counter | DNS 查询 / 缓存命中 |
 | `warp_rust_wg_tx_backpressure_total` | counter | WG 出口通道满时触发回压重试次数 |
 | `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道关闭时丢弃的包（异常预警） |
@@ -428,6 +429,12 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 加上 `metrics-exporter-prometheus` 自动导出的 `process_*` 系列（RSS / CPU / 文件描述符），就能在 Grafana 里画完整曲线。
 
 ### 内存 / CPU 速查
+
+> 内存泄漏自查（v0.3.3+）：抓 `warp_rust_netstack_sockets_active`，它应稳定贴合活跃连接数。
+> 若它随时间单调上升而并发连接数平稳，说明有 socket 未释放——v0.3.3 已修复 `TcpConnection::connect`
+> 在失败/取消路径上泄漏 `2×tcp_buffer_size` 的 socket buffer，升级即可。每条 TCP 连接稳态占用约
+> `2×tcp_buffer_size`（默认 1MiB → 2MiB），内存吃紧时可把 `[warp].tcp_buffer_size` 调到 256KiB、
+> `[limits].relay_buffer_size` 调到 64KiB。
 
 ```bash
 # systemctl 自带（最简单）

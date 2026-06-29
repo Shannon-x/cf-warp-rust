@@ -9,7 +9,7 @@
 #             UDP recv_from 改 state_notify 唤醒）
 [package]
 name = "wireguard-netstack"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "GPL-3.0"
 authors = ["Lorenzo Rizzotti <dev@dreaming.codes>", "warp-rust contributors"]

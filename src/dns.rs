@@ -279,6 +279,24 @@ impl Resolver {
                 }
             }
             Role::Leader(tx) => {
+                // RAII：无论 leader 正常完成，还是 future 在下面 `query_record().await`
+                // 处被取消（调用方 drop），都要把本 key 从 in_flight 移除——否则残留
+                // 一条 (host,qtype)→Receiver 模板，且后续同 key 请求会误判为 waiter 去
+                // 等一个永不再 send 的 channel（虽能因 sender drop 而兜底自查，但白等一轮）。
+                struct InFlightGuard<'a> {
+                    map: &'a Mutex<HashMap<(String, u16), SingleflightSlot>>,
+                    key: &'a (String, u16),
+                }
+                impl Drop for InFlightGuard<'_> {
+                    fn drop(&mut self) {
+                        self.map.lock().remove(self.key);
+                    }
+                }
+                let _slot_guard = InFlightGuard {
+                    map: &self.in_flight,
+                    key: &k,
+                };
+
                 let result = self.query_record(host, qtype).await;
                 // 写入缓存：成功 → 正向；任何失败 → 负缓存
                 self.store_cache(host.to_owned(), qtype, result.as_ref().ok().copied());
@@ -288,14 +306,11 @@ impl Resolver {
                     Err(_) => Err(()),
                 };
                 // send 失败仅当所有 Receiver 都 drop——in_flight map 还持有一份
-                // Receiver 模板（remove 在这之后），所以 send 必然成功。
+                // Receiver 模板（`_slot_guard` 在本函数返回时才 remove），所以 send 必然成功。
                 let _ = tx.send(Some(Arc::new(shared)));
-                // 短锁移除自己。tx 在函数返回时 drop；map 中那份 Receiver 模板被丢弃，
-                // 已 clone 出去的 waiter Receiver 不受影响（仍能读到最后一次值）。
-                {
-                    let mut g = self.in_flight.lock();
-                    g.remove(&k);
-                }
+                // 移除自己由 `_slot_guard` 的 Drop 统一负责：正常路径在此函数返回时触发，
+                // 取消路径在 await 被 drop 时触发。tx 随后 drop；已 clone 出去的 waiter
+                // Receiver 不受影响（仍能读到最后一次值）。
                 result
             }
         }

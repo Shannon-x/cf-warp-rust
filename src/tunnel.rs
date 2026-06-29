@@ -84,6 +84,20 @@ impl Tunnel {
         self.inner.store(Arc::new(None));
     }
 
+    /// 隧道当前是否具备 IPv6 出口（WARP 双栈时为 true）。
+    ///
+    /// 拨号层据此过滤 v6 候选：向无 v6 的隧道拨 v6 目标必定在 netstack 里触发
+    /// `Ipv6NotSupported`——既浪费一次 socket 分配，历史上也是泄漏触发点（现已被
+    /// `TcpConnection::connect` 的 RAII guard 兜底，但仍应从源头省掉无谓拨号）。
+    pub fn has_ipv6(&self) -> bool {
+        let snapshot = self.inner.load_full();
+        snapshot
+            .as_ref()
+            .as_ref()
+            .map(|t| t.wg_tunnel().tunnel_ipv6().is_some())
+            .unwrap_or(false)
+    }
+
     /// 给后续探针留出的接口：距上一次 WireGuard 握手的时长。
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
         let snapshot = self.inner.load_full();

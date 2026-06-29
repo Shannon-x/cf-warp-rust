@@ -289,6 +289,21 @@ async fn happy_eyeballs_dial(
     if candidates.is_empty() {
         return Err(Error::other("no upstream candidates"));
     }
+
+    // 隧道无 IPv6 出口时丢弃 v6 候选：否则会向 netstack 发起注定 `Ipv6NotSupported`
+    // 的拨号，浪费一次 socket 分配。仅 v6 而隧道无 v6 时直接报不可达。
+    let candidates: Vec<SocketAddr> = if tunnel.has_ipv6() {
+        candidates
+    } else {
+        let v4_only: Vec<SocketAddr> = candidates.into_iter().filter(|a| a.is_ipv4()).collect();
+        if v4_only.is_empty() {
+            return Err(Error::other(
+                "target resolved to IPv6 only, but tunnel has no IPv6 route",
+            ));
+        }
+        v4_only
+    };
+
     if candidates.len() == 1 {
         let addr = candidates[0];
         let conn = tunnel.dial_tcp(addr).await?;
