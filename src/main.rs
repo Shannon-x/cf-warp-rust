@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use wireguard_netstack::ManagedTunnel;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -83,45 +82,58 @@ async fn run(cli: Cli) -> Result<()> {
         peer = %snapshot.wg_config.peer_endpoint,
         "connecting WireGuard tunnel"
     );
-    let managed = ManagedTunnel::connect(snapshot.wg_config.clone()).await?;
-    let tunnel = Tunnel::from_managed(managed);
+    let connected = Tunnel::connect_candidate(snapshot.wg_config.clone()).await?;
+    let active_wg_config = connected.config;
+    let tunnel = Tunnel::from_managed(connected.managed);
 
     // 3. 加载身份池（为空也允许）
     let identity_pool = IdentityPool::load(&cfg.warp.data_dir)?;
 
-    // 4. 启动 SOCKS5 监听（带 DoS 防护 + DNS 解析层）
-    let server_cfg = cfg.server.clone();
-    let limits = cfg.limits.clone();
-    let resolver = Arc::new(crate::dns::Resolver::new(&cfg.dns, tunnel.clone()));
-    let socks_cancel = cancel.clone();
-    let socks_tunnel = tunnel.clone();
-    let mut services = tokio::task::JoinSet::new();
-    services.spawn(async move {
-        (
-            "SOCKS5",
-            proxy::serve(server_cfg, limits, resolver, socks_tunnel, socks_cancel).await,
-        )
-    });
-
-    // 5. 启动 supervisor（健康探针、恢复阶梯、配置刷新定时器）
+    // 4. 先构造 supervisor。健康标志初始为 false；首次公网探针成功前，
+    // SOCKS5 只完成协议握手并快速返回 GeneralFailure，不再为注定失败的请求
+    // 批量分配 smoltcp socket buffer。隧道失联期间这能切断客户端重试风暴。
     let supervisor = Supervisor::new(
         cfg.clone(),
         account.clone(),
         tunnel.clone(),
         identity_pool,
         snapshot.credentials,
-        snapshot.wg_config,
+        active_wg_config,
     );
+    let health_flag = supervisor.health_flag();
+
+    let mut services = tokio::task::JoinSet::new();
     let supervisor_cancel = cancel.clone();
     services.spawn({
         let sup = supervisor.clone();
         async move { ("supervisor", sup.run(supervisor_cancel).await) }
     });
 
+    // 5. 启动 SOCKS5 监听（带 DoS 防护 + DNS 解析层）
+    let server_cfg = cfg.server.clone();
+    let limits = cfg.limits.clone();
+    let resolver = Arc::new(crate::dns::Resolver::new(&cfg.dns, tunnel.clone()));
+    let socks_cancel = cancel.clone();
+    let socks_tunnel = tunnel.clone();
+    let socks_health = health_flag.clone();
+    services.spawn(async move {
+        (
+            "SOCKS5",
+            proxy::serve(
+                server_cfg,
+                limits,
+                resolver,
+                socks_tunnel,
+                socks_health,
+                socks_cancel,
+            )
+            .await,
+        )
+    });
+
     // 6. metrics 端点
     let metrics_cfg = cfg.metrics.clone();
     let metrics_cancel = cancel.clone();
-    let health_flag = supervisor.health_flag();
     if let Some(metrics_handle) = metrics_handle {
         services.spawn(async move {
             (

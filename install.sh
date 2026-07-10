@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# warp-rust install.sh  schema=7  (auto interactive by default, /dev/tty 局部重定向，curl|bash 也能交互)
+# warp-rust install.sh  schema=9  (安全重装 + 有界建连；/dev/tty 局部重定向，curl|bash 也能交互)
 #
 # warp-rust 一键安装 / 卸载 / 更新脚本（Linux + systemd 专用）
 #
@@ -96,7 +96,7 @@ USER_NAME=""
 PASS=""
 VERSION=""
 ACTION="install"
-# v0.3.0 / schema=8：默认 auto —— /dev/tty 可达就交互，cron/CI 自动走默认非交互
+# v0.3.0+：默认 auto —— /dev/tty 可达就交互，cron/CI 自动走默认非交互
 # (auto | yes | no)
 INTERACTIVE_MODE="auto"
 # 是否传入了任何 install 参数；传了就强制非交互，免得 curl|bash --port 8964 还问一遍
@@ -396,11 +396,14 @@ if [ "$ACTION" = "update" ]; then
   systemctl stop "$SERVICE_NAME"
   install -m 0755 -o root -g root "$EXTRACTED/warp-rust" "$INSTALL_BIN"
   ok "二进制已更新到 ${VERSION}"
-  systemctl start "$SERVICE_NAME"
+  systemctl start "$SERVICE_NAME" \
+    || die "服务启动失败，请用 journalctl -u $SERVICE_NAME -n 50 查看"
   sleep 1
-  systemctl is-active --quiet "$SERVICE_NAME" \
-    && ok "服务已重启" \
-    || warn "服务启动失败，请用 journalctl -u $SERVICE_NAME -n 50 查看"
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    ok "服务已重启"
+  else
+    die "服务启动后未保持 active，请用 journalctl -u $SERVICE_NAME -n 50 查看"
+  fi
   exit 0
 fi
 
@@ -436,6 +439,11 @@ fi
 
 # ── 写配置 ──────────────────────────────────────────────────────────────────
 echo "  · 生成配置 $CONF_FILE"
+if [ -f "$CONF_FILE" ]; then
+  CONF_BACKUP="${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -p "$CONF_FILE" "$CONF_BACKUP"
+  warn "检测到旧配置，已备份到 $CONF_BACKUP（普通安装会按本次向导重建配置；--update 才完全保留配置）"
+fi
 {
   echo "# 由 install.sh 自动生成"
   echo "# 重新跑 install.sh 会覆盖；要保留请改名再启动 systemd 自定义 unit"
@@ -488,6 +496,7 @@ enabled = false
 
 [limits]
 max_concurrent_connections = 1024
+max_pending_dials = 128
 handshake_timeout = "10s"
 connect_timeout = "12s"
 happy_eyeballs_delay = "200ms"
@@ -572,9 +581,28 @@ systemctl daemon-reload
 ok "[4/5] 安装完成"
 
 info "[5/5] 启动 systemd 服务，等服务真正可用..."
-systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+# `enable --now` 对已经 active 的服务只负责 enable，不会重启现有进程。
+# 旧版脚本在“直接重新运行安装向导”时因此会出现：磁盘上的二进制/配置已经更新，
+# 内存里仍是旧版本进程。除了行为混杂，后面的 readiness 还会读到旧进程日志。
+# 这里明确 enable + restart/start，并且不吞掉 systemctl 错误。
+JOURNAL_SINCE_EPOCH="$(date +%s)"
+systemctl enable "$SERVICE_NAME" >/dev/null
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+  info "检测到旧服务仍在运行，正在重启以加载新二进制和配置..."
+  systemctl restart "$SERVICE_NAME" || die "服务重启失败，请查看 journalctl -u $SERVICE_NAME -n 80"
+else
+  systemctl start "$SERVICE_NAME" || die "服务启动失败，请查看 journalctl -u $SERVICE_NAME -n 80"
+fi
+systemctl is-active --quiet "$SERVICE_NAME" \
+  || die "服务启动后未保持 active，请查看 journalctl -u $SERVICE_NAME -n 80"
+RUNNING_PID="$(systemctl show "$SERVICE_NAME" -p MainPID --value)"
+if [ -n "$RUNNING_PID" ] && [ "$RUNNING_PID" != "0" ] && [ -x "/proc/$RUNNING_PID/exe" ]; then
+  RUNNING_VERSION="$("/proc/$RUNNING_PID/exe" --version 2>/dev/null || true)"
+  [ -n "$RUNNING_VERSION" ] && info "运行中进程：$RUNNING_VERSION (pid=$RUNNING_PID)"
+fi
 
-# 跟实时日志最多 25 秒，看到 'SOCKS5 listening' 就算成功
+# 跟本次启动日志最多 25 秒。readiness 是唯一成功依据；不能要求日志窗口里必须
+# 恰好出现 `SOCKS5 listening`，否则日志写入延迟/轮转会制造假失败。
 echo
 echo "${CYAN}── 服务启动日志（实时）──${RESET}"
 SECS_LIMIT=25
@@ -583,7 +611,7 @@ LAST_JOURNAL_TS=""
 READY=0
 while [ $((SECONDS - START)) -lt $SECS_LIMIT ]; do
   # 拿最近 30 行日志
-  CURRENT="$(journalctl -u "$SERVICE_NAME" --no-pager -q -n 30 --since "30 seconds ago" 2>/dev/null \
+  CURRENT="$(journalctl -u "$SERVICE_NAME" --no-pager -q -n 60 --since "@${JOURNAL_SINCE_EPOCH}" 2>/dev/null \
               | sed 's/^/  /')"
   if [ "$CURRENT" != "$LAST_JOURNAL_TS" ]; then
     # 显示新增的行（简单 diff）
@@ -594,10 +622,13 @@ while [ $((SECONDS - START)) -lt $SECS_LIMIT ]; do
     fi
     LAST_JOURNAL_TS="$CURRENT"
   fi
-  # 监听成功还不等于 WARP 公网出口健康；同时要求 readiness 探针通过。
-  if echo "$CURRENT" | grep -q "SOCKS5 listening" \
+  # /healthz 只有在 SOCKS5、supervisor 和多目标公网探针均就绪后才会成功。
+  if systemctl is-active --quiet "$SERVICE_NAME" \
      && curl -fsS --max-time 2 http://127.0.0.1:9090/healthz >/dev/null 2>&1; then
     READY=1
+    break
+  fi
+  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
     break
   fi
   # 检测明显失败

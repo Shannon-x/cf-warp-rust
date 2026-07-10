@@ -13,8 +13,8 @@ use crate::dns::Resolver;
 use crate::error::{Error, Result};
 use crate::metrics::{
     M_AUTH_FAIL, M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_CONNS_REJECTED,
-    M_DIAL_ATTEMPT, M_DIAL_FAILURE, M_DIAL_TIMEOUT, M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT,
-    M_UDP_ASSOCIATES_ACTIVE,
+    M_CONNS_REJECTED_DIAL_PRESSURE, M_CONNS_REJECTED_UNHEALTHY, M_DIAL_ATTEMPT, M_DIAL_FAILURE,
+    M_DIAL_TIMEOUT, M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT, M_UDP_ASSOCIATES_ACTIVE,
 };
 use crate::proxy::udp;
 use crate::tunnel::{Tunnel, TunnelTcpConnection};
@@ -25,9 +25,9 @@ use metrics::{counter, gauge};
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -57,6 +57,7 @@ pub async fn serve(
     limits: LimitsConfig,
     resolver: Arc<Resolver>,
     tunnel: Arc<Tunnel>,
+    healthy: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let listener = TcpListener::bind(cfg.bind).await?;
@@ -69,6 +70,7 @@ pub async fn serve(
     );
 
     let semaphore = Arc::new(Semaphore::new(limits.max_concurrent_connections));
+    let dial_semaphore = Arc::new(Semaphore::new(limits.max_pending_dials));
     let server_ip = cfg.bind.ip();
     let limits = Arc::new(limits);
     let mut connections = JoinSet::new();
@@ -121,12 +123,15 @@ pub async fn serve(
                 let resolver = resolver.clone();
                 let auth = cfg.auth.clone();
                 let limits = limits.clone();
+                let healthy = healthy.clone();
+                let dial_semaphore = dial_semaphore.clone();
                 let parent_cancel = cancel.clone();
                 connections.spawn(async move {
                     // permit 在 task 退出时自动 release
                     let _permit = permit;
                     if let Err(e) = handle(
-                        stream, peer, server_ip, tunnel, resolver, auth, limits, parent_cancel,
+                        stream, peer, server_ip, tunnel, resolver, auth, limits, healthy,
+                        dial_semaphore, parent_cancel,
                     )
                     .await
                     {
@@ -147,6 +152,8 @@ async fn handle(
     resolver: Arc<Resolver>,
     auth: Option<AuthConfig>,
     limits: Arc<LimitsConfig>,
+    healthy: Arc<AtomicBool>,
+    dial_semaphore: Arc<Semaphore>,
     parent_cancel: CancellationToken,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
@@ -177,6 +184,12 @@ async fn handle(
             // 继续往下走
         }
         Socks5Command::UDPAssociate => {
+            if !healthy.load(Ordering::Acquire) {
+                counter!(M_CONNS_REJECTED).increment(1);
+                counter!(M_CONNS_REJECTED_UNHEALTHY).increment(1);
+                proto.reply_error(&ReplyError::GeneralFailure).await?;
+                return Ok(());
+            }
             return handle_udp_associate(
                 proto,
                 peer,
@@ -195,6 +208,30 @@ async fn handle(
         }
     }
 
+    // 隧道已被 supervisor 判定为不健康时，不再进入 DNS + Happy Eyeballs
+    // 路径。一个失败拨号最多会并行预分配多组 smoltcp RX/TX buffer；浏览器的
+    // 自动重试风暴会因此把外部线路故障放大成内存和 CPU 压力。返回标准 SOCKS5
+    // GeneralFailure 让客户端快速退避，健康探针恢复后新请求自动放行。
+    if !healthy.load(Ordering::Acquire) {
+        counter!(M_CONNS_REJECTED).increment(1);
+        counter!(M_CONNS_REJECTED_UNHEALTHY).increment(1);
+        debug!(%peer, %target, "tunnel unhealthy; rejecting upstream dial");
+        proto.reply_error(&ReplyError::GeneralFailure).await?;
+        return Ok(());
+    }
+
+    // permit 只覆盖 DNS + 上游建连；进入 relay 后即释放，不压低已建立长连接并发。
+    let _dial_permit = match dial_semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            counter!(M_CONNS_REJECTED).increment(1);
+            counter!(M_CONNS_REJECTED_DIAL_PRESSURE).increment(1);
+            debug!(%peer, %target, "pending dial limit reached; rejecting request");
+            proto.reply_error(&ReplyError::GeneralFailure).await?;
+            return Ok(());
+        }
+    };
+
     // v0.2.1：解析为候选列表（v6 优先，v4 兜底）
     let candidates = match resolve_target(&resolver, &target).await {
         Ok(c) => c,
@@ -210,7 +247,7 @@ async fn handle(
         match happy_eyeballs_dial(tunnel.clone(), candidates, &limits).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(%peer, %target, error = %e, "all upstream candidates failed");
+                log_dial_failure(peer, &target, &e);
                 let reply = match &e {
                     Error::TunnelNotReady => ReplyError::GeneralFailure,
                     _ => ReplyError::HostUnreachable,
@@ -219,6 +256,7 @@ async fn handle(
                 return Ok(());
             }
         };
+    drop(_dial_permit);
 
     let client = proto.reply_success(upstream_addr).await?;
     counter!(M_CONNS_OPENED).increment(1);
@@ -238,6 +276,44 @@ async fn handle(
     counter!(M_CONNS_CLOSED).increment(1);
     debug!(%peer, %upstream_addr, bytes_up, bytes_down, "socks5 connection closed");
     Ok(())
+}
+
+/// 连接目标不可达时浏览器通常会立即并发重试。逐连接 `warn!` 会把一个上游故障
+/// 放大成 journald 洪水和格式化 CPU；保留 debug 明细，同时每 2 秒最多输出一条
+/// 聚合 warn，并报告期间抑制的条数。Prometheus 的 dial failure/timeout counter
+/// 仍逐次精确计数，不受日志采样影响。
+fn log_dial_failure(peer: SocketAddr, target: &TargetAddr, error: &Error) {
+    struct State {
+        last: Instant,
+        suppressed: u64,
+    }
+
+    static STATE: OnceLock<std::sync::Mutex<State>> = OnceLock::new();
+    const INTERVAL: Duration = Duration::from_secs(2);
+
+    debug!(%peer, %target, %error, "all upstream candidates failed");
+    let state = STATE.get_or_init(|| {
+        std::sync::Mutex::new(State {
+            last: Instant::now() - INTERVAL,
+            suppressed: 0,
+        })
+    });
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.last.elapsed() >= INTERVAL {
+        let suppressed = std::mem::take(&mut state.suppressed);
+        state.last = Instant::now();
+        warn!(
+            %peer,
+            %target,
+            %error,
+            suppressed_since_last = suppressed,
+            "upstream dial failures (rate limited)"
+        );
+    } else {
+        state.suppressed = state.suppressed.saturating_add(1);
+    }
 }
 
 async fn handshake_and_read_command(

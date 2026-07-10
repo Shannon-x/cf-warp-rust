@@ -3,6 +3,23 @@
 本项目的所有重要变更记录于此。版本遵循语义化版本（SemVer）。
 日期格式为 `YYYY-MM-DD`。
 
+## [0.4.1] - 2026-07-10
+
+### 修复
+
+- 修复重复运行安装向导时仅执行 `systemctl enable --now`、不会重启已经 active 的旧进程的问题。现在安装/重装会备份旧配置、明确 restart/start、打印运行中进程版本，失败不再被 `|| true` 吞掉，并只读取本次启动后的 journal。
+- 修复“磁盘已安装 v0.4.x、内存仍运行 v0.3.x、配置却已覆盖为新版”导致的版本/行为混杂；readiness 不再依赖日志窗口恰好出现 `SOCKS5 listening`。
+- 修复 WARP 默认 UDP 端点不可达时恢复状态机不断重试同一端口的问题；现在按 API 端口优先，并有界回退 UDP 2408/500/1701/4500，成功端口会写回后续 reconnect 状态。
+- 升级间接依赖 `anyhow 1.0.102 → 1.0.103`，消除 `RUSTSEC-2026-0190` 的 `downcast_mut` unsoundness。
+
+### 优化 / 加固
+
+- supervisor 判定隧道不健康后，SOCKS5 TCP/UDP 请求快速返回标准失败，不再为客户端重试风暴持续分配 netstack socket。
+- 新增 `[limits].max_pending_dials`（默认 128），把建连阶段与已建立连接分别限流，将坏线路下 Happy Eyeballs 最坏 buffer 峰值限制在固定范围。
+- 上游拨号失败日志改为 debug 明细 + 每 2 秒一条聚合 warning；连接失败指标仍逐次精确累计，避免 journald 洪水反过来消耗 CPU/磁盘。
+- 新增 `warp_rust_conns_rejected_tunnel_unhealthy_total` 与 `warp_rust_conns_rejected_dial_pressure_total`，可区分隧道故障和建连压力拒绝。
+- 新增安装升级、端点回退和建连容量校验回归测试。
+
 ## [0.4.0] - 2026-07-10
 
 ### 修复
@@ -89,6 +106,7 @@
 
 - WARP peer endpoint 优先 DNS 解析，IP 仅作 fallback。
 
+[0.4.1]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.0
 [0.3.3]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.2

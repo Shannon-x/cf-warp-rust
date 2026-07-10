@@ -66,6 +66,7 @@ enabled = true
 [limits]
 # v0.1.1 起内置 DoS 防护，所有字段都可调
 max_concurrent_connections = 1024   # 同时在飞 SOCKS5 连接上限；满即拒
+max_pending_dials = 128             # 同时建连上限；坏线路重试时限制 socket buffer 峰值
 handshake_timeout = "10s"           # SOCKS5 握手 + read_command 总超时
 connect_timeout = "12s"             # 所有上游候选的整体拨号时限
 happy_eyeballs_delay = "200ms"      # 相邻候选错峰启动间隔

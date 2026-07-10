@@ -124,6 +124,7 @@ enabled = true
 
 [limits]
 max_concurrent_connections = 1024
+max_pending_dials = 128
 handshake_timeout = "10s"
 connect_timeout = "12s"
 happy_eyeballs_delay = "200ms"

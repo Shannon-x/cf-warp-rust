@@ -219,6 +219,10 @@ pub struct HotReloadConfig {
 pub struct LimitsConfig {
     /// 同时在飞 SOCKS5 连接上限；满后新连接立刻关闭并记 metric
     pub max_concurrent_connections: usize,
+    /// 同时处于 DNS/上游 TCP 建连阶段的请求上限。失败线路上的拨号会持有
+    /// smoltcp socket RX/TX buffer，必须单独限流，避免重试风暴放大内存占用。
+    #[serde(default = "default_max_pending_dials")]
+    pub max_pending_dials: usize,
     /// SOCKS5 握手（含 read_command）超时；超时即关
     #[serde(with = "humantime_serde")]
     pub handshake_timeout: Duration,
@@ -253,6 +257,10 @@ fn default_relay_buffer_size() -> usize {
     64 * 1024
 }
 
+fn default_max_pending_dials() -> usize {
+    128
+}
+
 fn default_connect_timeout() -> Duration {
     Duration::from_secs(12)
 }
@@ -277,6 +285,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_concurrent_connections: 1024,
+            max_pending_dials: default_max_pending_dials(),
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: default_connect_timeout(),
             happy_eyeballs_delay: default_happy_eyeballs_delay(),
@@ -506,6 +515,14 @@ impl Config {
                 self.limits.max_concurrent_connections
             ));
         }
+        if self.limits.max_pending_dials == 0
+            || self.limits.max_pending_dials > self.limits.max_concurrent_connections
+        {
+            return Err(format!(
+                "[limits] max_pending_dials={} 必须在 1..=max_concurrent_connections={} 范围内",
+                self.limits.max_pending_dials, self.limits.max_concurrent_connections
+            ));
+        }
         if self.limits.connect_timeout.is_zero() {
             return Err("[limits] connect_timeout 必须大于 0".into());
         }
@@ -521,14 +538,18 @@ impl Config {
         if !(1..=4).contains(&self.limits.max_parallel_dials) {
             return Err("[limits] max_parallel_dials 必须在 1..=4".into());
         }
+        let max_dial_ports = self
+            .limits
+            .max_pending_dials
+            .saturating_mul(self.limits.max_parallel_dials.saturating_sub(1));
         if self
             .limits
             .max_concurrent_connections
-            .saturating_mul(self.limits.max_parallel_dials)
+            .saturating_add(max_dial_ports)
             > 32_768
         {
             return Err(
-                "[limits] max_concurrent_connections * max_parallel_dials 不能超过 32768（用户态 TCP 临时端口容量）"
+                "[limits] max_concurrent_connections + max_pending_dials * (max_parallel_dials - 1) 不能超过 32768（用户态 TCP 临时端口容量）"
                     .into(),
             );
         }
@@ -541,13 +562,19 @@ impl Config {
         if self.dns.mode == DnsMode::Tunnel && self.dns.servers.is_empty() {
             return Err("[dns] mode=tunnel 时 servers 不能为空".into());
         }
-        let per_connection = self
+        let established_capacity = self
             .warp
             .tcp_buffer_size
             .saturating_mul(2)
-            .saturating_mul(self.limits.max_parallel_dials)
-            .saturating_add(self.limits.relay_buffer_size.saturating_mul(2));
-        let capacity = per_connection.saturating_mul(self.limits.max_concurrent_connections);
+            .saturating_add(self.limits.relay_buffer_size.saturating_mul(2))
+            .saturating_mul(self.limits.max_concurrent_connections);
+        let extra_dial_capacity = self
+            .warp
+            .tcp_buffer_size
+            .saturating_mul(2)
+            .saturating_mul(self.limits.max_parallel_dials.saturating_sub(1))
+            .saturating_mul(self.limits.max_pending_dials);
+        let capacity = established_capacity.saturating_add(extra_dial_capacity);
         if capacity > 2 * 1024 * 1024 * 1024usize {
             tracing::warn!(
                 estimated_capacity_bytes = capacity,
@@ -655,9 +682,19 @@ mod tests {
     fn validate_rejects_dial_concurrency_beyond_port_capacity() {
         let mut cfg = Config::default();
         cfg.limits.max_concurrent_connections = 16_384;
+        cfg.limits.max_pending_dials = 16_384;
         cfg.limits.max_parallel_dials = 4;
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("32768"));
+    }
+
+    #[test]
+    fn validate_rejects_pending_dials_above_connection_limit() {
+        let mut cfg = Config::default();
+        cfg.limits.max_concurrent_connections = 64;
+        cfg.limits.max_pending_dials = 65;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_pending_dials"));
     }
 }
 

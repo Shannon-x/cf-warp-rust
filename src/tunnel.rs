@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wireguard_netstack::{
     ManagedTunnel, TcpConnection as NetstackTcpConnection, UdpHandle as NetstackUdpHandle,
     WireGuardConfig,
@@ -70,6 +70,29 @@ pub struct Tunnel {
     inner: ArcSwap<Option<Arc<ManagedTunnel>>>,
 }
 
+/// 已完成握手的候选隧道，以及它实际使用的配置。WARP ingress 在默认端口
+/// 不可达时可能通过备用 UDP 端口建联；调用方必须保存 `config`，否则下一轮
+/// reconnect 又会退回原来的坏端口。
+pub struct ConnectedTunnel {
+    pub managed: ManagedTunnel,
+    pub config: WireGuardConfig,
+}
+
+// Cloudflare WARP WireGuard ingress 的官方端口集合。API 通常返回 2408；部分
+// VPS/运营商会限制该端口，但允许同一 ingress IP 的 IPsec 兼容端口。
+const WARP_WG_FALLBACK_PORTS: [u16; 4] = [2408, 500, 1701, 4500];
+
+fn endpoint_ports(original_port: u16) -> Vec<u16> {
+    let mut ports = Vec::with_capacity(1 + WARP_WG_FALLBACK_PORTS.len());
+    ports.push(original_port);
+    ports.extend(
+        WARP_WG_FALLBACK_PORTS
+            .into_iter()
+            .filter(|port| *port != original_port),
+    );
+    ports
+}
+
 impl Tunnel {
     /// 用一个已经建联完成的 `ManagedTunnel` 构造。
     pub fn from_managed(t: ManagedTunnel) -> Arc<Self> {
@@ -79,16 +102,59 @@ impl Tunnel {
     }
 
     /// 重新建联，并原子地替换掉原来的隧道。旧隧道的后台任务会随 Drop 被 abort。
-    pub async fn rebuild(&self, cfg: WireGuardConfig) -> Result<()> {
+    pub async fn rebuild(&self, cfg: WireGuardConfig) -> Result<WireGuardConfig> {
         info!("rebuilding WireGuard tunnel");
-        let new = Self::connect_candidate(cfg).await?;
-        self.replace(new);
-        Ok(())
+        let connected = Self::connect_candidate(cfg).await?;
+        let active_config = connected.config.clone();
+        self.replace(connected.managed);
+        Ok(active_config)
     }
 
-    /// 建立且完成握手的候选隧道，但不改动当前流量。
-    pub async fn connect_candidate(cfg: WireGuardConfig) -> Result<ManagedTunnel> {
-        Ok(ManagedTunnel::connect(cfg).await?)
+    /// 建立且完成握手的候选隧道，但不改动当前流量。先尝试配置中的端口，
+    /// 失败后依次尝试 WARP WireGuard 备用端口。每次失败的 ManagedTunnel 都会
+    /// 立即 drop 并 abort 自己的后台任务，不会留下孤儿隧道。
+    pub async fn connect_candidate(cfg: WireGuardConfig) -> Result<ConnectedTunnel> {
+        let original_port = cfg.peer_endpoint.port();
+        let mut failures = Vec::new();
+        for (index, port) in endpoint_ports(original_port).into_iter().enumerate() {
+            let mut candidate = cfg.clone();
+            candidate.peer_endpoint.set_port(port);
+            // 原始 API 端点给足标准 10 秒；备用端口各用 5 秒，限制最坏恢复时延。
+            let timeout = if index == 0 {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(5)
+            };
+            match ManagedTunnel::connect_with_timeout(candidate.clone(), timeout).await {
+                Ok(managed) => {
+                    if port != original_port {
+                        warn!(
+                            original_port,
+                            active_port = port,
+                            peer_ip = %candidate.peer_endpoint.ip(),
+                            "WireGuard connected through fallback UDP port"
+                        );
+                    }
+                    return Ok(ConnectedTunnel {
+                        managed,
+                        config: candidate,
+                    });
+                }
+                Err(e) => {
+                    failures.push(format!("udp/{port}: {e}"));
+                    warn!(
+                        peer = %candidate.peer_endpoint,
+                        error = %e,
+                        "WireGuard endpoint attempt failed"
+                    );
+                }
+            }
+        }
+
+        Err(Error::other(format!(
+            "all WARP WireGuard endpoint ports failed: {}",
+            failures.join("; ")
+        )))
     }
 
     /// 候选隧道和账号都已验证/持久化后，做最后的原子切换。
@@ -174,5 +240,17 @@ impl Tunnel {
             .as_ref()
             .map(|t| t.wg_tunnel().tunnel_ipv6().is_some())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_fallback_keeps_api_port_first_without_duplicates() {
+        assert_eq!(endpoint_ports(2408), vec![2408, 500, 1701, 4500]);
+        assert_eq!(endpoint_ports(500), vec![500, 2408, 1701, 4500]);
+        assert_eq!(endpoint_ports(12345), vec![12345, 2408, 500, 1701, 4500]);
     }
 }

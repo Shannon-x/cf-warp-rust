@@ -7,15 +7,27 @@
 - **首次启动自动注册** Cloudflare WARP 账号；凭据持久化到 `data/account.json`（权限 0600）。后续重启复用同一身份，不会重复消耗注册配额。
 - **SOCKS5 CONNECT 与 UDP ASSOCIATE 同时支持。** UDP 报文走 WireGuard 隧道里的用户态 UDP socket，DNS、QUIC 等场景端到端可用，不是只能跑 TCP。
 - **用户态 WireGuard**，基于 [`wireguard-netstack`](https://crates.io/crates/wireguard-netstack)（本仓库在 `vendor/` 下做了 fork，新增 UDP 暴露）。**无需 `wg-quick`、无需 TUN 设备、无需 root**。
-- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。默认每 30 秒并发探测 3 个独立公网目标，2 个成功才判定出口健康。
+- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。默认每 30 秒并发探测 3 个独立公网目标，2 个成功才判定出口健康；默认 WARP UDP 端口失败时自动回退 2408/500/1701/4500。
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
 - **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置变更检测（解析校验，不热应用）** — `config.toml` 改动会被监听并立即重新解析，TOML 语法错或字段错会马上在日志里报告；**但新配置不会自动应用到运行中的进程**，改完后需 `sudo systemctl restart warp-rust` 才生效。`systemd restart` 不会动 `data/account.json`，正在跑的 WARP 凭据/身份轮转状态都会保留。
-- **高并发内存平衡**：默认 MTU 1420、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；需要单流极限吞吐时可单独调大。
+- **高并发内存平衡**：默认 MTU 1420、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；已建立连接和建连请求分别限流，坏线路下的客户端重试不会无界放大 socket buffer。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
 - **开放代理保护**（v0.1.1 + v0.3.2 收紧）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动。可通过 `WARP_RUST_ALLOW_OPEN_PROXY=1` 整体跳过校验（高风险）；**容器场景**还可通过 `WARP_RUST_TRUSTED_HOST_NET=1` 仅放行「容器内 0.0.0.0 + 宿主 `-p 127.0.0.1:...` 限定」这一窄场景。仓库 `scripts/run-docker.sh` / `docker-compose.yml` / `scripts/quickstart.sh` 已默认注入；**裸 `docker run -p 1080:1080 ghcr.io/...` 启动失败**（v0.3.2 BREAKING：必须显式 opt-in，杜绝意外把无鉴权 SOCKS5 挂到宿主 INADDR_ANY）。
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
 - **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl / Linux aarch64-musl / Windows x86_64 / macOS Apple Silicon）。
+
+## v0.4.1：针对大量连接超时与日志洪水的修复
+
+现场日志同时暴露了两类问题：`HANDSHAKE(REKEY_TIMEOUT)` 表示 VPS 到 WARP peer 的 UDP 握手没有及时收到响应；大量 `peer=127.0.0.1` 的 Google 请求则来自本机客户端失败后的并发重试。v0.4.1 修复程序能够控制的放大链路：
+
+- 重复运行安装向导会真正重启现有服务，不再出现“文件是新版、内存仍跑旧版”的混合状态。
+- WARP API 返回的端口失败后，自动尝试 [Cloudflare WireGuard 文档列出的](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/deployment/firewall/) UDP 2408/500/1701/4500，并记住成功端口供后续重连使用。
+- 隧道不健康时 SOCKS5 快速失败；新增 `max_pending_dials = 128` 单独限制建连阶段，避免大量超时请求同时占用 Happy Eyeballs socket buffer。
+- 单条失败仍计入 Prometheus，但 warning 每 2 秒聚合一次，避免 journald 日志洪水。
+- 升级 `anyhow`，修复 `RUSTSEC-2026-0190` unsoundness。
+
+这些优化不能让外部已屏蔽的 Google/WARP 路由凭空恢复，但会自动寻找可用 WARP UDP 端口，并防止外部线路故障演变成进程内存、CPU 和磁盘压力。
 
 ## v0.4.0 相对 v0.3.3：连接可靠性与高并发改进
 
@@ -37,7 +49,7 @@ v0.4.0 的重点是解决“DNS 已经解析成功，但新连接仍然反复 TC
 
 - 旧 `config.toml` 如果显式写了 `tcp_buffer_size = 1048576` 或 `relay_buffer_size = 262144`，升级不会自动改掉这些值。想使用 v0.4.0 的默认内存模型，请改为 262144 和 65536。
 - 为了让域名多候选拨号生效，建议在 `[limits]` 显式配置 `connect_timeout = "12s"`、`happy_eyeballs_delay = "200ms"`、`max_dial_candidates = 8` 和 `max_parallel_dials = 2`。
-- systemd 部署请用 `/healthz` 做 readiness 探测，用 `/livez` 做进程存活检查。
+- systemd 部署请用 `/healthz` 做 readiness 探测，用 `/livez` 做进程存活检查。升级到 v0.4.1 后建议增加 `max_pending_dials = 128`；旧配置缺少该字段时也会自动使用此默认值。
 
 ---
 
@@ -70,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/install
 - 二进制在 `/usr/local/bin/warp-rust`
 - 配置在 `/etc/warp-rust/config.toml`（权限 0640，仅 root 与服务用户可读）
 - 数据在 `/var/lib/warp-rust/`（含 WARP 凭据，权限 0750）
-- systemd 服务 `warp-rust.service`，已 `enable --now`，带完整安全 hardening
+- systemd 服务 `warp-rust.service`，已启用并启动；重复安装时会明确重启现有进程，带完整安全 hardening
 
 常用命令：
 
@@ -79,6 +91,14 @@ sudo systemctl status warp-rust          # 看状态
 sudo systemctl restart warp-rust         # 重启
 sudo journalctl -u warp-rust -f          # 跟日志
 curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace   # 验证（期望 warp=on）
+```
+
+确认磁盘与正在运行的进程版本一致：
+
+```bash
+/usr/local/bin/warp-rust --version
+PID=$(systemctl show warp-rust -p MainPID --value)
+sudo /proc/$PID/exe --version
 ```
 
 ---
@@ -304,6 +324,7 @@ cargo build --release
 | `[warp]` | `register_cooldown` | 两次重注册之间的最小间隔。默认 10m |
 | `[warp]` | `mtu` | WireGuard MTU。默认 1420；PMTU 不稳时可回退 1280 |
 | `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 262144；每连接约占 2 倍内存 |
+| `[limits]` | `max_concurrent_connections` / `max_pending_dials` | 总连接上限与建连阶段上限。默认 1024 / 128 |
 | `[limits]` | `relay_buffer_size` | SOCKS TCP 每方向 relay buffer。默认 65536 |
 | `[limits]` | `relay_close_grace` | v0.3.2：双向 relay 中一侧退出后给对端的优雅窗口；超时 abort 兜底。默认 `500ms` |
 | `[limits]` | `connect_timeout` / `happy_eyeballs_delay` | 全候选总超时与错峰拨号间隔 |
@@ -441,7 +462,9 @@ curl -f http://127.0.0.1:9090/livez
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
 | `warp_rust_conns_opened_total` / `conns_closed_total` | counter | SOCKS5 TCP 累计开/关数 |
-| `warp_rust_conns_rejected_total` | counter | 因并发上限被拒数 |
+| `warp_rust_conns_rejected_total` | counter | 所有资源/健康原因的累计拒绝数 |
+| `warp_rust_conns_rejected_tunnel_unhealthy_total` | counter | 隧道不健康时快速拒绝数 |
+| `warp_rust_conns_rejected_dial_pressure_total` | counter | 达到 `max_pending_dials` 后的快速拒绝数 |
 | `warp_rust_bytes_up_total` / `bytes_down_total` | counter | 上下行累计字节 |
 | `warp_rust_probe_success_total` / `probe_failure_total` | counter | 健康探针成败数 |
 | `warp_rust_dial_attempt_total` / `dial_failure_total` / `dial_timeout_total` | counter | 多候选拨号尝试、失败与整体超时 |
@@ -497,6 +520,21 @@ curl --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace | grep -E '^
 
 # 看 SOCKS5 端口监听状态
 ss -tlnp | grep warp-rust
+```
+
+### `HANDSHAKE(REKEY_TIMEOUT)` 与 Google 大量超时
+
+- `HANDSHAKE(REKEY_TIMEOUT)` 是 WireGuard 握手发出后约 5 秒没有收到 peer 响应，不是 DNS 报错。v0.4.1 会在重连时尝试备用 UDP 端口；如果所有端口都失败，继续检查 VPS 安全组、宿主防火墙和上游 UDP 策略。
+- `peer=127.0.0.1` 表示请求来自服务器本机。Chrome、Android/Google 服务或自动化程序失败后可能快速重试；v0.4.1 会在隧道不健康或建连压力过高时快速拒绝并聚合日志。
+- 默认健康探针是 3 个目标取 2 个成功。因此 `probe ok` 代表通用出口 quorum 恢复，不保证某一家网络（例如 Google）的所有端口都可达。可在 `[health].targets` 加入业务关键 IP:port，并相应提高 `min_successes`。
+
+```bash
+# Cloudflare 与 Google 分别测试；前者成功而后者失败通常是选择性出口/路由问题
+curl --max-time 15 --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace
+curl --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.google.com/generate_204 -v
+
+# 观察实际 WARP UDP 端口及握手恢复
+sudo journalctl -u warp-rust --since '5 min ago' | grep -E 'fallback UDP port|HANDSHAKE|probe|recovery'
 ```
 
 ## 已知限制与注意事项

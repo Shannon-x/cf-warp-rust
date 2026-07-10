@@ -26,6 +26,8 @@ pub const M_ROTATE: &str = "warp_rust_rotate_identity_total";
 pub const M_UDP_ASSOCIATES_ACTIVE: &str = "warp_rust_udp_associates_active";
 // v0.1.1：DoS 防护与 DNS 解析相关
 pub const M_CONNS_REJECTED: &str = "warp_rust_conns_rejected_total";
+pub const M_CONNS_REJECTED_UNHEALTHY: &str = "warp_rust_conns_rejected_tunnel_unhealthy_total";
+pub const M_CONNS_REJECTED_DIAL_PRESSURE: &str = "warp_rust_conns_rejected_dial_pressure_total";
 pub const M_HANDSHAKE_TIMEOUT: &str = "warp_rust_handshake_timeout_total";
 pub const M_IDLE_TIMEOUT: &str = "warp_rust_idle_timeout_total";
 pub const M_AUTH_FAIL: &str = "warp_rust_auth_fail_total";

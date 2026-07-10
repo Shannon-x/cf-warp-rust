@@ -248,7 +248,8 @@ impl Supervisor {
 
     async fn action_reconnect(&self) -> Result<()> {
         let wg = self.wg_config.lock().await.clone();
-        self.tunnel.rebuild(wg).await?;
+        let active_wg = self.tunnel.rebuild(wg).await?;
+        *self.wg_config.lock().await = active_wg;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
     }
@@ -256,8 +257,8 @@ impl Supervisor {
     async fn action_rebuild_config(&self) -> Result<()> {
         let creds = self.creds.lock().await.clone();
         let wg = self.account.refresh_config(&creds).await?;
-        self.tunnel.rebuild(wg.clone()).await?;
-        *self.wg_config.lock().await = wg;
+        let active_wg = self.tunnel.rebuild(wg).await?;
+        *self.wg_config.lock().await = active_wg;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
     }
@@ -268,13 +269,13 @@ impl Supervisor {
         match self.account.prepare_reregister().await {
             Ok(candidate) => {
                 let next_wg = candidate.wg_config;
-                let new_tunnel = Tunnel::connect_candidate(next_wg.clone()).await?;
+                let connected = Tunnel::connect_candidate(next_wg).await?;
                 self.account
                     .commit_candidate(&candidate.account_file)
                     .await?;
                 *self.creds.lock().await = candidate.account_file.credentials.clone();
-                *self.wg_config.lock().await = next_wg;
-                self.tunnel.replace(new_tunnel);
+                *self.wg_config.lock().await = connected.config;
+                self.tunnel.replace(connected.managed);
                 counter!(M_REREGISTER).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
                 Ok(())
@@ -298,13 +299,13 @@ impl Supervisor {
             Some(file) => {
                 let candidate = self.account.prepare_identity(&file).await?;
                 let next_wg = candidate.wg_config;
-                let new_tunnel = Tunnel::connect_candidate(next_wg.clone()).await?;
+                let connected = Tunnel::connect_candidate(next_wg).await?;
                 self.account
                     .commit_candidate(&candidate.account_file)
                     .await?;
                 *self.creds.lock().await = candidate.account_file.credentials.clone();
-                *self.wg_config.lock().await = next_wg;
-                self.tunnel.replace(new_tunnel);
+                *self.wg_config.lock().await = connected.config;
+                self.tunnel.replace(connected.managed);
                 counter!(M_ROTATE).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
             }
