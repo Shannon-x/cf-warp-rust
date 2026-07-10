@@ -3,6 +3,17 @@
 本项目的所有重要变更记录于此。版本遵循语义化版本（SemVer）。
 日期格式为 `YYYY-MM-DD`。
 
+## [0.4.2] - 2026-07-10
+
+### 修复
+
+- **恢复状态机在默认（空）身份池下会永久停摆（critical）。** `action_for` 在连续失败数 `n >= rotate_identity_after`（默认 10）之后**永远**返回 `RotateIdentity`，而 `consecutive_failures` 只有探针成功才清零。旧实现（含 v0.3.x/v0.4.0/v0.4.1）在空身份池（默认部署 `data/identities/` 不存在即为空池）时只打印一条 warning 就返回 `Ok(())`，于是从第 10 次连续探针失败起，整个恢复系统再也不会触发带 UDP 端口回退的隧道重建——隧道即使一直在 flap、底层网络后来恢复了，也只能人工重启。现在空池会回退到 reregister（其内部再回退到 rebuild_config），保证顶格恢复动作永远真正尝试重建隧道。这是「拨号全挂、数小时不自愈」的根因之一。
+- **WireGuard 接口 MTU 默认从 1420 下调到 1280（WARP 官方推荐值）。** 1420 在很多 VPS/云网络（自身隧道封装、PPPoE、MTU<1500 骨干）上会让满载 WireGuard 数据包（内层 ~1420 + 60 WG 封装 + 28 IP/UDP ≈ 1508 > 1500）在路径上被丢弃：握手/SYN 等小包能过、隧道看似建成，但一旦承载真实数据就卡死。1280 给足余量、与 WARP 官方 / wgcf / wireproxy 默认一致。确认路径 MTU=1500 的环境可手动调回 `[warp].mtu = 1420`。
+
+### 说明
+
+- 生产环境出现「隧道能到 1.1.1.1、但公网出口全部 `TCP connection timeout` + 频繁 `HANDSHAKE(REKEY_TIMEOUT)`」时：若同一版本二进制在另一台 VPS 正常，则该机大概率是**到 WARP endpoint 的 UDP 路径不稳定/被限速**（环境级），本版仅提升健壮性（端口回退 + 恢复不再停摆 + 更安全的 MTU），无法修复本质上丢包的 UDP 链路。此时可考虑：换 VPS/IP、配置 WARP+ `license_key`、或用官方 `warp-cli`/`wgcf` 验证该机是否任何 WARP 客户端都无法稳定建联。
+
 ## [0.4.1] - 2026-07-10
 
 ### 修复

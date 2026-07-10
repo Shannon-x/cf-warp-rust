@@ -92,8 +92,14 @@ pub struct WarpConfig {
     pub refresh_interval: Duration,
     #[serde(with = "humantime_serde", default = "default_register_cooldown")]
     pub register_cooldown: Duration,
-    /// WireGuard 接口 MTU。Cloudflare WARP 推荐 1280，更大可调到 1420（标准 WG）。
-    /// 默认 1420：对齐标准 WireGuard / wireproxy；PMTU 不足时可回退 1280。
+    /// WireGuard 接口 MTU。**Cloudflare WARP 官方推荐 1280**。
+    ///
+    /// v0.4.2：默认从 1420 下调到 1280。1420 在很多 VPS/云网络（叠加了自身
+    /// 隧道封装、PPPoE 或 MTU<1500 的骨干）上会让满载的 WireGuard 数据包
+    /// （内层 ~1420 + 60 字节 WG 封装 + 28 IP/UDP ≈ 1508 > 1500）在路径上被丢弃：
+    /// 握手/SYN 等小包能过、隧道看似建成，但一旦承载真实数据就卡死。1280 给
+    /// 足够余量、与 WARP 官方 / wgcf / wireproxy 默认一致。带宽极好、确认路径
+    /// MTU=1500 的环境可手动调回 1420。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     /// smoltcp TCP socket 的单向 buffer 大小。实际每条 TCP 连接约占用 2 倍该值。
@@ -110,7 +116,7 @@ fn default_register_cooldown() -> Duration {
 }
 
 fn default_mtu() -> u16 {
-    1420
+    1280
 }
 
 fn default_tcp_buffer_size() -> usize {

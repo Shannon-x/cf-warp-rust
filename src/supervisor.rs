@@ -310,7 +310,17 @@ impl Supervisor {
                 counter!(M_TUNNEL_REBUILD).increment(1);
             }
             None => {
-                warn!("identity pool empty; cannot rotate (will keep retrying current identity)");
+                // FIX（critical）：空身份池**绝不能**是 no-op。`action_for` 在
+                // `n >= rotate_identity_after`（默认 10）之后永远返回 RotateIdentity，
+                // 而 `consecutive_failures` 只有 ProbeOk 才清零。旧实现在空池
+                // （默认部署 `data/identities/` 不存在，就是空池）时只 warn 并返回
+                // Ok(())，于是从第 10 次连续探针失败起整个恢复系统永久停摆——隧道即使
+                // 一直在 flap、底层网络后来恢复了，也再不会触发带 endpoint 端口回退的
+                // 重建，只能人工重启。这正是「拨号全挂、数小时不自愈」的根因之一。
+                // 回退到 reregister（其内部在 cooldown 未到时又回退到 rebuild_config），
+                // 保证顶格恢复动作永远真正尝试重建隧道。
+                warn!("identity pool empty; cannot rotate — falling back to reregister/rebuild so recovery never stalls");
+                return self.action_reregister().await;
             }
         }
         Ok(())
