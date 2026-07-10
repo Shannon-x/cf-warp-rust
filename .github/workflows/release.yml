@@ -43,7 +43,7 @@ jobs:
             archive: zip
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -102,7 +102,12 @@ jobs:
           Copy-Item scripts/*.sh "$name/scripts/"
           Compress-Archive -Path "$name" -DestinationPath "dist/$name.zip" -Force
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File -Encoding ASCII "dist/$name.zip.sha256"
+          # 强制 LF + 无 BOM，使 Linux/macOS 的 sha256sum -c 也能直接验证。
+          [System.IO.File]::WriteAllText(
+            "dist/$name.zip.sha256",
+            "$hash  $name.zip`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
           Get-ChildItem dist/
 
       - name: Upload artifact
@@ -118,7 +123,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4

@@ -26,7 +26,7 @@ jobs:
     name: build (aarch64-apple-darwin)
     runs-on: macos-latest    # GitHub 默认 macos-latest = Apple Silicon (M 系列)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
