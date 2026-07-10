@@ -8,17 +8,24 @@ use crate::tunnel::Tunnel;
 use crate::warp::identity_pool::IdentityPool;
 use crate::warp::AccountManager;
 use metrics::counter;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use warp_wireguard_gen::WarpCredentials;
+use wireguard_netstack::WireGuardConfig;
 
 #[derive(Debug)]
 pub enum SupervisorEvent {
-    ProbeOk,
-    ProbeFailed { reason: String },
+    ProbeOk {
+        observed_at: Instant,
+    },
+    ProbeFailed {
+        reason: String,
+        observed_at: Instant,
+    },
     RefreshTimerFired,
 }
 
@@ -38,9 +45,15 @@ pub struct Supervisor {
     identity_pool: Mutex<IdentityPool>,
     /// 当前生效的凭据（rotate / re-register 时会被更新）
     creds: Mutex<WarpCredentials>,
+    /// 当前已验证的隧道配置。第一级 Reconnect 直接复用，不访问 API。
+    wg_config: Mutex<WireGuardConfig>,
     events_tx: mpsc::Sender<SupervisorEvent>,
     events_rx: Mutex<mpsc::Receiver<SupervisorEvent>>,
     consecutive_failures: Mutex<u8>,
+    /// 恢复完成前观测到、但排队到恢复完成后才处理的探针必须丢弃；否则旧失败
+    /// 会立即推动恢复阶梯，造成无谓的重注册/身份轮换风暴。
+    last_recovery_completed: Mutex<Option<Instant>>,
+    healthy: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -50,6 +63,7 @@ impl Supervisor {
         tunnel: Arc<Tunnel>,
         identity_pool: IdentityPool,
         creds: WarpCredentials,
+        wg_config: WireGuardConfig,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
         Arc::new(Self {
@@ -58,18 +72,22 @@ impl Supervisor {
             tunnel,
             identity_pool: Mutex::new(identity_pool),
             creds: Mutex::new(creds),
+            wg_config: Mutex::new(wg_config),
             events_tx: tx,
             events_rx: Mutex::new(rx),
             consecutive_failures: Mutex::new(0),
+            last_recovery_completed: Mutex::new(None),
+            healthy: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub fn events_tx(&self) -> mpsc::Sender<SupervisorEvent> {
-        self.events_tx.clone()
+    pub fn health_flag(&self) -> Arc<AtomicBool> {
+        self.healthy.clone()
     }
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
         info!("supervisor started");
+        let mut background = tokio::task::JoinSet::new();
 
         // 健康探针
         {
@@ -77,7 +95,7 @@ impl Supervisor {
             let cfg = self.cfg.health.clone();
             let tx = self.events_tx.clone();
             let child = cancel.child_token();
-            tokio::spawn(health::probe_loop(tunnel, cfg, tx, child));
+            background.spawn(health::probe_loop(tunnel, cfg, tx, child));
         }
 
         // 配置刷新定时器
@@ -85,19 +103,24 @@ impl Supervisor {
             let interval = self.cfg.warp.refresh_interval;
             let tx = self.events_tx.clone();
             let child = cancel.child_token();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 ticker.tick().await; // 跳过 interval 的首次立即 fire
                 loop {
                     tokio::select! {
                         biased;
                         _ = child.cancelled() => break,
                         _ = ticker.tick() => {
-                            let _ = tx.send(SupervisorEvent::RefreshTimerFired).await;
+                            if tx.send(SupervisorEvent::RefreshTimerFired).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
             });
+        } else {
+            info!("scheduled WARP config refresh disabled");
         }
 
         // 事件分发循环
@@ -105,7 +128,17 @@ impl Supervisor {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => {
+                    background.shutdown().await;
+                    break;
+                },
+                joined = background.join_next(), if !background.is_empty() => {
+                    return Err(match joined {
+                        Some(Ok(())) => crate::error::Error::other("supervisor background task exited unexpectedly"),
+                        Some(Err(e)) => crate::error::Error::other(format!("supervisor background task failed: {e}")),
+                        None => crate::error::Error::other("supervisor background tasks disappeared"),
+                    });
+                }
                 Some(evt) = rx.recv() => {
                     if let Err(e) = self.handle_event(evt).await {
                         error!(error = %e, "supervisor handler failed");
@@ -119,14 +152,27 @@ impl Supervisor {
 
     async fn handle_event(&self, evt: SupervisorEvent) -> Result<()> {
         match evt {
-            SupervisorEvent::ProbeOk => {
+            SupervisorEvent::ProbeOk { observed_at } => {
+                if self.probe_is_stale(observed_at).await {
+                    debug!("discarding stale successful probe");
+                    return Ok(());
+                }
+                self.healthy.store(true, Ordering::Release);
                 let mut fails = self.consecutive_failures.lock().await;
                 if *fails > 0 {
                     info!(prior_failures = *fails, "probe ok — healthy again");
                     *fails = 0;
                 }
             }
-            SupervisorEvent::ProbeFailed { reason } => {
+            SupervisorEvent::ProbeFailed {
+                reason,
+                observed_at,
+            } => {
+                if self.probe_is_stale(observed_at).await {
+                    debug!(reason, "discarding stale failed probe");
+                    return Ok(());
+                }
+                self.healthy.store(false, Ordering::Release);
                 let action = {
                     let mut fails = self.consecutive_failures.lock().await;
                     *fails = fails.saturating_add(1);
@@ -145,6 +191,13 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    async fn probe_is_stale(&self, observed_at: Instant) -> bool {
+        self.last_recovery_completed
+            .lock()
+            .await
+            .is_some_and(|completed| observed_at <= completed)
     }
 
     fn action_for(&self, n: u8) -> RecoveryAction {
@@ -177,6 +230,7 @@ impl Supervisor {
             warn!(error = %e, ?action, "recovery step failed");
         } else {
             info!(?action, "recovery step completed");
+            *self.last_recovery_completed.lock().await = Some(Instant::now());
         }
         result
     }
@@ -193,8 +247,7 @@ impl Supervisor {
     }
 
     async fn action_reconnect(&self) -> Result<()> {
-        let creds = self.creds.lock().await.clone();
-        let wg = self.account.refresh_config(&creds).await?;
+        let wg = self.wg_config.lock().await.clone();
         self.tunnel.rebuild(wg).await?;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
@@ -203,21 +256,25 @@ impl Supervisor {
     async fn action_rebuild_config(&self) -> Result<()> {
         let creds = self.creds.lock().await.clone();
         let wg = self.account.refresh_config(&creds).await?;
-        self.tunnel.rebuild(wg).await?;
+        self.tunnel.rebuild(wg.clone()).await?;
+        *self.wg_config.lock().await = wg;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
     }
 
     async fn action_reregister(&self) -> Result<()> {
-        // FIX-4：调 AccountManager::reregister（它内部校验 register_cooldown）
-        // 之前的实现直接 fs::remove_file + load_or_register，绕过了冷却保护，
-        // 而且若 API 失败旧账号已经删除、不可恢复。
-        // 现在改成：reregister 成功就替换；失败（多半冷却中）回退到 rebuild_config
-        // 而不丢账号。
-        match self.account.reregister().await {
-            Ok(snapshot) => {
-                *self.creds.lock().await = snapshot.credentials.clone();
-                self.tunnel.rebuild(snapshot.wg_config).await?;
+        // 候选账号和候选隧道都成功后才提交，任何 API/握手/磁盘错误
+        // 都会保留当前可用账号与隧道。
+        match self.account.prepare_reregister().await {
+            Ok(candidate) => {
+                let next_wg = candidate.wg_config;
+                let new_tunnel = Tunnel::connect_candidate(next_wg.clone()).await?;
+                self.account
+                    .commit_candidate(&candidate.account_file)
+                    .await?;
+                *self.creds.lock().await = candidate.account_file.credentials.clone();
+                *self.wg_config.lock().await = next_wg;
+                self.tunnel.replace(new_tunnel);
                 counter!(M_REREGISTER).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
                 Ok(())
@@ -239,12 +296,15 @@ impl Supervisor {
         };
         match next {
             Some(file) => {
-                let pool = self.identity_pool.lock().await;
-                pool.activate(&self.cfg.warp.data_dir, &file)?;
-                drop(pool);
-                let snapshot = self.account.load_or_register().await?;
-                *self.creds.lock().await = snapshot.credentials.clone();
-                self.tunnel.rebuild(snapshot.wg_config).await?;
+                let candidate = self.account.prepare_identity(&file).await?;
+                let next_wg = candidate.wg_config;
+                let new_tunnel = Tunnel::connect_candidate(next_wg.clone()).await?;
+                self.account
+                    .commit_candidate(&candidate.account_file)
+                    .await?;
+                *self.creds.lock().await = candidate.account_file.credentials.clone();
+                *self.wg_config.lock().await = next_wg;
+                self.tunnel.replace(new_tunnel);
                 counter!(M_ROTATE).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
             }
@@ -262,16 +322,17 @@ mod tests {
     use crate::config::RecoveryConfig;
 
     fn cfg() -> Config {
-        let mut c = Config::default();
-        c.recovery = RecoveryConfig {
-            reconnect_after: 1,
-            rebuild_config_after: 3,
-            reregister_after: 5,
-            rotate_identity_after: 10,
-            backoff_min: Duration::from_millis(0),
-            backoff_max: Duration::from_millis(0),
-        };
-        c
+        Config {
+            recovery: RecoveryConfig {
+                reconnect_after: 1,
+                rebuild_config_after: 3,
+                reregister_after: 5,
+                rotate_identity_after: 10,
+                backoff_min: Duration::from_millis(0),
+                backoff_max: Duration::from_millis(0),
+            },
+            ..Config::default()
+        }
     }
 
     /// 纯函数 —— 无需构造 fake AccountManager / Tunnel

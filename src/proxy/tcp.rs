@@ -13,24 +13,44 @@ use crate::dns::Resolver;
 use crate::error::{Error, Result};
 use crate::metrics::{
     M_AUTH_FAIL, M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_CONNS_REJECTED,
-    M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT, M_UDP_ASSOCIATES_ACTIVE,
+    M_DIAL_ATTEMPT, M_DIAL_FAILURE, M_DIAL_TIMEOUT, M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT,
+    M_UDP_ASSOCIATES_ACTIVE,
 };
 use crate::proxy::udp;
-use crate::tunnel::Tunnel;
+use crate::tunnel::{Tunnel, TunnelTcpConnection};
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{ReplyError, Socks5Command};
 use metrics::{counter, gauge};
+use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn};
-use wireguard_netstack::TcpConnection;
+
+struct ActiveUdpAssociate;
+
+impl ActiveUdpAssociate {
+    fn new() -> Self {
+        gauge!(M_UDP_ASSOCIATES_ACTIVE).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveUdpAssociate {
+    fn drop(&mut self) {
+        gauge!(M_UDP_ASSOCIATES_ACTIVE).decrement(1.0);
+    }
+}
 
 pub async fn serve(
     cfg: ServerConfig,
@@ -51,16 +71,40 @@ pub async fn serve(
     let semaphore = Arc::new(Semaphore::new(limits.max_concurrent_connections));
     let server_ip = cfg.bind.ip();
     let limits = Arc::new(limits);
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 info!("SOCKS5 listener stopping");
+                // abort 会 drop 在飞 connect future / TcpConnection；两者都有 RAII
+                // 清理 smoltcp socket 与临时端口，不留下 detached task。
+                connections.shutdown().await;
                 return Ok(());
             }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(e)) = joined {
+                    warn!(error = ?e, "SOCKS5 connection task panicked or was cancelled");
+                }
+            }
             accept = listener.accept() => {
-                let (stream, peer) = accept?;
+                let (stream, peer) = match accept {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // EMFILE/ENFILE 等资源压力通常是瞬态；不能让整个监听服务
+                        // 因一次 accept 失败永久退出。短退避也避免错误热循环。
+                        warn!(error = %e, "SOCKS5 accept failed; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                connections.shutdown().await;
+                                return Ok(());
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
+                        continue;
+                    }
+                };
 
                 // FIX-3 并发上限：满即拒（fail-fast）
                 let permit = match semaphore.clone().try_acquire_owned() {
@@ -78,7 +122,7 @@ pub async fn serve(
                 let auth = cfg.auth.clone();
                 let limits = limits.clone();
                 let parent_cancel = cancel.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     // permit 在 task 退出时自动 release
                     let _permit = permit;
                     if let Err(e) = handle(
@@ -106,6 +150,9 @@ async fn handle(
     parent_cancel: CancellationToken,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    // wildcard 监听时 cfg.bind.ip() 是 0.0.0.0/::，不能把它作为 UDP
+    // ASSOCIATE 的 BND.ADDR 回给客户端；使用这条 TCP 连接实际到达的本地 IP。
+    let local_server_ip = stream.local_addr().map_or(server_ip, |addr| addr.ip());
 
     // FIX-3 握手超时
     let hs = tokio::time::timeout(
@@ -130,8 +177,16 @@ async fn handle(
             // 继续往下走
         }
         Socks5Command::UDPAssociate => {
-            return handle_udp_associate(proto, peer, server_ip, tunnel, resolver, parent_cancel)
-                .await;
+            return handle_udp_associate(
+                proto,
+                peer,
+                local_server_ip,
+                tunnel,
+                resolver,
+                parent_cancel,
+                limits.idle_timeout,
+            )
+            .await;
         }
         Socks5Command::TCPBind => {
             debug!(%peer, "BIND not supported");
@@ -151,18 +206,19 @@ async fn handle(
     };
 
     // v0.2.1：候选列表通过 happy eyeballs 拨号；upstream_addr 是实际胜出的地址
-    let (upstream_addr, upstream) = match happy_eyeballs_dial(&tunnel, candidates).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(%peer, %target, error = %e, "all upstream candidates failed");
-            let reply = match &e {
-                Error::TunnelNotReady => ReplyError::GeneralFailure,
-                _ => ReplyError::HostUnreachable,
-            };
-            proto.reply_error(&reply).await?;
-            return Ok(());
-        }
-    };
+    let (upstream_addr, upstream) =
+        match happy_eyeballs_dial(tunnel.clone(), candidates, &limits).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%peer, %target, error = %e, "all upstream candidates failed");
+                let reply = match &e {
+                    Error::TunnelNotReady => ReplyError::GeneralFailure,
+                    _ => ReplyError::HostUnreachable,
+                };
+                proto.reply_error(&reply).await?;
+                return Ok(());
+            }
+        };
 
     let client = proto.reply_success(upstream_addr).await?;
     counter!(M_CONNS_OPENED).increment(1);
@@ -198,7 +254,8 @@ async fn handshake_and_read_command(
         None => Socks5ServerProtocol::accept_no_auth(stream).await?,
         Some(a) => {
             let (proto, ok) = Socks5ServerProtocol::accept_password_auth(stream, |u, p| {
-                u == a.username && p == a.password
+                bool::from(u.as_bytes().ct_eq(a.username.as_bytes()))
+                    & bool::from(p.as_bytes().ct_eq(a.password.as_bytes()))
             })
             .await?;
             if !ok {
@@ -226,6 +283,7 @@ async fn handle_udp_associate(
     tunnel: Arc<Tunnel>,
     resolver: Arc<Resolver>,
     parent_cancel: CancellationToken,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let relay_bind = match UdpSocket::bind(SocketAddr::new(server_ip, 0)).await {
         Ok(s) => s,
@@ -240,26 +298,50 @@ async fn handle_udp_associate(
 
     let mut control = proto.reply_success(relay_addr).await?;
     let relay_token = parent_cancel.child_token();
-    gauge!(M_UDP_ASSOCIATES_ACTIVE).increment(1.0);
+    let _active = ActiveUdpAssociate::new();
 
-    let relay_handle = {
+    let mut relay_handle = AbortOnDropHandle::new({
         let tunnel = tunnel.clone();
         let resolver = resolver.clone();
         let token = relay_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = udp::run_relay(relay_bind, tunnel, resolver, token).await {
+            if let Err(e) =
+                udp::run_relay(relay_bind, tunnel, resolver, peer.ip(), idle_timeout, token).await
+            {
                 warn!(error = %e, "udp relay exited with error");
             }
         })
-    };
+    });
 
     let mut buf = [0u8; 16];
-    let _ = control.read(&mut buf).await;
-    debug!(%peer, "udp associate: client closed control stream");
+    let relay_completed = tokio::select! {
+        biased;
+        _ = parent_cancel.cancelled() => false,
+        result = &mut relay_handle => {
+            if let Err(e) = result {
+                warn!(error = ?e, "udp relay task failed");
+            }
+            true
+        }
+        result = control.read(&mut buf) => {
+            if let Err(e) = result {
+                debug!(%peer, error = %e, "udp associate control stream failed");
+            } else {
+                debug!(%peer, "udp associate: client closed control stream");
+            }
+            false
+        }
+    };
 
     relay_token.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(2), relay_handle).await;
-    gauge!(M_UDP_ASSOCIATES_ACTIVE).decrement(1.0);
+    if !relay_completed
+        && tokio::time::timeout(Duration::from_secs(2), &mut relay_handle)
+            .await
+            .is_err()
+    {
+        relay_handle.abort();
+        let _ = relay_handle.await;
+    }
     Ok(())
 }
 
@@ -273,26 +355,19 @@ async fn resolve_target(resolver: &Resolver, target: &TargetAddr) -> Result<Vec<
     }
 }
 
-/// v0.2.1：Happy Eyeballs Phase 1 风格拨号。
-///
-/// 候选列表 v6 先 v4 后；试 v6 → 250ms 内没拿到结果，**并发**起 v4 拨号；
-/// 任一成功返回，另一个 abort。
-///
-/// 极简对照 RFC 8305：
-/// - 不做地址排序（我们的列表已经 v6 优先）
-/// - 单 v6 + 单 v4 双线程而不是逐个全开
-/// - 适合 SOCKS5 的快速首字节场景
+/// 有界 Happy Eyeballs：完整尝试 DNS 候选，错峰启动且限制同时在飞数量。
 async fn happy_eyeballs_dial(
-    tunnel: &Tunnel,
-    candidates: Vec<SocketAddr>,
-) -> Result<(SocketAddr, wireguard_netstack::TcpConnection)> {
+    tunnel: Arc<Tunnel>,
+    mut candidates: Vec<SocketAddr>,
+    limits: &LimitsConfig,
+) -> Result<(SocketAddr, TunnelTcpConnection)> {
     if candidates.is_empty() {
         return Err(Error::other("no upstream candidates"));
     }
 
     // 隧道无 IPv6 出口时丢弃 v6 候选：否则会向 netstack 发起注定 `Ipv6NotSupported`
     // 的拨号，浪费一次 socket 分配。仅 v6 而隧道无 v6 时直接报不可达。
-    let candidates: Vec<SocketAddr> = if tunnel.has_ipv6() {
+    candidates = if tunnel.has_ipv6() {
         candidates
     } else {
         let v4_only: Vec<SocketAddr> = candidates.into_iter().filter(|a| a.is_ipv4()).collect();
@@ -304,73 +379,118 @@ async fn happy_eyeballs_dial(
         v4_only
     };
 
-    if candidates.len() == 1 {
-        let addr = candidates[0];
-        let conn = tunnel.dial_tcp(addr).await?;
-        return Ok((addr, conn));
-    }
+    let mut seen = HashSet::new();
+    candidates.retain(|addr| seen.insert(*addr));
+    candidates.truncate(limits.max_dial_candidates);
 
-    // 拆 v6 / v4
-    let (v6, v4): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|a| matches!(a, SocketAddr::V6(_)));
-    let v6_addr = v6.into_iter().next();
-    let v4_addr = v4.into_iter().next();
-
-    // 同时拨；最先成功的赢
-    match (v6_addr, v4_addr) {
-        (Some(v6), Some(v4)) => {
-            let tunnel_clone = tunnel as *const Tunnel;
-            // 注意：Tunnel 是 Arc 间接，我们这里通过引用借用，不能 send 给 task。
-            // 改成 tokio::select! 同步 await，不 spawn —— 这样不需要 'static。
-            let v6_fut = tunnel.dial_tcp(v6);
-            let v4_delay = tokio::time::sleep(Duration::from_millis(250));
-            tokio::pin!(v6_fut);
-            tokio::pin!(v4_delay);
-            let _ = tunnel_clone;
-
-            // 先等 v6 250ms；超时就并发 v4
-            tokio::select! {
-                biased;
-                r = &mut v6_fut => {
-                    match r {
-                        Ok(c) => return Ok((v6, c)),
-                        Err(e) => {
-                            warn!(%v6, error = %e, "v6 dial failed quickly, fallback v4");
-                            return tunnel.dial_tcp(v4).await.map(|c| (v4, c));
-                        }
-                    }
-                }
-                _ = &mut v4_delay => {}
-            }
-
-            // v6 仍未返回 → 并发 v4
-            let v4_fut = tunnel.dial_tcp(v4);
-            tokio::pin!(v4_fut);
-            tokio::select! {
-                biased;
-                r = &mut v6_fut => {
-                    match r {
-                        Ok(c) => Ok((v6, c)),
-                        Err(_) => v4_fut.await.map(|c| (v4, c)),
-                    }
-                }
-                r = &mut v4_fut => {
-                    match r {
-                        Ok(c) => Ok((v4, c)),
-                        Err(_) => v6_fut.await.map(|c| (v6, c)),
-                    }
-                }
-            }
-        }
-        (Some(v6), None) => tunnel.dial_tcp(v6).await.map(|c| (v6, c)),
-        (None, Some(v4)) => tunnel.dial_tcp(v4).await.map(|c| (v4, c)),
-        (None, None) => Err(Error::other("no upstream candidates")),
-    }
+    staggered_dial(
+        candidates,
+        limits.happy_eyeballs_delay,
+        limits.connect_timeout,
+        limits.max_parallel_dials,
+        move |addr| {
+            let tunnel = tunnel.clone();
+            async move { tunnel.dial_tcp(addr).await }
+        },
+    )
+    .await
 }
 
-/// 带 idle 超时的双向 relay。每个方向 read 已经包了 `tokio::time::timeout(idle, ..)`，
-/// 因此整条连接不会无限挂；不再额外加「连接总生命周期」timeout。
+async fn staggered_dial<C, D, Fut>(
+    candidates: Vec<SocketAddr>,
+    delay: Duration,
+    total_timeout: Duration,
+    max_parallel: usize,
+    dial: D,
+) -> Result<(SocketAddr, C)>
+where
+    C: Send + 'static,
+    D: Fn(SocketAddr) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<C>> + Send + 'static,
+{
+    let mut pending: VecDeque<_> = candidates.into();
+    if pending.is_empty() {
+        return Err(Error::other("no usable upstream candidates"));
+    }
+
+    let max_parallel = max_parallel.max(1);
+    let mut attempts = JoinSet::new();
+    let first = pending.pop_front().expect("checked non-empty");
+    let first_dial = dial.clone();
+    counter!(M_DIAL_ATTEMPT).increment(1);
+    attempts.spawn(async move { (first, first_dial(first).await) });
+    let mut attempted = 1usize;
+    let mut last_error: Option<Error> = None;
+
+    let deadline = tokio::time::sleep(total_timeout);
+    let launch = tokio::time::sleep(delay);
+    tokio::pin!(deadline);
+    tokio::pin!(launch);
+
+    loop {
+        if attempts.is_empty() && pending.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            joined = attempts.join_next(), if !attempts.is_empty() => {
+                match joined {
+                    Some(Ok((addr, Ok(connection)))) => {
+                        attempts.shutdown().await;
+                        return Ok((addr, connection));
+                    }
+                    Some(Ok((addr, Err(e)))) => {
+                        counter!(M_DIAL_FAILURE).increment(1);
+                        debug!(%addr, error = %e, "upstream candidate failed");
+                        last_error = Some(e);
+                    }
+                    Some(Err(e)) => {
+                        last_error = Some(Error::other(format!("dial task failed: {e}")));
+                    }
+                    None => {}
+                }
+
+                // 若当前所有尝试都快速失败，不必白等错峰计时器。
+                if attempts.is_empty() {
+                    if let Some(addr) = pending.pop_front() {
+                        let next_dial = dial.clone();
+                        counter!(M_DIAL_ATTEMPT).increment(1);
+                        attempts.spawn(async move { (addr, next_dial(addr).await) });
+                        attempted += 1;
+                        launch.as_mut().reset(tokio::time::Instant::now() + delay);
+                    }
+                }
+            }
+            _ = &mut launch, if !pending.is_empty() && attempts.len() < max_parallel => {
+                let addr = pending.pop_front().expect("select guard checked pending");
+                let next_dial = dial.clone();
+                counter!(M_DIAL_ATTEMPT).increment(1);
+                attempts.spawn(async move { (addr, next_dial(addr).await) });
+                attempted += 1;
+                launch.as_mut().reset(tokio::time::Instant::now() + delay);
+            }
+            _ = &mut deadline => {
+                counter!(M_DIAL_TIMEOUT).increment(1);
+                attempts.shutdown().await;
+                return Err(Error::other(format!(
+                    "upstream dial timed out after {:?} ({} candidates started)",
+                    total_timeout, attempted
+                )));
+            }
+        }
+    }
+
+    let detail = last_error
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "no dial result".to_owned());
+    Err(Error::other(format!(
+        "all {attempted} upstream candidates failed; last error: {detail}"
+    )))
+}
+
+/// 带 idle 超时的双向 relay。上下行共享一个活动计时器；任一方向成功
+/// 传输都会续期，避免持续下载/上传被另一个空闲方向误杀。
 ///
 /// v0.3.1 修复（Bug #3）：两个方向通过 `CancellationToken` 协调，任一方向
 /// EOF / 错误 / idle 超时都会立刻 cancel 对端并 shutdown 自己的写半边——
@@ -395,7 +515,7 @@ async fn happy_eyeballs_dial(
 /// 严格 ≤ 实际写出字节，metric 不会虚高）。
 async fn relay_with_idle_timeout(
     client: TcpStream,
-    upstream: TcpConnection,
+    upstream: TunnelTcpConnection,
     idle: Duration,
     buf_size: usize,
     grace: Duration,
@@ -408,6 +528,31 @@ async fn relay_with_idle_timeout(
     let token = CancellationToken::new();
     let send_token = token.clone();
     let recv_token = token.clone();
+    let activity = Arc::new(Notify::new());
+    let send_activity = activity.clone();
+    let recv_activity = activity.clone();
+
+    // 整条连接唯一的 idle watcher。它只发 cancel，两个 relay task
+    // 仍由 coordinate_relay 优雅等待/超时 abort 并 reap。
+    let idle_token = token.clone();
+    let idle_watch = AbortOnDropHandle::new(tokio::spawn(async move {
+        let deadline = tokio::time::sleep(idle);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                _ = idle_token.cancelled() => return,
+                _ = activity.notified() => {
+                    deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+                }
+                _ = &mut deadline => {
+                    counter!(M_IDLE_TIMEOUT).increment(1);
+                    idle_token.cancel();
+                    return;
+                }
+            }
+        }
+    }));
 
     // 字节计数：放在 atomic，task 被 abort 仍能拿回已经传输的 partial 值。
     // Ordering::Relaxed 足够——`JoinHandle::await` 自身提供 happens-before，
@@ -424,14 +569,10 @@ async fn relay_with_idle_timeout(
             tokio::select! {
                 biased;
                 _ = send_token.cancelled() => break,
-                r = tokio::time::timeout(idle, client_r.read(&mut buf)) => {
+                r = client_r.read(&mut buf) => {
                     let n = match r {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) => break, // 读出错（含对端 reset）
-                        Err(_) => {
-                            counter!(M_IDLE_TIMEOUT).increment(1);
-                            break;
-                        }
+                        Ok(n) => n,
+                        Err(_) => break, // 读出错（含对端 reset）
                     };
                     if n == 0 {
                         break;
@@ -440,6 +581,7 @@ async fn relay_with_idle_timeout(
                         break;
                     }
                     up_bytes_t.fetch_add(n as u64, Ordering::Relaxed);
+                    send_activity.notify_one();
                 }
             }
         }
@@ -455,14 +597,10 @@ async fn relay_with_idle_timeout(
             tokio::select! {
                 biased;
                 _ = recv_token.cancelled() => break,
-                r = tokio::time::timeout(idle, up_for_recv.read(&mut buf)) => {
+                r = up_for_recv.read(&mut buf) => {
                     let n = match r {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            counter!(M_IDLE_TIMEOUT).increment(1);
-                            break;
-                        }
+                        Ok(n) => n,
+                        Err(_) => break,
                     };
                     if n == 0 {
                         break;
@@ -471,6 +609,7 @@ async fn relay_with_idle_timeout(
                         break;
                     }
                     down_bytes_t.fetch_add(n as u64, Ordering::Relaxed);
+                    recv_activity.notify_one();
                 }
             }
         }
@@ -479,8 +618,14 @@ async fn relay_with_idle_timeout(
         recv_token.cancel();
     });
 
-    // 不再有外层「连接生命周期」总超时；inner per-read idle 超时已经兜底。
+    // 不设「连接总寿命」；只由共享 watcher 根据双向最后活动判定 idle。
     coordinate_relay(send, recv, grace).await;
+    token.cancel();
+    if let Err(e) = idle_watch.await {
+        if e.is_panic() {
+            warn!(panic = ?e, "idle watcher panicked");
+        }
+    }
 
     Ok((
         up_bytes.load(Ordering::Relaxed),
@@ -501,10 +646,15 @@ async fn relay_with_idle_timeout(
 /// 提取成 `pub(crate)` 泛型 helper 是为了单元测试——它不依赖 TcpStream /
 /// TcpConnection，可以用普通 `tokio::spawn` 的 `JoinHandle<()>` 直接覆盖。
 pub(crate) async fn coordinate_relay(
-    mut a: tokio::task::JoinHandle<()>,
-    mut b: tokio::task::JoinHandle<()>,
+    a: tokio::task::JoinHandle<()>,
+    b: tokio::task::JoinHandle<()>,
     grace: Duration,
 ) {
+    // 调用方 future 如果被上层取消（例如服务停机的 JoinSet::shutdown），
+    // 普通 JoinHandle 的 Drop 会 detach。在首个 await 前包装为 abort-on-drop，
+    // 保证取消路径同样回收 socket/buffer 任务。
+    let mut a = AbortOnDropHandle::new(a);
+    let mut b = AbortOnDropHandle::new(b);
     // v0.3.2 修复：原版 select! 用 `_ =` 把 first-completes 的 JoinResult 吞掉了，
     // 若先完成那侧自己 panic（不是被 abort）panic 信息会被 drop，运维不可见。
     // 改成 `r =` 拿到 JoinResult 再 surface panic；对端的 panic 在它 grace
@@ -549,6 +699,80 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AOrdering};
     use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn staggered_dial_tries_every_candidate_until_success() {
+        let candidates: Vec<SocketAddr> = ["192.0.2.1:1", "192.0.2.2:2", "192.0.2.3:3"]
+            .into_iter()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_dial = seen.clone();
+        let (addr, value) = staggered_dial(
+            candidates,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            2,
+            move |addr| {
+                let seen = seen_for_dial.clone();
+                async move {
+                    seen.lock().unwrap().push(addr);
+                    if addr.port() == 3 {
+                        Ok("connected")
+                    } else {
+                        Err(Error::other("synthetic failure"))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("third candidate should win");
+
+        assert_eq!(addr.port(), 3);
+        assert_eq!(value, "connected");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn staggered_dial_aborts_and_reaps_losing_attempt() {
+        struct ActiveGuard(Arc<AtomicUsize>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, AOrdering::SeqCst);
+            }
+        }
+
+        let candidates: Vec<SocketAddr> = ["192.0.2.1:1", "192.0.2.2:2"]
+            .into_iter()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let active = Arc::new(AtomicUsize::new(0));
+        let active_for_dial = active.clone();
+        let (addr, ()) = staggered_dial(
+            candidates,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            2,
+            move |addr| {
+                let active = active_for_dial.clone();
+                async move {
+                    active.fetch_add(1, AOrdering::SeqCst);
+                    let _guard = ActiveGuard(active);
+                    if addr.port() == 1 {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Err(Error::other("should have been aborted"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("second candidate should win");
+
+        assert_eq!(addr.port(), 2);
+        assert_eq!(active.load(AOrdering::SeqCst), 0, "loser must be reaped");
+    }
 
     /// 一侧 EOF（立刻退出），另一侧合作（监听 notify 后退出）→ 应在 grace 内退出，
     /// 远低于原版 idle+500ms (≈300s) 的错杀窗口。
@@ -623,5 +847,40 @@ mod tests {
             ticks_now, ticks_after_abort,
             "task should be aborted, but still ticking: {ticks_after_abort} → {ticks_now}"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinate_relay_outer_cancellation_aborts_both_tasks() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, AOrdering::SeqCst);
+            }
+        }
+
+        let a_dropped = Arc::new(AtomicBool::new(false));
+        let b_dropped = Arc::new(AtomicBool::new(false));
+        let a_flag = DropFlag(a_dropped.clone());
+        let b_flag = DropFlag(b_dropped.clone());
+        let a = tokio::spawn(async move {
+            let _drop = a_flag;
+            std::future::pending::<()>().await;
+        });
+        let b = tokio::spawn(async move {
+            let _drop = b_flag;
+            std::future::pending::<()>().await;
+        });
+        let coordinator = tokio::spawn(coordinate_relay(a, b, Duration::from_secs(30)));
+        tokio::task::yield_now().await;
+        coordinator.abort();
+        let _ = coordinator.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !a_dropped.load(AOrdering::SeqCst) || !b_dropped.load(AOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outer cancellation must not detach relay tasks");
     }
 }

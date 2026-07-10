@@ -28,12 +28,14 @@ pub fn spawn(config_path: PathBuf, cancel: CancellationToken) {
 }
 
 async fn run(config_path: PathBuf, cancel: CancellationToken) -> notify::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
+    // 文件系统事件可能瞬时爆发；使用有界队列并合并/丢弃过量事件，避免
+    // unbounded_channel 在恶意或异常写入风暴下无界增长。
+    let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(128);
 
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<Event>| {
             // notify 的回调不在 tokio 线程上执行
-            let _ = tx.send(res);
+            let _ = tx.try_send(res);
         })?;
 
     let dir = config_path
@@ -73,10 +75,14 @@ async fn run(config_path: PathBuf, cancel: CancellationToken) -> notify::Result<
                 // 给那些先 rename 后 write 的编辑器留一点空档
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 match Config::load(Some(&config_path)) {
-                    Ok(_) => info!(path = %config_path.display(),
-                        "config file changed and parses OK (restart to apply non-trivial fields)"),
+                    Ok(cfg) => match cfg.validate() {
+                        Ok(()) => info!(path = %config_path.display(),
+                            "config file changed and validates OK (restart to apply fields)"),
+                        Err(e) => warn!(path = %config_path.display(), error = %e,
+                            "config file changed but failed validation — running state unchanged"),
+                    },
                     Err(e) => warn!(path = %config_path.display(), error = %e,
-                        "config file changed but failed to parse — leaving running state alone"),
+                        "config file changed but failed to parse — running state unchanged"),
                 }
             }
         }

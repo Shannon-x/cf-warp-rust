@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{info, warn};
 use wireguard_netstack::ManagedTunnel;
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,13 @@ async fn run(cli: Cli) -> Result<()> {
     telemetry::init(&cfg.logging);
 
     info!(version = env!("CARGO_PKG_VERSION"), config = %cli.config.display(), "warp-rust starting");
+
+    // 在 validate/隧道初始化前安装，否则开放代理等启动期安全计数会丢失。
+    let metrics_handle = if cfg.metrics.enabled {
+        Some(metrics::install_recorder()?)
+    } else {
+        None
+    };
 
     // 启动前安全校验：拒绝公网+无鉴权组合等高危配置
     if let Err(msg) = cfg.validate() {
@@ -88,11 +95,12 @@ async fn run(cli: Cli) -> Result<()> {
     let resolver = Arc::new(crate::dns::Resolver::new(&cfg.dns, tunnel.clone()));
     let socks_cancel = cancel.clone();
     let socks_tunnel = tunnel.clone();
-    let socks_task = tokio::spawn(async move {
-        if let Err(e) = proxy::serve(server_cfg, limits, resolver, socks_tunnel, socks_cancel).await
-        {
-            error!(error = %e, "SOCKS5 server exited with error");
-        }
+    let mut services = tokio::task::JoinSet::new();
+    services.spawn(async move {
+        (
+            "SOCKS5",
+            proxy::serve(server_cfg, limits, resolver, socks_tunnel, socks_cancel).await,
+        )
     });
 
     // 5. 启动 supervisor（健康探针、恢复阶梯、配置刷新定时器）
@@ -102,25 +110,26 @@ async fn run(cli: Cli) -> Result<()> {
         tunnel.clone(),
         identity_pool,
         snapshot.credentials,
+        snapshot.wg_config,
     );
     let supervisor_cancel = cancel.clone();
-    let supervisor_task = tokio::spawn({
+    services.spawn({
         let sup = supervisor.clone();
-        async move {
-            if let Err(e) = sup.run(supervisor_cancel).await {
-                error!(error = %e, "supervisor exited with error");
-            }
-        }
+        async move { ("supervisor", sup.run(supervisor_cancel).await) }
     });
 
     // 6. metrics 端点
     let metrics_cfg = cfg.metrics.clone();
     let metrics_cancel = cancel.clone();
-    let metrics_task = tokio::spawn(async move {
-        if let Err(e) = metrics::serve(metrics_cfg, metrics_cancel).await {
-            error!(error = %e, "metrics server exited with error");
-        }
-    });
+    let health_flag = supervisor.health_flag();
+    if let Some(metrics_handle) = metrics_handle {
+        services.spawn(async move {
+            (
+                "metrics",
+                metrics::serve(metrics_cfg, metrics_cancel, health_flag, metrics_handle).await,
+            )
+        });
+    }
 
     // 7. 配置文件热重载 watcher
     info!(
@@ -132,15 +141,42 @@ async fn run(cli: Cli) -> Result<()> {
         config_watch::spawn(abs_path, cancel.clone());
     }
 
-    // 8. 等待停机信号
-    cancel.cancelled().await;
+    // 8. 等待停机信号；任一关键服务意外退出也必须让主进程失败退出，交给
+    // systemd 重启。旧实现只记一条日志后继续假装健康，监听 bind 失败时尤其危险。
+    let unexpected = tokio::select! {
+        _ = cancel.cancelled() => None,
+        joined = services.join_next() => {
+            match joined {
+                Some(Ok((name, Ok(())))) => Some(format!("{name} service exited unexpectedly")),
+                Some(Ok((name, Err(e)))) => Some(format!("{name} service failed: {e}")),
+                Some(Err(e)) => Some(format!("service task failed: {e}")),
+                None => Some("all services exited unexpectedly".to_owned()),
+            }
+        }
+    };
+    cancel.cancel();
     info!("shutdown initiated");
 
     // 9. 排空子任务
-    let _ = tokio::time::timeout(Duration::from_secs(5), socks_task).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), supervisor_task).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), metrics_task).await;
+    let drain = async {
+        while let Some(result) = services.join_next().await {
+            if let Err(e) = result {
+                warn!(error = ?e, "service task did not stop cleanly");
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        warn!("service shutdown grace expired; aborting remaining tasks");
+        services.shutdown().await;
+    }
     tunnel.clear();
     info!("warp-rust stopped");
-    Ok(())
+    if let Some(message) = unexpected {
+        Err(crate::error::Error::other(message))
+    } else {
+        Ok(())
+    }
 }

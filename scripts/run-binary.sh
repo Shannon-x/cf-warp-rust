@@ -82,11 +82,13 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
 mtu = 1420
-tcp_buffer_size = 1048576
+tcp_buffer_size = 262144
 
 [health]
 interval = "30s"
 timeout = "8s"
+targets = ["1.1.1.1:443", "8.8.8.8:53", "9.9.9.9:53"]
+min_successes = 2
 
 [recovery]
 reconnect_after = 1
@@ -106,9 +108,22 @@ enabled = false
 [limits]
 max_concurrent_connections = 1024
 handshake_timeout = "10s"
+connect_timeout = "12s"
+happy_eyeballs_delay = "200ms"
+max_dial_candidates = 8
+max_parallel_dials = 2
 idle_timeout = "300s"
-relay_buffer_size = 262144
+relay_buffer_size = 65536
 auth_fail_sleep = "1s"
+relay_close_grace = "500ms"
+
+[dns]
+mode = "system"
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+timeout = "3s"
+cache_ttl = "60s"
+negative_ttl = "5s"
+max_cache_entries = 4096
 EOF
 } > "$CFG"
 chmod 600 "$CFG"

@@ -32,14 +32,16 @@ register_cooldown = "10m"
 # 若底层路径 PMTU 不足导致卡顿或丢包，可回退到 1280
 mtu = 1420
 # smoltcp TCP socket 单向 buffer。实际每条 TCP 连接约占 2 × 该值。
-# 64KB 会把 15-50ms RTT 的单连接吞吐卡在几十 Mbps；1MB 更适合大流量代理。
-tcp_buffer_size = 1048576
+# 256KB 在常见 RTT 下兼顾单流吞吐与高并发内存；需要单流极限速度时再调大。
+tcp_buffer_size = 262144
 
 [health]
-# 健康探针节奏（每多少秒拨号一次 1.1.1.1:443，确认隧道通畅）
+# 健康探针节奏
 interval = "30s"
 # 单次探针超时
 timeout = "8s"
+targets = ["1.1.1.1:443", "8.8.8.8:53", "9.9.9.9:53"]
+min_successes = 2
 
 [recovery]
 # 自愈阶梯：连续失败几次触发对应级别的恢复动作
@@ -65,8 +67,12 @@ enabled = true
 # v0.1.1 起内置 DoS 防护，所有字段都可调
 max_concurrent_connections = 1024   # 同时在飞 SOCKS5 连接上限；满即拒
 handshake_timeout = "10s"           # SOCKS5 握手 + read_command 总超时
+connect_timeout = "12s"             # 所有上游候选的整体拨号时限
+happy_eyeballs_delay = "200ms"      # 相邻候选错峰启动间隔
+max_dial_candidates = 8              # 单个域名最多尝试的 DNS 地址数
+max_parallel_dials = 2               # 单客户端同时在飞候选上限
 idle_timeout = "300s"               # 双向 relay 的 idle 超时
-relay_buffer_size = 262144          # TCP relay buffer；对齐 wireproxy 的 256KB buffer pool
+relay_buffer_size = 65536           # 每方向 relay buffer；每连接共 128KB
 auth_fail_sleep = "1s"              # 鉴权失败后强制延迟，防暴破
 relay_close_grace = "500ms"         # v0.3.2：一侧退出后给对端的优雅窗口；超时 abort 兜底
 
@@ -78,3 +84,5 @@ mode = "system"
 servers = ["1.1.1.1:53", "1.0.0.1:53"]   # mode = "tunnel" 时使用
 timeout = "3s"
 cache_ttl = "60s"                  # 解析结果缓存 TTL；命中跳过 DNS 查询
+negative_ttl = "5s"                # 失败结果短缓存，防查询风暴
+max_cache_entries = 4096            # 随机域名无法让缓存无界增长

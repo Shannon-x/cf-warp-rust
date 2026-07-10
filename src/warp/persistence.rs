@@ -36,7 +36,29 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let mut perms = std::fs::metadata(path)?.permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(path, perms)?;
+        // persist(rename) 后同步最终文件元数据；Linux 再同步父目录项，避免掉电后
+        // 出现「返回成功但 account.json 目录项丢失」。
+        std::fs::File::open(path)?.sync_all()?;
+        #[cfg(target_os = "linux")]
+        std::fs::File::open(dir)?.sync_all()?;
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn save_is_atomic_readable_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.json");
+        save(&path, &serde_json::json!({"secret": "value"})).unwrap();
+        let value: serde_json::Value = load(&path).unwrap().unwrap();
+        assert_eq!(value["secret"], "value");
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

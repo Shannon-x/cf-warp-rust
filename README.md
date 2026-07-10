@@ -7,11 +7,11 @@
 - **首次启动自动注册** Cloudflare WARP 账号；凭据持久化到 `data/account.json`（权限 0600）。后续重启复用同一身份，不会重复消耗注册配额。
 - **SOCKS5 CONNECT 与 UDP ASSOCIATE 同时支持。** UDP 报文走 WireGuard 隧道里的用户态 UDP socket，DNS、QUIC 等场景端到端可用，不是只能跑 TCP。
 - **用户态 WireGuard**，基于 [`wireguard-netstack`](https://crates.io/crates/wireguard-netstack)（本仓库在 `vendor/` 下做了 fork，新增 UDP 暴露）。**无需 `wg-quick`、无需 TUN 设备、无需 root**。
-- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。健康探针每 30 秒通过隧道内拨号一次。
+- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。默认每 30 秒并发探测 3 个独立公网目标，2 个成功才判定出口健康。
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
 - **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置变更检测（解析校验，不热应用）** — `config.toml` 改动会被监听并立即重新解析，TOML 语法错或字段错会马上在日志里报告；**但新配置不会自动应用到运行中的进程**，改完后需 `sudo systemctl restart warp-rust` 才生效。`systemd restart` 不会动 `data/account.json`，正在跑的 WARP 凭据/身份轮转状态都会保留。
-- **高吞吐默认值**（v0.3.0）：默认 MTU 1420、1MB smoltcp TCP 窗口、256KB SOCKS relay buffer，减少 WARP SOCKS 出站的单连接限速。
+- **高并发内存平衡**：默认 MTU 1420、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；需要单流极限吞吐时可单独调大。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
 - **开放代理保护**（v0.1.1 + v0.3.2 收紧）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动。可通过 `WARP_RUST_ALLOW_OPEN_PROXY=1` 整体跳过校验（高风险）；**容器场景**还可通过 `WARP_RUST_TRUSTED_HOST_NET=1` 仅放行「容器内 0.0.0.0 + 宿主 `-p 127.0.0.1:...` 限定」这一窄场景。仓库 `scripts/run-docker.sh` / `docker-compose.yml` / `scripts/quickstart.sh` 已默认注入；**裸 `docker run -p 1080:1080 ghcr.io/...` 启动失败**（v0.3.2 BREAKING：必须显式 opt-in，杜绝意外把无鉴权 SOCKS5 挂到宿主 INADDR_ANY）。
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
@@ -281,10 +281,13 @@ cargo build --release
 | `[warp]` | `refresh_interval` | 周期刷新 WireGuard 配置的间隔。默认 24h |
 | `[warp]` | `register_cooldown` | 两次重注册之间的最小间隔。默认 10m |
 | `[warp]` | `mtu` | WireGuard MTU。默认 1420；PMTU 不稳时可回退 1280 |
-| `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 1048576；每连接约占 2 倍内存 |
-| `[limits]` | `relay_buffer_size` | SOCKS TCP relay buffer。默认 262144 |
+| `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 262144；每连接约占 2 倍内存 |
+| `[limits]` | `relay_buffer_size` | SOCKS TCP 每方向 relay buffer。默认 65536 |
 | `[limits]` | `relay_close_grace` | v0.3.2：双向 relay 中一侧退出后给对端的优雅窗口；超时 abort 兜底。默认 `500ms` |
-| `[health]` | `interval` / `timeout` | 探针节奏（隧道内拨号 1.1.1.1:443） |
+| `[limits]` | `connect_timeout` / `happy_eyeballs_delay` | 全候选总超时与错峰拨号间隔 |
+| `[limits]` | `max_dial_candidates` / `max_parallel_dials` | 每个目标的候选数和同时在飞拨号硬上限 |
+| `[health]` | `interval` / `timeout` / `targets` / `min_successes` | 多目标 quorum 公网出口探针 |
+| `[dns]` | `mode` / `max_cache_entries` | 宿主/隧道 DNS 选择与有界缓存 |
 | `[recovery]` | `reconnect_after` 等四档 | 触发每一级恢复动作的连续失败次数阈值 |
 | `[metrics]` | `enabled` / `bind` | Prometheus `/metrics` 端点 |
 | `[hot_reload]` | `enabled` | 是否监听配置文件变化 |
@@ -406,6 +409,9 @@ format = "json"
 
 ```bash
 curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
+# readiness：多目标出口 quorum 通过才返回 200；livez 只检查进程存活
+curl -f http://127.0.0.1:9090/healthz
+curl -f http://127.0.0.1:9090/livez
 ```
 
 关键指标：
@@ -416,6 +422,7 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 | `warp_rust_conns_rejected_total` | counter | 因并发上限被拒数 |
 | `warp_rust_bytes_up_total` / `bytes_down_total` | counter | 上下行累计字节 |
 | `warp_rust_probe_success_total` / `probe_failure_total` | counter | 健康探针成败数 |
+| `warp_rust_dial_attempt_total` / `dial_failure_total` / `dial_timeout_total` | counter | 多候选拨号尝试、失败与整体超时 |
 | `warp_rust_tunnel_rebuild_total` | counter | 隧道重建数（自愈触发） |
 | `warp_rust_reregister_total` | counter | WARP 重注册数 |
 | `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
@@ -424,17 +431,17 @@ curl -s http://127.0.0.1:9090/metrics | grep ^warp_rust
 | `warp_rust_dns_query_total` / `dns_cache_hit_total` | counter | DNS 查询 / 缓存命中 |
 | `warp_rust_wg_tx_backpressure_total` | counter | WG 出口通道满时触发回压重试次数 |
 | `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道关闭时丢弃的包（异常预警） |
+| `warp_rust_netstack_rx_queue_dropped_total` | counter | netstack 有界 RX 队列满时丢包（持续增长表示 CPU/带宽过载） |
 | `warp_rust_handshake_timeout_total` / `idle_timeout_total` / `auth_fail_total` | counter | DoS 防护各类拦截 |
 
-加上 `metrics-exporter-prometheus` 自动导出的 `process_*` 系列（RSS / CPU / 文件描述符），就能在 Grafana 里画完整曲线。
+进程 RSS / CPU / 文件描述符不由本程序伪造导出；Linux 部署可另外采集 `node_exporter` 或 `process-exporter`，也可把 systemd/cgroup 指标与上述业务指标联图。
 
 ### 内存 / CPU 速查
 
 > 内存泄漏自查（v0.3.3+）：抓 `warp_rust_netstack_sockets_active`，它应稳定贴合活跃连接数。
 > 若它随时间单调上升而并发连接数平稳，说明有 socket 未释放——v0.3.3 已修复 `TcpConnection::connect`
 > 在失败/取消路径上泄漏 `2×tcp_buffer_size` 的 socket buffer，升级即可。每条 TCP 连接稳态占用约
-> `2×tcp_buffer_size`（默认 1MiB → 2MiB），内存吃紧时可把 `[warp].tcp_buffer_size` 调到 256KiB、
-> `[limits].relay_buffer_size` 调到 64KiB。
+> `2×tcp_buffer_size`（默认 256KiB → 512KiB），另加两方向 relay buffer（默认共 128KiB）。
 
 ```bash
 # systemctl 自带（最简单）
@@ -472,7 +479,7 @@ ss -tlnp | grep warp-rust
 
 ## 已知限制与注意事项
 
-- **支持 IPv4 与 IPv6 出口（v0.2.0+）。** WARP 给的 `addresses.v6` 会被解析并配置到 netstack；SOCKS5 客户端给 IPv6 目标地址、或 SOCKS5 UDP ATYP=0x04，都能通过 WARP IPv6 出口访问。Domain ATYP 当前先解 A 记录走 v4，AAAA happy-eyeballs 待 v0.2.1。
+- **支持 IPv4 与 IPv6 出口（v0.2.0+）。** WARP 给的 `addresses.v6` 会被解析并配置到 netstack；SOCKS5 客户端给 IPv6 目标地址、或 SOCKS5 UDP ATYP=0x04，都能通过 WARP IPv6 出口访问。Domain ATYP 会保留完整 A/AAAA 集合并按 Happy Eyeballs 错峰尝试。
 - **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。开启 `[dns].mode = "tunnel"` 后域名走隧道内 1.1.1.1:53。
 - **SOCKS5 BIND 不支持**，**UDP 分片不支持**：协议层留作后续版本增强。
 - **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE` 与 [SECURITY.md](SECURITY.md)。

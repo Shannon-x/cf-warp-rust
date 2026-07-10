@@ -33,5 +33,5 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 
-# 通过 [patch.crates-io] 重定向到本地 fork
-wireguard-netstack = "0.3"
+# vendored fork 直接使用相邻路径，确保本 crate 单独测试时也不会误连 crates.io 上游。
+wireguard-netstack = { path = "../wireguard-netstack", default-features = false }

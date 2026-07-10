@@ -1,6 +1,6 @@
 [package]
 name = "warp-rust"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Long-running SOCKS5 proxy through Cloudflare WARP, with auto-register and self-healing"
@@ -17,7 +17,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 # WARP & WireGuard userspace stack (GPL-3.0; their licenses propagate to us)
 warp-wireguard-gen = { version = "0.1", features = ["serde"] }
-wireguard-netstack = "0.3"
+wireguard-netstack = { version = "0.3", default-features = false }
 
 # SOCKS5 server
 fast-socks5 = "1"
@@ -36,7 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error
-anyhow = "1"
 thiserror = "2"
 
 # Observability (M3)
@@ -51,6 +50,8 @@ notify = "8"
 arc-swap = "1"
 bytes = "1"
 parking_lot = "0.12"
+rand = "0.10"
+subtle = "2"
 
 [profile.release]
 lto = "thin"

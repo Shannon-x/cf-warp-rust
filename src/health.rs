@@ -1,6 +1,5 @@
-//! 周期性健康探针 —— 通过隧道拨号 1.1.1.1:443。成功即证明 WireGuard 握手
-//! 还有效、netstack 与 Cloudflare 之间的 TCP 链路通畅。失败结果会以事件
-//! 形式发到 supervisor，由 supervisor 决定如何处理。
+//! 周期性健康探针 —— 并发拨号配置的多个 Cloudflare/外部目标，以多数派判断
+//! WireGuard、netstack 与真实公网出口是否健康。结果发给 supervisor 恢复状态机。
 
 use crate::config::HealthConfig;
 use crate::error::Error;
@@ -15,18 +14,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-const PROBE_TARGET: &str = "1.1.1.1:443";
-
 pub async fn probe_loop(
     tunnel: Arc<Tunnel>,
     cfg: HealthConfig,
     tx: mpsc::Sender<SupervisorEvent>,
     cancel: CancellationToken,
 ) {
-    let target: SocketAddr = PROBE_TARGET.parse().expect("static probe target");
     let mut ticker = tokio::time::interval(cfg.interval);
-    // 跳过 interval 的首个立即 tick —— 启动流程已经验证过链路一次了
-    ticker.tick().await;
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // interval 的首次 tick 立即执行：启动时只验证了 WireGuard 握手，尚未验证
+    // 公网出口；不能在第一个 30s 窗口里把半健康隧道暴露为 ready。
 
     loop {
         tokio::select! {
@@ -36,22 +33,64 @@ pub async fn probe_loop(
                 return;
             }
             _ = ticker.tick() => {
-                let evt = match probe_once(&tunnel, target, cfg.timeout).await {
+                let observed_at = std::time::Instant::now();
+                let evt = match probe_targets(
+                    tunnel.clone(),
+                    &cfg.targets,
+                    cfg.min_successes,
+                    cfg.timeout,
+                ).await {
                     Ok(()) => {
                         trace!("probe ok");
                         counter!(M_PROBE_OK).increment(1);
-                        SupervisorEvent::ProbeOk
+                        SupervisorEvent::ProbeOk { observed_at }
                     }
                     Err(e) => {
                         debug!(error = %e, "probe failed");
                         counter!(M_PROBE_FAIL).increment(1);
-                        SupervisorEvent::ProbeFailed { reason: e.to_string() }
+                        SupervisorEvent::ProbeFailed { reason: e.to_string(), observed_at }
                     }
                 };
                 let _ = tx.send(evt).await;
             }
         }
     }
+}
+
+async fn probe_targets(
+    tunnel: Arc<Tunnel>,
+    targets: &[SocketAddr],
+    min_successes: usize,
+    timeout: Duration,
+) -> Result<(), Error> {
+    let mut probes = tokio::task::JoinSet::new();
+    for &target in targets {
+        let tunnel = tunnel.clone();
+        probes.spawn(async move { (target, probe_once(&tunnel, target, timeout).await) });
+    }
+
+    let mut successes = 0usize;
+    let mut failures = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((_target, Ok(()))) => successes += 1,
+            Ok((target, Err(e))) => failures.push(format!("{target}: {e}")),
+            Err(e) => failures.push(format!("probe task: {e}")),
+        }
+        if successes >= min_successes {
+            probes.shutdown().await;
+            return Ok(());
+        }
+        if successes + probes.len() < min_successes {
+            probes.shutdown().await;
+            break;
+        }
+    }
+
+    Err(Error::other(format!(
+        "egress quorum failed ({successes}/{min_successes} required): {}",
+        failures.join("; ")
+    )))
 }
 
 async fn probe_once(tunnel: &Tunnel, target: SocketAddr, timeout: Duration) -> Result<(), Error> {

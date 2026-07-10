@@ -3,7 +3,7 @@
 //! This module provides a TCP/IP stack that runs entirely in userspace,
 //! routing packets through our WireGuard tunnel.
 //!
-//! # LOCK DISCIPLINE（warp-rust fork v0.3.1，Bug #5 (A)）
+//! # LOCK DISCIPLINE（warp-rust fork v0.4.0）
 //!
 //! `NetStackInner` 被一把全局 `parking_lot::Mutex` 守着。这把锁是高并发下
 //! 最大的串行化瓶颈 —— **每条连接的 read / write / poll / push_rx 都要争
@@ -21,35 +21,8 @@
 //!    `send_with_state` / `recv_with_state` 等组合 API**，一次拿锁做完
 //!    多件事，避免一个 hot path 三次进出锁。
 //!
-//! 长期目标（v0.4）：sharded NetStack —— 按 5-tuple hash 到多个独立
-//! NetStack，每个有自己的 SocketSet + Interface。本次（v0.3.1）暂不做
-//! 因为 (a) Cloudflare WARP 单 keypair 多 session 兼容性未验证，
-//! (b) smoltcp 的 `Interface::poll` 要 `&mut SocketSet`，单 stack 内无法
-//! 进一步细化锁。
-//!
-//! # LOCK DISCIPLINE（warp-rust fork v0.3.1，Bug #5 (A)）
-//!
-//! `NetStackInner` 被一把全局 `parking_lot::Mutex` 守着。这把锁是高并发下
-//! 最大的串行化瓶颈 —— **每条连接的 read / write / poll / push_rx 都要争
-//! 这同一把锁**。规则：
-//!
-//! 1. 锁内**只允许** smoltcp 状态机操作：socket get/get_mut、`interface.poll`、
-//!    `interface.context`、`sockets.add/remove`、`rx_queue.push/pop`、
-//!    `tx_queue.drain` 等。
-//! 2. **不允许在锁内做**：
-//!    - 任何 `Vec::new` / `vec![..; N]` 等 heap alloc（尤其是 MB 级 socket buffer）
-//!    - IP / TCP packet 解析（`Ipv4Packet::new_checked` 等）—— 这只是日志用
-//!    - `format!`、`String::push_str`
-//!    - 任何 `.await` / 阻塞调用 / 跨线程 channel send
-//! 3. 对小操作（can_send/recv + send/recv + may_send/recv）**优先用
-//!    `send_with_state` / `recv_with_state` 等组合 API**，一次拿锁做完
-//!    多件事，避免一个 hot path 三次进出锁。
-//!
-//! 长期目标（v0.4）：sharded NetStack —— 按 5-tuple hash 到多个独立
-//! NetStack，每个有自己的 SocketSet + Interface。本次（v0.3.1）暂不做
-//! 因为 (a) Cloudflare WARP 单 keypair 多 session 兼容性未验证，
-//! (b) smoltcp 的 `Interface::poll` 要 `&mut SocketSet`，单 stack 内无法
-//! 进一步细化锁。
+//! 更进一步的 sharded NetStack 需要先验证 Cloudflare WARP 单 keypair 多
+//! session 兼容性；未验证前保持单 stack，并通过每 socket 事件唤醒压低锁竞争。
 
 use crate::error::{Error, Result};
 use crate::wireguard::WireGuardTunnel;
@@ -61,12 +34,13 @@ use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer, State as TcpState}
 use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
 };
+use smoltcp::socket::Socket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Packet,
     Ipv6Address, TcpPacket,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,9 +55,58 @@ pub const DEFAULT_MTU: usize = 1420;
 
 /// Size of TCP socket buffers.
 ///
-/// 64KiB 会把单连接吞吐限制在 `buffer / RTT`，在 15-50ms 出口 RTT 下只能跑
-/// 10-35Mbps。默认提升到 1MiB，实际内存约为每连接 2MiB（rx + tx）。
-pub const DEFAULT_TCP_BUFFER_SIZE: usize = 1024 * 1024;
+/// 256KiB 在常见 15-50ms RTT 下仍可提供约 40-140Mbps 的单连接窗口，同时把
+/// 每连接的固定预分配从 2MiB 降到 512KiB（rx + tx）。需要跑单流超高速时可由
+/// 上层配置调大；高并发服务不应默认按 1MiB/方向预分配。
+pub const DEFAULT_TCP_BUFFER_SIZE: usize = 256 * 1024;
+
+// 用户态 stack 不与宿主内核端口空间冲突；使用 Linux 常见动态范围
+// 32768..=65535，让 16384 并发配合 2 路 Happy Eyeballs 仍有完整容量。
+const EPHEMERAL_PORT_START: u16 = 32_768;
+const EPHEMERAL_PORT_COUNT: usize = 32_768;
+const MAX_DEVICE_QUEUE_PACKETS: usize = 8192;
+
+/// 固定大小的临时端口分配器。旧实现每次随机抽一个端口，在大量连接到同一目标时
+/// 很快发生生日碰撞，生成相同四元组；smoltcp 随后会把回包交给错误的 socket。
+/// 位图保证端口在释放前绝不复用，也不会为了追踪端口产生额外堆分配。
+struct EphemeralPortAllocator {
+    used: [u64; EPHEMERAL_PORT_COUNT / 64],
+    next: usize,
+}
+
+impl EphemeralPortAllocator {
+    fn new() -> Self {
+        Self {
+            used: [0; EPHEMERAL_PORT_COUNT / 64],
+            next: (rand::random::<u16>() as usize) % EPHEMERAL_PORT_COUNT,
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u16> {
+        for offset in 0..EPHEMERAL_PORT_COUNT {
+            let idx = (self.next + offset) % EPHEMERAL_PORT_COUNT;
+            let word = idx / 64;
+            let bit = 1u64 << (idx % 64);
+            if self.used[word] & bit == 0 {
+                self.used[word] |= bit;
+                self.next = (idx + 1) % EPHEMERAL_PORT_COUNT;
+                return Some(EPHEMERAL_PORT_START + idx as u16);
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, port: u16) {
+        let Some(idx) = port
+            .checked_sub(EPHEMERAL_PORT_START)
+            .map(usize::from)
+            .filter(|idx| *idx < EPHEMERAL_PORT_COUNT)
+        else {
+            return;
+        };
+        self.used[idx / 64] &= !(1u64 << (idx % 64));
+    }
+}
 
 /// A virtual network device that sends/receives through the WireGuard tunnel.
 struct VirtualDevice {
@@ -105,8 +128,12 @@ impl VirtualDevice {
     }
 
     /// Add a packet to the receive queue (from WireGuard).
-    fn push_rx(&mut self, packet: BytesMut) {
+    fn push_rx(&mut self, packet: BytesMut) -> bool {
+        if self.rx_queue.len() >= MAX_DEVICE_QUEUE_PACKETS {
+            return false;
+        }
         self.rx_queue.push_back(packet);
+        true
     }
 
     /// Take all packets from the transmit queue (to send via WireGuard).
@@ -165,6 +192,9 @@ impl Device for VirtualDevice {
     type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.tx_queue.len() >= MAX_DEVICE_QUEUE_PACKETS {
+            return None;
+        }
         if let Some(buffer) = self.rx_queue.pop_front() {
             Some((
                 VirtualRxToken { buffer },
@@ -178,7 +208,7 @@ impl Device for VirtualDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(VirtualTxToken {
+        (self.tx_queue.len() < MAX_DEVICE_QUEUE_PACKETS).then_some(VirtualTxToken {
             tx_queue: &mut self.tx_queue,
         })
     }
@@ -196,6 +226,15 @@ struct NetStackInner {
     interface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
+    signals: HashMap<SocketHandle, Arc<SocketSignals>>,
+}
+
+#[derive(Default)]
+struct SocketSignals {
+    connect: tokio::sync::Notify,
+    read: tokio::sync::Notify,
+    write: tokio::sync::Notify,
+    udp_read: tokio::sync::Notify,
 }
 
 /// A userspace TCP/IP network stack.
@@ -207,8 +246,9 @@ pub struct NetStack {
     tcp_buffer_size: usize,
     /// PERF-2（warp-rust fork）：事件驱动 poll —— rx/read/write 路径唤醒 poll loop
     poll_notify: tokio::sync::Notify,
-    /// 唤醒等待 socket 状态变化的 TCP connect/read/write 调用方。
-    state_notify: tokio::sync::Notify,
+    /// TCP 与 UDP 分属不同的传输层端口空间，各自独立分配。
+    tcp_ports: Mutex<EphemeralPortAllocator>,
+    udp_ports: Mutex<EphemeralPortAllocator>,
 }
 
 impl NetStack {
@@ -272,6 +312,7 @@ impl NetStack {
             interface,
             device,
             sockets,
+            signals: HashMap::new(),
         };
 
         Arc::new(Self {
@@ -280,7 +321,8 @@ impl NetStack {
             wg_tx,
             tcp_buffer_size,
             poll_notify: tokio::sync::Notify::new(),
-            state_notify: tokio::sync::Notify::new(),
+            tcp_ports: Mutex::new(EphemeralPortAllocator::new()),
+            udp_ports: Mutex::new(EphemeralPortAllocator::new()),
         })
     }
 
@@ -290,24 +332,32 @@ impl NetStack {
         self.poll_notify.notify_one();
     }
 
-    #[inline]
-    fn notify_state(&self) {
-        self.state_notify.notify_waiters();
+    fn allocate_tcp_port(&self) -> Result<u16> {
+        self.tcp_ports
+            .lock()
+            .allocate()
+            .ok_or_else(|| Error::TcpConnectGeneric("TCP ephemeral port range exhausted".into()))
     }
 
-    async fn wait_for_activity(&self) {
-        tokio::select! {
-            _ = self.state_notify.notified() => {}
-            // Fallback covers the small race where a notification is emitted
-            // between the caller's readiness check and registering the waiter.
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-        }
+    fn release_tcp_port(&self, port: u16) {
+        self.tcp_ports.lock().release(port);
+    }
+
+    fn allocate_udp_port(&self) -> Result<u16> {
+        self.udp_ports
+            .lock()
+            .allocate()
+            .ok_or_else(|| Error::TcpConnectGeneric("UDP ephemeral port range exhausted".into()))
+    }
+
+    fn release_udp_port(&self, port: u16) {
+        self.udp_ports.lock().release(port);
     }
 
     /// Create a new TCP socket and return its handle.
     ///
     /// PERF（warp-rust fork v0.3.1，Bug #5 (A)）：
-    /// 在 1MiB tcp_buffer_size 配置下，rx+tx 总共要分配 2MiB。如果把
+    /// 在较大的 tcp_buffer_size 配置下，rx+tx 会产生显著固定预分配。如果把
     /// `vec![0u8; ...]` 放在 `inner.lock()` 之内，新连接建立时这把全局锁
     /// 至少要被持有一次 ~毫秒级 alloc + zeroing 的时长，**严重阻塞**正在
     /// 跑流量的所有其它连接 + poll loop。
@@ -326,9 +376,12 @@ impl NetStack {
         socket.set_ack_delay(None);
 
         // ---- 锁内：仅做 slab 插入 ----
+        let signals = Arc::new(SocketSignals::default());
         let handle = {
             let mut inner = self.inner.lock();
-            inner.sockets.add(socket)
+            let handle = inner.sockets.add(socket);
+            inner.signals.insert(handle, signals);
+            handle
         };
         // 可观测性：活跃 socket 数。create_tcp_socket / create_udp_socket_with 的每次
         // 分配都 +1，remove_socket 每次 -1，严格配对。若活跃连接数平稳而此 gauge 仍
@@ -338,12 +391,10 @@ impl NetStack {
     }
 
     /// Connect a TCP socket to the given address. v0.2.0：v4 与 v6 都支持。
-    pub fn connect(&self, handle: SocketHandle, addr: SocketAddr) -> Result<()> {
-        let mut inner = self.inner.lock();
+    pub fn connect(&self, handle: SocketHandle, addr: SocketAddr) -> Result<u16> {
+        let local_port = self.allocate_tcp_port()?;
 
-        let local_port = 49152 + (rand::random::<u16>() % 16384);
-
-        let (remote, local, log_local) = match addr {
+        let endpoints = match addr {
             SocketAddr::V4(v4) => {
                 let oct = v4.ip().octets();
                 let remote_ep =
@@ -358,10 +409,14 @@ impl NetStack {
             }
             SocketAddr::V6(v6) => {
                 // 需要 tunnel_ipv6 才能拨 v6
-                let local_v6 = self
-                    .wg_tunnel
-                    .tunnel_ipv6()
-                    .ok_or(Error::Ipv6NotSupported)?;
+                let local_v6 = self.wg_tunnel.tunnel_ipv6().ok_or(Error::Ipv6NotSupported);
+                let local_v6 = match local_v6 {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        self.release_tcp_port(local_port);
+                        return Err(e);
+                    }
+                };
                 let seg = v6.ip().segments();
                 let remote_ep = IpEndpoint::new(
                     IpAddress::Ipv6(Ipv6Address::new(
@@ -383,9 +438,16 @@ impl NetStack {
                     )),
                     local_port,
                 );
-                (remote_ep, local_ep, format!("[{}]:{}", local_v6, local_port))
+                (
+                    remote_ep,
+                    local_ep,
+                    format!("[{}]:{}", local_v6, local_port),
+                )
             }
         };
+        let (remote, local, log_local) = endpoints;
+
+        let mut inner = self.inner.lock();
 
         let NetStackInner {
             ref mut interface,
@@ -394,16 +456,21 @@ impl NetStack {
         } = *inner;
         let cx = interface.context();
         let socket = sockets.get_mut::<TcpSocket>(handle);
-        socket
-            .connect(cx, remote, local)
-            .map_err(|e| Error::TcpConnectGeneric(format!("TCP connect failed: {}", e)))?;
+        if let Err(e) = socket.connect(cx, remote, local) {
+            drop(inner);
+            self.release_tcp_port(local_port);
+            return Err(Error::TcpConnectGeneric(format!(
+                "TCP connect failed: {}",
+                e
+            )));
+        }
 
         log::debug!("TCP socket connecting to {} from {}", addr, log_local);
 
         // 避免 unused：仅用于 SocketAddrV6 import 抑制
         let _ = std::marker::PhantomData::<SocketAddrV6>;
 
-        Ok(())
+        Ok(local_port)
     }
 
     /// Check if a TCP socket is connected.
@@ -535,6 +602,7 @@ impl NetStack {
         {
             let mut inner = self.inner.lock();
             inner.sockets.remove(handle);
+            inner.signals.remove(&handle);
         }
         // 与 create_*_socket 的 increment 配对，见 `warp_rust_netstack_sockets_active`。
         metrics::gauge!("warp_rust_netstack_sockets_active").decrement(1.0);
@@ -544,6 +612,15 @@ impl NetStack {
     /// 稳态下应等于活跃连接数；若持续高于活跃连接数即为孤儿 socket 累积。
     pub fn socket_count(&self) -> usize {
         self.inner.lock().sockets.iter().count()
+    }
+
+    fn socket_signals(&self, handle: SocketHandle) -> Arc<SocketSignals> {
+        self.inner
+            .lock()
+            .signals
+            .get(&handle)
+            .cloned()
+            .expect("socket signals must exist while socket is registered")
     }
 
     /// Poll the network stack, processing packets and updating socket states.
@@ -560,6 +637,7 @@ impl NetStack {
                 ref mut interface,
                 ref mut device,
                 ref mut sockets,
+                ref signals,
             } = *inner;
 
             let rx_queue_len = device.rx_queue.len();
@@ -567,6 +645,40 @@ impl NetStack {
             // Poll the interface
             let poll_result = interface.poll(timestamp, device, sockets);
             let processed = poll_result != PollResult::None;
+
+            // 只唤醒状态真正就绪的对应 socket，避免全局 notify_waiters 导致
+            // N 条连接在每个包上同时抢一把 NetStack 锁（惊群）。
+            if processed {
+                for (handle, socket) in sockets.iter() {
+                    let Some(signal) = signals.get(&handle) else {
+                        continue;
+                    };
+                    match socket {
+                        Socket::Tcp(socket) => {
+                            let state = socket.state();
+                            if matches!(
+                                state,
+                                TcpState::Established | TcpState::Closed | TcpState::TimeWait
+                            ) {
+                                signal.connect.notify_waiters();
+                            }
+                            if socket.can_recv() || !socket.may_recv() {
+                                signal.read.notify_waiters();
+                            }
+                            if socket.can_send() || !socket.may_send() {
+                                signal.write.notify_waiters();
+                            }
+                        }
+                        Socket::Udp(socket) => {
+                            if socket.can_recv() {
+                                signal.udp_read.notify_waiters();
+                            }
+                        }
+                        #[allow(unreachable_patterns)]
+                        _ => {}
+                    }
+                }
+            }
 
             // Drain transmitted packets and send through WireGuard
             let tx_packets = device.drain_tx();
@@ -645,10 +757,6 @@ impl NetStack {
             }
         }
 
-        if processed || tx_count > 0 {
-            self.notify_state();
-        }
-
         processed
     }
 
@@ -692,8 +800,14 @@ impl NetStack {
             }
         }
 
-        let mut inner = self.inner.lock();
-        inner.device.push_rx(packet);
+        let accepted = {
+            let mut inner = self.inner.lock();
+            inner.device.push_rx(packet)
+        };
+        if !accepted {
+            metrics::counter!("warp_rust_netstack_rx_queue_dropped_total").increment(1);
+            log::debug!("netstack RX queue full; dropping packet");
+        }
     }
 
     /// PERF-2 v2（warp-rust fork v0.2.2）：基于 smoltcp `poll_at` 自适应的
@@ -708,16 +822,18 @@ impl NetStack {
     ///
     /// 实测：idle 时几乎不耗 CPU；500Mbps 时立即响应（kick 唤醒）。
     pub async fn run_poll_loop(self: &Arc<Self>) -> Result<()> {
-        let started = std::time::Instant::now();
         loop {
             let sleep_dur = {
                 let mut inner = self.inner.lock();
-                let now =
-                    smoltcp::time::Instant::from_millis(started.elapsed().as_millis() as i64);
+                // 必须与 `poll()` / Interface::new 使用同一时钟域。旧代码从本
+                // poll loop 启动时重新以 0 计时，而 `poll()` 用 Instant::now()，
+                // 导致 poll_at 计算出的 TCP 重传 deadline 被错误拉长到 1s 兜底。
+                let now = Instant::now();
                 let NetStackInner {
                     ref mut interface,
                     ref device,
                     ref sockets,
+                    ..
                 } = *inner;
                 if device.has_pending_tx() {
                     Duration::from_millis(1)
@@ -763,6 +879,8 @@ pub struct TcpConnection {
     pub netstack: Arc<NetStack>,
     /// The socket handle for this connection.
     pub handle: SocketHandle,
+    local_port: u16,
+    signals: Arc<SocketSignals>,
 }
 
 impl TcpConnection {
@@ -775,7 +893,7 @@ impl TcpConnection {
     ///   - `netstack.connect(handle, addr)?` 提前返回 `Err`（如无 v6 隧道时的
     ///     `Ipv6NotSupported`，或 smoltcp 的 `InvalidState`/`Unaddressable`）；
     ///   - 循环里 `Closed`/`TimeWait`/30s 超时的 `Err` 返回；
-    ///   - `wait_for_activity().await` 被上层取消——happy-eyeballs 败者 future 被
+    ///   - 等待 socket signal 时被上层取消——happy-eyeballs 败者 future 被
     ///     `select!` drop、健康探针 `timeout()` 到期 drop 等。
     /// `TcpConnection::Drop` 只在对象构造成功后才存在，救不了上述路径。
     ///
@@ -789,37 +907,53 @@ impl TcpConnection {
         struct SocketGuard {
             netstack: Arc<NetStack>,
             handle: SocketHandle,
+            local_port: Option<u16>,
             armed: bool,
         }
         impl Drop for SocketGuard {
             fn drop(&mut self) {
                 if self.armed {
                     self.netstack.remove_socket(self.handle);
+                    if let Some(port) = self.local_port {
+                        self.netstack.release_tcp_port(port);
+                    }
                 }
             }
         }
 
         let handle = netstack.create_tcp_socket();
+        let signals = netstack.socket_signals(handle);
         // guard 持一份 Arc clone（仅 refcount +1），与下面 `Self { netstack }` 的移动解耦。
         let mut guard = SocketGuard {
             netstack: Arc::clone(&netstack),
             handle,
+            local_port: None,
             armed: true,
         };
 
-        netstack.connect(handle, addr)?; // Err → guard.drop → remove_socket
+        let local_port = netstack.connect(handle, addr)?; // Err → guard.drop → remove_socket
+        guard.local_port = Some(local_port);
         // 立即叫 poll loop 把 SYN 发出去
         netstack.kick();
 
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
         loop {
+            // 先把 waiter 注册进 Notify 队列，再检查 socket 状态，消除
+            // check→wait 之间的丢通知窗口；无需旧版每 1ms 忙轮询兜底。
+            let notified = signals.connect.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let state = netstack.socket_state(handle);
             if state == TcpState::Established {
                 guard.armed = false; // 交棒给 TcpConnection::Drop
                 log::debug!("TCP connection established to {}", addr);
-                return Ok(Self { netstack, handle });
+                return Ok(Self {
+                    netstack: Arc::clone(&netstack),
+                    handle,
+                    local_port,
+                    signals: Arc::clone(&signals),
+                });
             }
             if state == TcpState::Closed || state == TcpState::TimeWait {
                 // guard.drop → remove_socket
@@ -828,10 +962,15 @@ impl TcpConnection {
                     message: format!("Connection failed (state: {:?})", state),
                 });
             }
-            if start.elapsed() > timeout {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(Error::TcpTimeout); // guard.drop → remove_socket
             }
-            netstack.wait_for_activity().await; // 取消 → guard.drop → remove_socket
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::TcpTimeout); // guard.drop → remove_socket
+                }
+            }
         }
     }
 
@@ -844,6 +983,9 @@ impl TcpConnection {
         // may_recv 合成单次取锁。原版每轮要进出锁 2-3 次，对高并发场景
         // 是显著的争用。
         loop {
+            let notified = self.signals.read.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let (n, may_recv) = self.netstack.recv_with_state(self.handle, buf)?;
             if n > 0 {
                 return Ok(n);
@@ -851,7 +993,7 @@ impl TcpConnection {
             if !may_recv {
                 return Ok(0); // 对端关闭
             }
-            self.netstack.wait_for_activity().await;
+            notified.await;
         }
     }
 
@@ -863,6 +1005,9 @@ impl TcpConnection {
         // may_send 合成单次取锁；写出非零字节后再叫一次 `kick()`（在锁外）
         // 让 poll loop 立即把包发出去。
         while written < data.len() {
+            let notified = self.signals.write.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let (n, may_send) = self
                 .netstack
                 .send_with_state(self.handle, &data[written..])?;
@@ -875,7 +1020,7 @@ impl TcpConnection {
                 return Err(Error::ConnectionClosed);
             }
             // tx_buffer 满或暂时不可发送：等状态通知
-            self.netstack.wait_for_activity().await;
+            notified.await;
         }
         Ok(written)
     }
@@ -915,6 +1060,7 @@ impl Drop for TcpConnection {
         self.netstack.close(self.handle);
         self.netstack.poll();
         self.netstack.remove_socket(self.handle);
+        self.netstack.release_tcp_port(self.local_port);
     }
 }
 
@@ -945,10 +1091,10 @@ impl NetStack {
         local_port: u16,
         prefer_v6: bool,
     ) -> Result<UdpHandle> {
-        let port = if local_port == 0 {
-            49152 + (rand::random::<u16>() % 16384)
+        let (port, allocated_port) = if local_port == 0 {
+            (self.allocate_udp_port()?, true)
         } else {
-            local_port
+            (local_port, false)
         };
 
         // PERF（warp-rust fork v0.3.1，Bug #5 (A)）：buffer alloc 留在锁外，
@@ -997,14 +1143,20 @@ impl NetStack {
         };
 
         // bind 只改 socket 自身状态，无需 SocketSet，可以在锁外做。
-        socket
-            .bind(listen)
-            .map_err(|e| Error::TcpConnectGeneric(format!("UDP bind failed: {}", e)))?;
+        if let Err(e) = socket.bind(listen) {
+            if allocated_port {
+                self.release_udp_port(port);
+            }
+            return Err(Error::TcpConnectGeneric(format!("UDP bind failed: {}", e)));
+        }
 
         // 锁内：仅做 slab 插入。
+        let signals = Arc::new(SocketSignals::default());
         let handle = {
             let mut inner = self.inner.lock();
-            inner.sockets.add(socket)
+            let handle = inner.sockets.add(socket);
+            inner.signals.insert(handle, signals.clone());
+            handle
         };
         // 与 remove_socket 的 decrement 配对，见 `warp_rust_netstack_sockets_active`。
         metrics::gauge!("warp_rust_netstack_sockets_active").increment(1.0);
@@ -1014,13 +1166,20 @@ impl NetStack {
             netstack: Arc::clone(self),
             handle,
             local_port: port,
+            allocated_port,
+            signals,
         })
     }
 
     /// 通过 `handle` 向 `dest` 发送一个 UDP 数据报。Ok 表示 smoltcp 已经接收
     /// 净荷；后续由 netstack 的 poll 循环把它真正发出去。
     /// v0.2.0：支持 v4 与 v6 目标。
-    pub fn udp_send_to(&self, handle: SocketHandle, payload: &[u8], dest: SocketAddr) -> Result<()> {
+    pub fn udp_send_to(
+        &self,
+        handle: SocketHandle,
+        payload: &[u8],
+        dest: SocketAddr,
+    ) -> Result<()> {
         let endpoint = match dest {
             SocketAddr::V4(v4) => {
                 let oct = v4.ip().octets();
@@ -1088,6 +1247,8 @@ pub struct UdpHandle {
     netstack: Arc<NetStack>,
     handle: SocketHandle,
     local_port: u16,
+    allocated_port: bool,
+    signals: Arc<SocketSignals>,
 }
 
 impl UdpHandle {
@@ -1100,18 +1261,25 @@ impl UdpHandle {
     /// v0.2.0：接受 SocketAddr（v4/v6 都可）
     pub async fn send_to(&self, payload: &[u8], dest: SocketAddr) -> Result<()> {
         self.netstack.udp_send_to(self.handle, payload, dest)?;
-        self.netstack.poll();
+        self.netstack.kick();
         Ok(())
     }
 
     /// 接收一个数据报。最多等待 `timeout`；超时返回 `Err(ReadTimeout)`。
     /// v0.3.x：与 TCP read 对齐 —— 不再 1ms 忙轮询，也不在 hot path 主动
     /// `poll()`（会跟 poll loop 抢 inner 锁）。改成先 try_recv，无数据时挂
-    /// 在 `state_notify` 上等 poll loop 唤醒；用一个总 deadline 控制超时。
+    /// 在本 UDP socket 的 signal 上等 poll loop 唤醒；用一个总 deadline 控制超时。
     /// v0.2.0：返回 SocketAddr（v4/v6）。
-    pub async fn recv_from(&self, buf: &mut [u8], timeout: Duration) -> Result<(usize, SocketAddr)> {
+    pub async fn recv_from(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<(usize, SocketAddr)> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let notified = self.signals.udp_read.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(got) = self.netstack.udp_try_recv(self.handle, buf)? {
                 return Ok(got);
             }
@@ -1119,11 +1287,9 @@ impl UdpHandle {
             if now >= deadline {
                 return Err(Error::ReadTimeout);
             }
-            // 等到 poll loop 处理过 rx（state_notify）或到 deadline 为止。
-            // wait_for_activity 自身带 1ms fallback 防 notify 漏掉，这里再加
-            // 一个 deadline sleep 用于上层 cancel 检查。
+            // 等到 poll loop 处理过该 socket 的 rx，或到 deadline 为止。
             tokio::select! {
-                _ = self.netstack.wait_for_activity() => {}
+                _ = &mut notified => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     // 让出后下一轮 try_recv + 再判 deadline，避免 sleep 与
                     // 通知 race 时直接 ReadTimeout 漏一次数据。
@@ -1136,7 +1302,10 @@ impl UdpHandle {
 impl Drop for UdpHandle {
     fn drop(&mut self) {
         self.netstack.remove_socket(self.handle);
-        self.netstack.poll();
+        if self.allocated_port {
+            self.netstack.release_udp_port(self.local_port);
+        }
+        self.netstack.kick();
     }
 }
 
@@ -1202,20 +1371,12 @@ mod connect_leak_tests {
 
         // 给它时间分配 socket 并 park
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(
-            ns.socket_count(),
-            1,
-            "connect 进行中应已分配 socket"
-        );
+        assert_eq!(ns.socket_count(), 1, "connect 进行中应已分配 socket");
 
         // 取消（drop future）→ guard.drop 必须 remove_socket
         task.abort();
         let _ = task.await;
-        assert_eq!(
-            ns.socket_count(),
-            0,
-            "guard 必须在取消路径(B)上移除 socket"
-        );
+        assert_eq!(ns.socket_count(), 0, "guard 必须在取消路径(B)上移除 socket");
     }
 
     /// 正常成功路径不受影响：guard disarm 后由 `TcpConnection::Drop` 接管，
@@ -1231,4 +1392,30 @@ mod connect_leak_tests {
         }
         assert_eq!(ns.socket_count(), 0, "UdpHandle::Drop 必须移除 socket");
     }
+}
+#[test]
+fn ephemeral_allocator_is_collision_free_and_reuses_released_ports() {
+    let mut ports = EphemeralPortAllocator::new();
+    let mut allocated = std::collections::HashSet::new();
+    for _ in 0..EPHEMERAL_PORT_COUNT {
+        let port = ports.allocate().expect("range should have a free port");
+        assert!(
+            allocated.insert(port),
+            "allocator returned duplicate {port}"
+        );
+    }
+    assert!(
+        ports.allocate().is_none(),
+        "full range must report exhaustion"
+    );
+
+    let released: Vec<_> = allocated.iter().copied().take(256).collect();
+    for port in &released {
+        ports.release(*port);
+    }
+    let mut reused = std::collections::HashSet::new();
+    for _ in 0..released.len() {
+        reused.insert(ports.allocate().expect("released port should be reusable"));
+    }
+    assert_eq!(reused.len(), released.len());
 }

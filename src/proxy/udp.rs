@@ -17,20 +17,22 @@
 
 use crate::dns::Resolver;
 use crate::error::{Error, Result};
-use crate::tunnel::Tunnel;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use crate::metrics::M_IDLE_TIMEOUT;
+use crate::tunnel::{Tunnel, TunnelUdpHandle};
+use metrics::counter;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, trace, warn};
-use wireguard_netstack::UdpHandle;
 
 /// 双栈 tunnel-side UDP socket 套装
 struct TunnelUdpPair {
-    v4: Arc<UdpHandle>,
-    v6: Option<Arc<UdpHandle>>,
+    v4: Arc<TunnelUdpHandle>,
+    v6: Option<Arc<TunnelUdpHandle>>,
 }
 
 impl TunnelUdpPair {
@@ -63,18 +65,22 @@ pub async fn run_relay(
     relay_bind: UdpSocket,
     tunnel: Arc<Tunnel>,
     resolver: Arc<Resolver>,
+    allowed_client_ip: IpAddr,
+    idle_timeout: Duration,
     parent: CancellationToken,
 ) -> Result<()> {
     let pair = Arc::new(TunnelUdpPair::new(&tunnel)?);
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let relay_bind = Arc::new(relay_bind);
+    let activity = Arc::new(Notify::new());
 
     // client → tunnel：按 dest family 选 v4/v6 socket
-    let c2t = {
+    let mut c2t = AbortOnDropHandle::new({
         let relay_bind = relay_bind.clone();
         let pair = pair.clone();
         let client_addr = client_addr.clone();
         let resolver = resolver.clone();
+        let activity = activity.clone();
         let parent = parent.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
@@ -87,21 +93,33 @@ pub async fn run_relay(
                             Ok(v) => v,
                             Err(e) => { warn!(error = %e, "client udp recv error"); break; }
                         };
-                        *client_addr.lock().await = Some(src);
-                        if let Err(e) = forward_client_to_tunnel(&buf[..n], &pair, &resolver).await {
-                            warn!(error = %e, "client→tunnel forward failed");
+                        if src.ip() != allowed_client_ip {
+                            warn!(%src, %allowed_client_ip, "dropping UDP packet from outside this association");
+                            continue;
+                        }
+                        let mut known_client = client_addr.lock().await;
+                        if known_client.is_some_and(|known| known != src) {
+                            warn!(%src, known = ?*known_client, "dropping UDP packet from a different source port");
+                            continue;
+                        }
+                        *known_client = Some(src);
+                        drop(known_client);
+                        match forward_client_to_tunnel(&buf[..n], &pair, &resolver).await {
+                            Ok(()) => activity.notify_one(),
+                            Err(e) => warn!(error = %e, "client→tunnel forward failed"),
                         }
                     }
                 }
             }
         })
-    };
+    });
 
     // tunnel → client：v4 + v6 socket 并行 recv
-    let t2c = {
+    let mut t2c = AbortOnDropHandle::new({
         let relay_bind = relay_bind.clone();
         let pair = pair.clone();
         let client_addr = client_addr.clone();
+        let activity = activity.clone();
         let parent = parent.clone();
         tokio::spawn(async move {
             let v4 = pair.v4.clone();
@@ -117,10 +135,13 @@ pub async fn run_relay(
             } else {
                 Vec::new()
             };
+            // 回包 framing buffer 复用，避免每个 UDP 数据报都新建 Vec。
+            let mut framed = Vec::new();
             enum Pick {
                 V4(usize, SocketAddr),
                 V6(usize, SocketAddr),
                 Timeout,
+                Error(String),
             }
             loop {
                 if parent.is_cancelled() {
@@ -135,17 +156,20 @@ pub async fn run_relay(
                     tokio::select! {
                         r = fut_v4 => match r {
                             Ok((n, sa)) => Pick::V4(n, sa),
-                            Err(_) => Pick::Timeout,
+                            Err(wireguard_netstack::Error::ReadTimeout) => Pick::Timeout,
+                            Err(e) => Pick::Error(e.to_string()),
                         },
                         r = fut_v6 => match r {
                             Ok((n, sa)) => Pick::V6(n, sa),
-                            Err(_) => Pick::Timeout,
+                            Err(wireguard_netstack::Error::ReadTimeout) => Pick::Timeout,
+                            Err(e) => Pick::Error(e.to_string()),
                         },
                     }
                 } else {
                     match v4.recv_from(&mut buf_v4, Duration::from_millis(200)).await {
                         Ok((n, sa)) => Pick::V4(n, sa),
-                        Err(_) => Pick::Timeout,
+                        Err(wireguard_netstack::Error::ReadTimeout) => Pick::Timeout,
+                        Err(e) => Pick::Error(e.to_string()),
                     }
                 };
 
@@ -153,6 +177,10 @@ pub async fn run_relay(
                     Pick::V4(n, sa) => (n, sa, &buf_v4[..n]),
                     Pick::V6(n, sa) => (n, sa, &buf_v6[..n]),
                     Pick::Timeout => continue, // 两边都 timeout，循环检查 cancel
+                    Pick::Error(e) => {
+                        warn!(error = %e, "tunnel UDP receive failed");
+                        break;
+                    }
                 };
 
                 let dst = match *client_addr.lock().await {
@@ -162,20 +190,57 @@ pub async fn run_relay(
                         continue;
                     }
                 };
-                let framed = wrap_socks5_udp(src, buf);
+                wrap_socks5_udp(&mut framed, src, buf);
                 let _ = n; // n 已经反映在 buf 切片长度里
                 if let Err(e) = relay_bind.send_to(&framed, dst).await {
                     warn!(error = %e, "tunnel→client send failed");
                     break;
                 }
+                activity.notify_one();
             }
         })
-    };
+    });
 
-    parent.cancelled().await;
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    let completed = loop {
+        tokio::select! {
+            biased;
+            _ = parent.cancelled() => break 0u8,
+            result = &mut c2t => {
+                if let Err(e) = result {
+                    warn!(error = ?e, "client→tunnel UDP task failed");
+                }
+                parent.cancel();
+                break 1;
+            }
+            result = &mut t2c => {
+                if let Err(e) = result {
+                    warn!(error = ?e, "tunnel→client UDP task failed");
+                }
+                parent.cancel();
+                break 2;
+            }
+            _ = activity.notified() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+            _ = &mut idle => {
+                debug!(?idle_timeout, "SOCKS5 UDP association idle timeout");
+                counter!(M_IDLE_TIMEOUT).increment(1);
+                parent.cancel();
+                break 0;
+            }
+        }
+    };
     debug!("SOCKS5 UDP relay shutting down");
-    c2t.abort();
-    t2c.abort();
+    if completed != 1 {
+        c2t.abort();
+        let _ = c2t.await;
+    }
+    if completed != 2 {
+        t2c.abort();
+        let _ = t2c.await;
+    }
     Ok(())
 }
 
@@ -217,6 +282,9 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
     if buf.len() < 4 {
         return Err(Error::other("SOCKS5 UDP packet too short"));
     }
+    if buf[0] != 0 || buf[1] != 0 {
+        return Err(Error::other("SOCKS5 UDP reserved bytes must be zero"));
+    }
     if buf[2] != 0x00 {
         return Err(Error::other("SOCKS5 UDP fragmentation not supported"));
     }
@@ -229,6 +297,9 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
             }
             let ip = Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
             let port = u16::from_be_bytes([rest[4], rest[5]]);
+            if port == 0 {
+                return Err(Error::other("SOCKS5 UDP destination port must be non-zero"));
+            }
             Ok(ParsedUdp {
                 target: UdpTarget::V4(SocketAddrV4::new(ip, port)),
                 payload: &rest[6..],
@@ -239,6 +310,9 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
                 return Err(Error::other("SOCKS5 UDP domain header truncated"));
             }
             let dlen = rest[0] as usize;
+            if dlen == 0 {
+                return Err(Error::other("SOCKS5 UDP domain must be non-empty"));
+            }
             if rest.len() < 1 + dlen + 2 {
                 return Err(Error::other("SOCKS5 UDP domain header truncated"));
             }
@@ -246,6 +320,9 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
                 .map_err(|_| Error::other("SOCKS5 UDP domain not utf8"))?
                 .to_owned();
             let port = u16::from_be_bytes([rest[1 + dlen], rest[1 + dlen + 1]]);
+            if port == 0 {
+                return Err(Error::other("SOCKS5 UDP destination port must be non-zero"));
+            }
             Ok(ParsedUdp {
                 target: UdpTarget::Domain(host, port),
                 payload: &rest[1 + dlen + 2..],
@@ -259,6 +336,9 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
             octets.copy_from_slice(&rest[..16]);
             let ip = std::net::Ipv6Addr::from(octets);
             let port = u16::from_be_bytes([rest[16], rest[17]]);
+            if port == 0 {
+                return Err(Error::other("SOCKS5 UDP destination port must be non-zero"));
+            }
             Ok(ParsedUdp {
                 target: UdpTarget::V6(SocketAddrV6::new(ip, port, 0, 0)),
                 payload: &rest[18..],
@@ -269,23 +349,22 @@ fn parse_socks5_udp_header(buf: &[u8]) -> Result<ParsedUdp<'_>> {
 }
 
 /// 双栈版 wrap：按 src family 选 ATYP=0x01 (v4) 或 0x04 (v6)
-fn wrap_socks5_udp(src: SocketAddr, payload: &[u8]) -> Vec<u8> {
+fn wrap_socks5_udp(out: &mut Vec<u8>, src: SocketAddr, payload: &[u8]) {
+    out.clear();
     match src {
         SocketAddr::V4(sa) => {
-            let mut out = Vec::with_capacity(10 + payload.len());
+            out.reserve(10 + payload.len());
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             out.extend_from_slice(&sa.ip().octets());
             out.extend_from_slice(&sa.port().to_be_bytes());
             out.extend_from_slice(payload);
-            out
         }
         SocketAddr::V6(sa) => {
-            let mut out = Vec::with_capacity(22 + payload.len());
+            out.reserve(22 + payload.len());
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]);
             out.extend_from_slice(&sa.ip().octets());
             out.extend_from_slice(&sa.port().to_be_bytes());
             out.extend_from_slice(payload);
-            out
         }
     }
 }

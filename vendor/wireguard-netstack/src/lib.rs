@@ -52,7 +52,9 @@
 //! }
 //! ```
 
+#[cfg(feature = "config-file")]
 pub mod config;
+#[cfg(feature = "doh")]
 pub mod dns;
 pub mod error;
 pub mod netstack;
@@ -60,7 +62,9 @@ pub mod tunnel;
 pub mod wireguard;
 
 // Re-export main types
+#[cfg(feature = "config-file")]
 pub use config::WgConfigFile;
+#[cfg(feature = "doh")]
 pub use dns::{DnsConfig, DohResolver, DohServerConfig};
 pub use error::{Error, Result};
 pub use netstack::{NetStack, TcpConnection, UdpHandle, DEFAULT_MTU};
