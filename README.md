@@ -17,6 +17,28 @@
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
 - **多架构发布**：每个 release 自动发布 Docker 镜像（linux/amd64 + linux/arm64）与预编译二进制（Linux x86_64-musl / Linux aarch64-musl / Windows x86_64 / macOS Apple Silicon）。
 
+## v0.4.0 相对 v0.3.3：连接可靠性与高并发改进
+
+v0.4.0 的重点是解决“DNS 已经解析成功，但新连接仍然反复 TCP timeout”类问题。它不改变 SOCKS5 协议或使用方式，主要重做拨号、连接生命周期与健康判定。完整条目见 [v0.4.0 发布说明](https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.0)。
+
+| 维度 | v0.3.3 之前 | v0.4.0 改进 |
+| --- | --- | --- |
+| 域名拨号 | 只保留首个 A/AAAA 地址，其余 DNS 候选不会被尝试 | 缓存完整 A/AAAA 记录集，交错排列并错峰尝试最多 8 个候选。一个 IP 超时时会继续尝试其他候选 |
+| 高并发拨号 | 临时端口随机抽取，高并发时可能碰撞；所有 socket 共享唤醒 | 32768 个无冲突端口、TCP/UDP 分离；每 socket 独立事件唤醒，移除 1ms 忙轮询与全局惊群 |
+| 稳态内存 | 默认单连接缓冲约 2.5 MiB（2 x 1 MiB TCP + 2 x 256 KiB relay） | 默认约 640 KiB（2 x 256 KiB TCP + 2 x 64 KiB relay），更适合高并发场景 |
+| 长连接 / idle | 上下行单独计时，单向持续下载或上传也可能被误杀 | 任一方向成功传输都会续期，只有双向无进展才超时；UDP 也使用真正的活动 idle |
+| 隧道热替换 | 替换旧隧道可以中止仍存活连接的后台驱动 | TCP/UDP 句柄持有旧隧道租约；新连接走新隧道，旧连接可自然结束 |
+| 自愈与就绪性 | 单一 1.1.1.1 探针，第一级恢复就会访问 API | 3 个公网目标的 2/3 quorum；第一级只复用已验证配置重连，更高阶段才请求 API |
+| 取消与账号安全 | 某些取消路径会 detach 子任务；身份切换先覆盖本地账号 | relay 子任务 abort-on-drop 并回收；候选身份先完成握手，再原子持久化与切换 |
+| 网络与协议防护 | 隧道 DNS 校验较少，UDP ASSOCIATE 的客户端源地址约束不足 | DNS 随机事务 ID 及回包来源/flags/rcode 校验；UDP 绑定 TCP peer IP 与首个源端口；密码使用常量时间比较 |
+| 运维可观测性 | 只能以端口连通判断健康 | `/healthz` 反映公网出口 quorum，`/livez` 只判断进程存活；增加拨号尝试/失败/超时指标 |
+
+### 从 v0.3.3 升级时的注意事项
+
+- 旧 `config.toml` 如果显式写了 `tcp_buffer_size = 1048576` 或 `relay_buffer_size = 262144`，升级不会自动改掉这些值。想使用 v0.4.0 的默认内存模型，请改为 262144 和 65536。
+- 为了让域名多候选拨号生效，建议在 `[limits]` 显式配置 `connect_timeout = "12s"`、`happy_eyeballs_delay = "200ms"`、`max_dial_candidates = 8` 和 `max_parallel_dials = 2`。
+- systemd 部署请用 `/healthz` 做 readiness 探测，用 `/livez` 做进程存活检查。
+
 ---
 
 ## ⚡️ 一行命令安装（Linux + systemd 服务器，最推荐）
