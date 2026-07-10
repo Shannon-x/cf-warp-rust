@@ -3,6 +3,30 @@
 本项目的所有重要变更记录于此。版本遵循语义化版本（SemVer）。
 日期格式为 `YYYY-MM-DD`。
 
+## [0.4.0] - 2026-07-10
+
+### 修复
+
+- DNS 现在保留并缓存完整 A/AAAA 记录集；有界 Happy Eyeballs 会错峰尝试全部候选，不再只试首个 v4/v6 地址。
+- 修复 smoltcp 临时端口随机碰撞、connect 取消后的端口回收、poll_at 时钟域不一致。
+- 用每 socket 的 connect/read/write/UDP 通知替代 1ms 忙轮询和全局惊群通知。
+- 多目标多数派出口探针取代单一 1.1.1.1 探针，并丢弃恢复期间排队的过期探针事件。
+- 恢复阶梯第一级现在复用内存中已验证配置直接重连；只有更高一级才访问 Cloudflare API。
+- TCP/UDP 句柄现在持有创建它的隧道租约，热替换不再中止旧连接的后台驱动任务。
+- TCP idle timeout 改为上下行共享活动计时，持续的单向下载/上传不再被误杀。
+- 修复 UDP ASSOCIATE 源地址劫持、把会话寿命误当 idle timeout、子任务退出后 relay 残留，以及超时 JoinHandle detach。
+- 修复关键服务退出后主进程仍假装健康、WARP API/DNS 请求无总超时、身份轮换/重注册在新隧道握手前覆盖现用账号。
+- 隧道 DNS 校验随机 transaction ID、响应源/flags/rcode，并拒绝截断或畸形域名。
+
+### 优化 / 加固
+
+- 默认 TCP 单向 buffer 从 1MiB 调整为 256KiB，relay 每方向从 256KiB 调整为 64KiB。
+- DNS 缓存、虚拟设备包队列、拨号候选和候选并发均增加硬上限；缓存满载淘汰为 O(1)。
+- 临时端口扩到 32768 个并与配置容量联动校验，高并发 Happy Eyeballs 不会过量承诺。
+- WARP API bearer token 不再走可 panic 的 HeaderValue unwrap；SOCKS 密码改为常量时间比较。
+- 公网监听强制 16 位、含大小写和数字的密码；`/healthz` 反映真实出口 quorum，`/livez` 保留进程存活检查。
+- 未使用的 wireguard-netstack DoH/config 模块改为 feature gate，减少生产二进制攻击面。
+
 ## [0.3.3] - 2026-06-29
 
 ### 修复（内存泄漏，重点）
@@ -65,6 +89,7 @@
 
 - WARP peer endpoint 优先 DNS 解析，IP 仅作 fallback。
 
+[0.4.0]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.0
 [0.3.3]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.1

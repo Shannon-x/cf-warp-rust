@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::Utc;
@@ -39,17 +40,20 @@ fn create_client(auth_token: Option<&str>, teams_jwt: Option<&str>) -> Result<Cl
     .with_no_client_auth();
 
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("CF-Client-Version", CF_CLIENT_VERSION.parse().unwrap());
+    headers.insert(
+        reqwest::header::HeaderName::from_static("cf-client-version"),
+        reqwest::header::HeaderValue::from_static(CF_CLIENT_VERSION),
+    );
     headers.insert(
         reqwest::header::ACCEPT,
-        "application/json; charset=UTF-8".parse().unwrap(),
+        reqwest::header::HeaderValue::from_static("application/json; charset=UTF-8"),
     );
 
     if let Some(token) = auth_token {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", token).parse().unwrap(),
-        );
+        let value = format!("Bearer {}", token)
+            .parse()
+            .map_err(|_| Error::InvalidResponse("Invalid access token header".to_string()))?;
+        headers.insert(reqwest::header::AUTHORIZATION, value);
     }
 
     // Add Teams JWT assertion header for Zero Trust enrollment
@@ -65,7 +69,10 @@ fn create_client(auth_token: Option<&str>, teams_jwt: Option<&str>) -> Result<Cl
         .use_preconfigured_tls(tls_config)
         .user_agent("1.1.1.1/6.81")
         .default_headers(headers)
-        .http1_only(); // No HTTP/2 to match official client behavior
+        .http1_only()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .pool_idle_timeout(Duration::from_secs(30)); // No HTTP/2 to match official client behavior
 
     builder.build().map_err(Error::from)
 }
@@ -239,11 +246,8 @@ async fn get_config_with_client_id(
         None
     } else {
         let v6_str = resp.config.interface.addresses.v6.clone();
-        let parsed: std::result::Result<std::net::Ipv6Addr, _> = v6_str
-            .split('/')
-            .next()
-            .unwrap_or(&v6_str)
-            .parse();
+        let parsed: std::result::Result<std::net::Ipv6Addr, _> =
+            v6_str.split('/').next().unwrap_or(&v6_str).parse();
         match parsed {
             Ok(addr) => {
                 log::debug!("Parsed tunnel IPv6: {}", addr);
@@ -338,15 +342,18 @@ pub async fn update_license(credentials: &WarpCredentials, license_key: &str) ->
 /// 异步解析 WARP peer endpoint：DNS 优先，失败 fallback 到 API 提供的 v4。
 async fn resolve_peer_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
     let host_str = endpoint.host.trim();
-    match tokio::net::lookup_host(host_str).await {
-        Ok(iter) => {
+    match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(host_str)).await {
+        Err(_) => {
+            log::warn!(
+                "WARP endpoint DNS '{}' timed out; fallback to API v4='{}'",
+                host_str,
+                endpoint.v4,
+            );
+        }
+        Ok(Ok(iter)) => {
             for sa in iter {
                 if let SocketAddr::V4(_) = sa {
-                    log::info!(
-                        "WARP endpoint via DNS: '{}' -> {}",
-                        host_str,
-                        sa,
-                    );
+                    log::info!("WARP endpoint via DNS: '{}' -> {}", host_str, sa,);
                     return Ok(sa);
                 }
             }
@@ -356,7 +363,7 @@ async fn resolve_peer_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
                 endpoint.v4,
             );
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::warn!(
                 "WARP endpoint DNS '{}' failed: {}; fallback to API v4='{}'",
                 host_str,
@@ -422,36 +429,24 @@ mod tests {
     #[test]
     fn fallback_handles_bare_v4_no_port() {
         // 防御：v4 字段如果就是裸 IP 没冒号
-        let sa = fallback_endpoint(&ep(
-            "engage.cloudflareclient.com:2408",
-            "162.159.192.7",
-            "",
-        ))
-        .unwrap();
+        let sa = fallback_endpoint(&ep("engage.cloudflareclient.com:2408", "162.159.192.7", ""))
+            .unwrap();
         assert_eq!(sa.to_string(), "162.159.192.7:2408");
     }
 
     #[test]
     fn fallback_handles_missing_host_port_defaults_2408() {
         // host 没端口（极少见）→ 默认 2408（WARP 标准）
-        let sa = fallback_endpoint(&ep(
-            "engage.cloudflareclient.com",
-            "162.159.192.7:0",
-            "",
-        ))
-        .unwrap();
+        let sa =
+            fallback_endpoint(&ep("engage.cloudflareclient.com", "162.159.192.7:0", "")).unwrap();
         assert_eq!(sa.port(), 2408);
     }
 
     #[test]
     fn fallback_rejects_invalid_v4_text() {
         // 非法 IPv4 文本 → Err，不 panic
-        let err = fallback_endpoint(&ep(
-            "engage.cloudflareclient.com:2408",
-            "not.an.ip:0",
-            "",
-        ))
-        .unwrap_err();
+        let err = fallback_endpoint(&ep("engage.cloudflareclient.com:2408", "not.an.ip:0", ""))
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("fallback parse failed"), "got: {msg}");
     }

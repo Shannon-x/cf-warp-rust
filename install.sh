@@ -463,11 +463,13 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
 mtu = 1420
-tcp_buffer_size = 1048576
+tcp_buffer_size = 262144
 
 [health]
 interval = "30s"
 timeout = "8s"
+targets = ["1.1.1.1:443", "8.8.8.8:53", "9.9.9.9:53"]
+min_successes = 2
 
 [recovery]
 reconnect_after = 1
@@ -487,9 +489,22 @@ enabled = false
 [limits]
 max_concurrent_connections = 1024
 handshake_timeout = "10s"
+connect_timeout = "12s"
+happy_eyeballs_delay = "200ms"
+max_dial_candidates = 8
+max_parallel_dials = 2
 idle_timeout = "300s"
-relay_buffer_size = 262144
+relay_buffer_size = 65536
 auth_fail_sleep = "1s"
+relay_close_grace = "500ms"
+
+[dns]
+mode = "system"
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+timeout = "3s"
+cache_ttl = "60s"
+negative_ttl = "5s"
+max_cache_entries = 4096
 EOF
 } > "$CONF_FILE"
 chown root:"$SERVICE_USER" "$CONF_FILE"
@@ -579,8 +594,9 @@ while [ $((SECONDS - START)) -lt $SECS_LIMIT ]; do
     fi
     LAST_JOURNAL_TS="$CURRENT"
   fi
-  # 检测启动成功标志
-  if echo "$CURRENT" | grep -q "SOCKS5 listening"; then
+  # 监听成功还不等于 WARP 公网出口健康；同时要求 readiness 探针通过。
+  if echo "$CURRENT" | grep -q "SOCKS5 listening" \
+     && curl -fsS --max-time 2 http://127.0.0.1:9090/healthz >/dev/null 2>&1; then
     READY=1
     break
   fi
@@ -595,7 +611,11 @@ echo "${CYAN}── 日志结束 ──${RESET}"
 # ── 报告 ────────────────────────────────────────────────────────────────────
 echo
 echo "${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
-ok "warp-rust ${VERSION} 已安装并运行"
+if [ "$READY" = 1 ]; then
+  ok "warp-rust ${VERSION} 已安装且公网出口健康"
+else
+  warn "warp-rust ${VERSION} 已安装，但尚未通过公网出口健康检查"
+fi
 echo "${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
 echo
 echo "  SOCKS5      : ${BOLD}$BIND${RESET}"
@@ -634,7 +654,7 @@ echo
 if [ "$READY" = 1 ] && systemctl is-active --quiet "$SERVICE_NAME"; then
   ok "${BOLD}服务运行正常，SOCKS5 已监听 $BIND${RESET}"
 elif systemctl is-active --quiet "$SERVICE_NAME"; then
-  warn "服务 active 但 25 秒内没看到 'SOCKS5 listening'（WARP 握手慢？）"
+  warn "服务 active 但 25 秒内 readiness 未通过（查看多目标出口探针日志）"
   echo "  跟踪日志：${BOLD}sudo journalctl -u $SERVICE_NAME -f${RESET}"
 else
   warn "服务未变 active；以下是最近日志："

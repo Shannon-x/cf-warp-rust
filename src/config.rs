@@ -114,7 +114,7 @@ fn default_mtu() -> u16 {
 }
 
 fn default_tcp_buffer_size() -> usize {
-    1024 * 1024
+    256 * 1024
 }
 
 impl Default for WarpConfig {
@@ -137,6 +137,24 @@ pub struct HealthConfig {
     pub interval: Duration,
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// 从隧道内拨号的独立目标。包含 Cloudflare 内部与外部网络，避免只探测
+    /// 1.1.1.1 时把“隧道握手活着但公网出口坏了”误判为健康。
+    #[serde(default = "default_health_targets")]
+    pub targets: Vec<SocketAddr>,
+    /// 一轮至少成功多少个目标才算健康。
+    #[serde(default = "default_health_min_successes")]
+    pub min_successes: usize,
+}
+
+fn default_health_targets() -> Vec<SocketAddr> {
+    ["1.1.1.1:443", "8.8.8.8:53", "9.9.9.9:53"]
+        .into_iter()
+        .map(|value| value.parse().expect("static health target"))
+        .collect()
+}
+
+fn default_health_min_successes() -> usize {
+    2
 }
 
 impl Default for HealthConfig {
@@ -144,6 +162,8 @@ impl Default for HealthConfig {
         Self {
             interval: Duration::from_secs(30),
             timeout: Duration::from_secs(8),
+            targets: default_health_targets(),
+            min_successes: default_health_min_successes(),
         }
     }
 }
@@ -202,6 +222,18 @@ pub struct LimitsConfig {
     /// SOCKS5 握手（含 read_command）超时；超时即关
     #[serde(with = "humantime_serde")]
     pub handshake_timeout: Duration,
+    /// 从开始拨第一个候选到整体失败的总时限，覆盖所有 Happy Eyeballs 尝试。
+    #[serde(with = "humantime_serde", default = "default_connect_timeout")]
+    pub connect_timeout: Duration,
+    /// 相邻候选的错峰启动间隔。
+    #[serde(with = "humantime_serde", default = "default_happy_eyeballs_delay")]
+    pub happy_eyeballs_delay: Duration,
+    /// 单个目标最多尝试多少条 DNS 候选，防止恶意响应放大资源占用。
+    #[serde(default = "default_max_dial_candidates")]
+    pub max_dial_candidates: usize,
+    /// 同一客户端拨号同时在飞的候选上限。
+    #[serde(default = "default_max_parallel_dials")]
+    pub max_parallel_dials: usize,
     /// 双向 relay 的 idle 超时；上下行都无数据传输到达时关连接
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
@@ -218,7 +250,23 @@ pub struct LimitsConfig {
 }
 
 fn default_relay_buffer_size() -> usize {
-    256 * 1024
+    64 * 1024
+}
+
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(12)
+}
+
+fn default_happy_eyeballs_delay() -> Duration {
+    Duration::from_millis(200)
+}
+
+fn default_max_dial_candidates() -> usize {
+    8
+}
+
+fn default_max_parallel_dials() -> usize {
+    2
 }
 
 fn default_relay_close_grace() -> Duration {
@@ -230,6 +278,10 @@ impl Default for LimitsConfig {
         Self {
             max_concurrent_connections: 1024,
             handshake_timeout: Duration::from_secs(10),
+            connect_timeout: default_connect_timeout(),
+            happy_eyeballs_delay: default_happy_eyeballs_delay(),
+            max_dial_candidates: default_max_dial_candidates(),
+            max_parallel_dials: default_max_parallel_dials(),
             idle_timeout: Duration::from_secs(300),
             relay_buffer_size: default_relay_buffer_size(),
             auth_fail_sleep: Duration::from_secs(1),
@@ -249,7 +301,7 @@ pub struct DnsConfig {
     /// 单次 DNS 查询超时
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
-    /// LRU 缓存 TTL；命中跳过 DNS 查询
+    /// 有界缓存 TTL；命中跳过 DNS 查询
     #[serde(with = "humantime_serde")]
     pub cache_ttl: Duration,
     /// Negative cache TTL：解析失败（NXDOMAIN / 超时 / 无该 qtype 记录）后的短暂缓存
@@ -257,10 +309,17 @@ pub struct DnsConfig {
     /// 5s 后能恢复。
     #[serde(with = "humantime_serde", default = "default_dns_negative_ttl")]
     pub negative_ttl: Duration,
+    /// DNS 缓存条目硬上限，避免客户端用随机域名让 HashMap 无界增长。
+    #[serde(default = "default_dns_max_cache_entries")]
+    pub max_cache_entries: usize,
 }
 
 fn default_dns_negative_ttl() -> Duration {
     Duration::from_secs(5)
+}
+
+fn default_dns_max_cache_entries() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,6 +337,7 @@ impl Default for DnsConfig {
             timeout: Duration::from_secs(3),
             cache_ttl: Duration::from_secs(60),
             negative_ttl: default_dns_negative_ttl(),
+            max_cache_entries: default_dns_max_cache_entries(),
         }
     }
 }
@@ -390,17 +450,109 @@ impl Config {
                 self.warp.mtu
             ));
         }
+        if self.health.targets.is_empty()
+            || self.health.min_successes == 0
+            || self.health.min_successes > self.health.targets.len()
+        {
+            return Err(format!(
+                "[health] min_successes={} 必须在 1..=targets.len()={} 范围内",
+                self.health.min_successes,
+                self.health.targets.len()
+            ));
+        }
+        if self.health.interval.is_zero() || self.health.timeout.is_zero() {
+            return Err("[health] interval 和 timeout 必须大于 0".into());
+        }
+        if self.recovery.reconnect_after == 0
+            || self.recovery.reconnect_after > self.recovery.rebuild_config_after
+            || self.recovery.rebuild_config_after > self.recovery.reregister_after
+            || self.recovery.reregister_after > self.recovery.rotate_identity_after
+        {
+            return Err(
+                "[recovery] 阈值必须非零并按 reconnect <= rebuild <= reregister <= rotate 排列"
+                    .into(),
+            );
+        }
+        if self.recovery.backoff_min > self.recovery.backoff_max {
+            return Err("[recovery] backoff_min 不能大于 backoff_max".into());
+        }
         if self.warp.tcp_buffer_size < 65_535 {
             return Err(format!(
-                "[warp] tcp_buffer_size = {} 太小；至少 65535，推荐 1048576",
+                "[warp] tcp_buffer_size = {} 太小；至少 65535，推荐 262144",
+                self.warp.tcp_buffer_size
+            ));
+        }
+        if self.warp.tcp_buffer_size > 8 * 1024 * 1024 {
+            return Err(format!(
+                "[warp] tcp_buffer_size = {} 过大；上限 8388608",
                 self.warp.tcp_buffer_size
             ));
         }
         if self.limits.relay_buffer_size < 4096 {
             return Err(format!(
-                "[limits] relay_buffer_size = {} 太小；至少 4096，推荐 262144",
+                "[limits] relay_buffer_size = {} 太小；至少 4096，推荐 65536",
                 self.limits.relay_buffer_size
             ));
+        }
+        if self.limits.relay_buffer_size > 1024 * 1024 {
+            return Err(format!(
+                "[limits] relay_buffer_size = {} 过大；上限 1048576",
+                self.limits.relay_buffer_size
+            ));
+        }
+        if !(1..=16_384).contains(&self.limits.max_concurrent_connections) {
+            return Err(format!(
+                "[limits] max_concurrent_connections = {} 超出 1..=16384",
+                self.limits.max_concurrent_connections
+            ));
+        }
+        if self.limits.connect_timeout.is_zero() {
+            return Err("[limits] connect_timeout 必须大于 0".into());
+        }
+        if self.limits.handshake_timeout.is_zero() || self.limits.idle_timeout.is_zero() {
+            return Err("[limits] handshake_timeout 和 idle_timeout 必须大于 0".into());
+        }
+        if self.limits.happy_eyeballs_delay.is_zero() {
+            return Err("[limits] happy_eyeballs_delay 必须大于 0".into());
+        }
+        if !(1..=32).contains(&self.limits.max_dial_candidates) {
+            return Err("[limits] max_dial_candidates 必须在 1..=32".into());
+        }
+        if !(1..=4).contains(&self.limits.max_parallel_dials) {
+            return Err("[limits] max_parallel_dials 必须在 1..=4".into());
+        }
+        if self
+            .limits
+            .max_concurrent_connections
+            .saturating_mul(self.limits.max_parallel_dials)
+            > 32_768
+        {
+            return Err(
+                "[limits] max_concurrent_connections * max_parallel_dials 不能超过 32768（用户态 TCP 临时端口容量）"
+                    .into(),
+            );
+        }
+        if self.dns.max_cache_entries == 0 || self.dns.max_cache_entries > 1_000_000 {
+            return Err("[dns] max_cache_entries 必须在 1..=1000000".into());
+        }
+        if self.dns.timeout.is_zero() {
+            return Err("[dns] timeout 必须大于 0".into());
+        }
+        if self.dns.mode == DnsMode::Tunnel && self.dns.servers.is_empty() {
+            return Err("[dns] mode=tunnel 时 servers 不能为空".into());
+        }
+        let per_connection = self
+            .warp
+            .tcp_buffer_size
+            .saturating_mul(2)
+            .saturating_mul(self.limits.max_parallel_dials)
+            .saturating_add(self.limits.relay_buffer_size.saturating_mul(2));
+        let capacity = per_connection.saturating_mul(self.limits.max_concurrent_connections);
+        if capacity > 2 * 1024 * 1024 * 1024usize {
+            tracing::warn!(
+                estimated_capacity_bytes = capacity,
+                "配置的理论连接缓冲容量超过 2GiB；请调低 tcp_buffer_size、relay_buffer_size 或并发上限"
+            );
         }
         // 鉴权字段健全性
         if let Some(auth) = &self.server.auth {
@@ -412,6 +564,18 @@ impl Config {
                     "[server.auth] password 长度仅 {}，至少 8 位；推荐 ≥16 位强密码",
                     auth.password.len()
                 ));
+            }
+            if !ip.is_loopback() {
+                let strong = auth.password.len() >= 16
+                    && auth.password.bytes().any(|c| c.is_ascii_lowercase())
+                    && auth.password.bytes().any(|c| c.is_ascii_uppercase())
+                    && auth.password.bytes().any(|c| c.is_ascii_digit());
+                if !strong {
+                    return Err(
+                        "公网监听的 [server.auth] password 必须至少 16 位，并包含大小写字母和数字"
+                            .into(),
+                    );
+                }
             }
         }
         Ok(())
@@ -477,6 +641,23 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.contains("password"));
+    }
+
+    #[test]
+    fn validate_public_long_but_low_entropy_password_rejected() {
+        let err = cfg_with("0.0.0.0:1080", Some(("u", "aaaaaaaaaaaaaaaaaaaa")))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("大小写"));
+    }
+
+    #[test]
+    fn validate_rejects_dial_concurrency_beyond_port_capacity() {
+        let mut cfg = Config::default();
+        cfg.limits.max_concurrent_connections = 16_384;
+        cfg.limits.max_parallel_dials = 4;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("32768"));
     }
 }
 

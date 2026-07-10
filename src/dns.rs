@@ -26,26 +26,29 @@ use tokio::net::lookup_host;
 use tokio::sync::watch;
 use tracing::{debug, trace, warn};
 
-/// 缓存项：单条记录类型的解析结果。
+type RecordSet = Arc<Vec<IpAddr>>;
+
+/// 缓存项：同一类型的完整记录集。
 ///
-/// `ip = None` 代表 negative cache：上一次查询失败（NXDOMAIN / no record /
+/// `records = None` 代表 negative cache：上一次查询失败（NXDOMAIN / no record /
 /// 网络错误），在 `expires` 之前直接返回 Err，不再打 DNS。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CacheEntry {
-    ip: Option<IpAddr>,
+    records: Option<RecordSet>,
     expires: Instant,
 }
 
 /// Singleflight 共享给所有 waiter 的结果载荷。
 ///
-/// `Error` 不实现 Clone，所以这里只承载 `IpAddr | ()`（用 `Result<IpAddr, ()>`）：
+/// `Error` 不实现 Clone，所以这里只承载 `RecordSet | ()`：
 /// waiter 取到 `Err(())` 后调用 `neg_err(host, qtype)` 重建与 cache hit 路径完全
 /// 一致的 `Error` 变体（`DnsNoIpv4` / `Other("no AAAA …")`），从而保留对外的错误
 /// 变体类型语义——外部 `matches!(err, Error::DnsNoIpv4(_))` 等模式匹配不受影响。
-type SingleflightResult = std::result::Result<IpAddr, ()>;
+type SingleflightResult = std::result::Result<RecordSet, ()>;
 
 /// `in_flight` map value：leader 派生出的 Receiver 模板，waiter clone 后独立 await。
-/// 类型展开后是 `watch::Receiver<Option<Arc<Result<IpAddr, ()>>>>`，三层嵌套触发
+/// 类型展开后是 `watch::Receiver<Option<Arc<Result<RecordSet, ()>>>>`，
+/// 多层嵌套触发
 /// clippy::type_complexity；起 alias 让结构体定义可读。
 type SingleflightSlot = watch::Receiver<Option<Arc<SingleflightResult>>>;
 
@@ -56,6 +59,7 @@ pub struct Resolver {
     timeout: Duration,
     cache_ttl: Duration,
     negative_ttl: Duration,
+    max_cache_entries: usize,
     tunnel: Option<Arc<Tunnel>>,
     /// 缓存按 (host, qtype) 分键。qtype=1 (A) / 28 (AAAA)
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
@@ -86,6 +90,7 @@ impl Resolver {
             timeout: cfg.timeout,
             cache_ttl: cfg.cache_ttl,
             negative_ttl: cfg.negative_ttl,
+            max_cache_entries: cfg.max_cache_entries,
             tunnel: Some(tunnel),
             cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -95,20 +100,22 @@ impl Resolver {
     }
 
     /// 仅 v4 解析；保留作为快速通道（DNS server 拨号等本身要 v4）。
+    #[cfg(test)]
     pub async fn resolve_v4(&self, host: &str, port: u16) -> Result<SocketAddrV4> {
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
             return Ok(SocketAddrV4::new(ip, port));
         }
         let key = host.to_ascii_lowercase();
         match self.lookup_cache(&key, QTYPE_A) {
-            Some(Some(IpAddr::V4(v4))) => {
+            Some(Some(records)) => {
                 counter!(M_DNS_CACHE_HIT).increment(1);
-                return Ok(SocketAddrV4::new(v4, port));
-            }
-            Some(Some(IpAddr::V6(_))) => {
-                // 不应该发生：A 槽里只会塞 v4
-                counter!(M_DNS_CACHE_HIT).increment(1);
-                return Err(Error::DnsNoIpv4(host.to_owned()));
+                let v4 = records.iter().find_map(|ip| match ip {
+                    IpAddr::V4(v4) => Some(*v4),
+                    IpAddr::V6(_) => None,
+                });
+                return v4
+                    .map(|ip| SocketAddrV4::new(ip, port))
+                    .ok_or_else(|| Error::DnsNoIpv4(host.to_owned()));
             }
             Some(None) => {
                 counter!(M_DNS_NEGATIVE_CACHE_HIT).increment(1);
@@ -118,11 +125,14 @@ impl Resolver {
         }
         counter!(M_DNS_QUERY).increment(1);
         // singleflight：并发同一 host 的 A 查询合并
-        let ip = self.query_record_dedup(&key, QTYPE_A).await?;
-        let v4 = match ip {
-            IpAddr::V4(v) => v,
-            IpAddr::V6(_) => return Err(Error::DnsNoIpv4(host.to_owned())),
-        };
+        let records = self.query_record_dedup(&key, QTYPE_A).await?;
+        let v4 = records
+            .iter()
+            .find_map(|ip| match ip {
+                IpAddr::V4(v) => Some(*v),
+                IpAddr::V6(_) => None,
+            })
+            .ok_or_else(|| Error::DnsNoIpv4(host.to_owned()))?;
         Ok(SocketAddrV4::new(v4, port))
     }
 
@@ -144,7 +154,7 @@ impl Resolver {
         let cached_v6 = self.lookup_cache(&key, QTYPE_AAAA);
 
         // 两个槽都有缓存 entry（无论正负）→ 完全跳过查询
-        if let (Some(v4), Some(v6)) = (cached_v4, cached_v6) {
+        if let (Some(v4), Some(v6)) = (cached_v4.clone(), cached_v6.clone()) {
             counter!(M_DNS_CACHE_HIT).increment(1);
             if v4.is_none() && v6.is_none() {
                 counter!(M_DNS_NEGATIVE_CACHE_HIT).increment(1);
@@ -169,8 +179,8 @@ impl Resolver {
         };
         let (a_res, aaaa_res) = tokio::join!(v4_fut, v6_fut);
 
-        let v4 = a_res.ok().filter(|ip| matches!(ip, IpAddr::V4(_)));
-        let v6 = aaaa_res.ok().filter(|ip| matches!(ip, IpAddr::V6(_)));
+        let v4 = a_res.ok();
+        let v6 = aaaa_res.ok();
         merge_dual(v6, v4, port, host)
     }
 
@@ -178,34 +188,41 @@ impl Resolver {
     /// - `Some(Some(ip))`：正向缓存命中
     /// - `Some(None)`：负缓存命中（最近一次查询失败，未过期）
     /// - `None`：缓存中没有该 entry（或已过期被回收）
-    fn lookup_cache(&self, host: &str, qtype: u16) -> Option<Option<IpAddr>> {
+    fn lookup_cache(&self, host: &str, qtype: u16) -> Option<Option<RecordSet>> {
         let mut cache = self.cache.lock();
         let k = (host.to_owned(), qtype);
-        if let Some(e) = cache.get(&k).copied() {
+        if let Some(e) = cache.get(&k).cloned() {
             if e.expires > Instant::now() {
-                return Some(e.ip);
+                return Some(e.records);
             }
             cache.remove(&k);
         }
         None
     }
 
-    /// 写入缓存。`ip = None` 走 `negative_ttl`，`Some(_)` 走 `cache_ttl`。
-    fn store_cache(&self, host: String, qtype: u16, ip: Option<IpAddr>) {
-        let ttl = if ip.is_some() {
+    /// 写入缓存。`records = None` 走负 TTL；缓存有硬上限，随机域名不能无界占内存。
+    fn store_cache(&self, host: String, qtype: u16, records: Option<RecordSet>) {
+        let ttl = if records.is_some() {
             self.cache_ttl
         } else {
             self.negative_ttl
         };
         let mut cache = self.cache.lock();
-        if cache.len() > 1024 {
-            cache.clear();
+        let now = Instant::now();
+        let key = (host, qtype);
+        // 不在每次写入时 retain/min_by_key 全表扫描：随机域名攻击会把
+        // 其放大成 O(max_cache_entries) CPU。过期项在 lookup 时惰性删除；
+        // 达到硬上限后 O(1) 淘汰一个现有键。
+        if cache.len() >= self.max_cache_entries && !cache.contains_key(&key) {
+            if let Some(victim) = cache.keys().next().cloned() {
+                cache.remove(&victim);
+            }
         }
         cache.insert(
-            (host, qtype),
+            key,
             CacheEntry {
-                ip,
-                expires: Instant::now() + ttl,
+                records,
+                expires: now + ttl,
             },
         );
     }
@@ -226,7 +243,7 @@ impl Resolver {
     /// 关键：`watch::Ref` 借用了 channel 的 RwLock，是 `!Send`；跨 `.await` 持有
     /// 会让整个 future 变 `!Send` → `tokio::spawn` 失败编译。所以 waiter 路径在
     /// `wait_for().await` 拿到 guard 后**立刻**clone Arc + drop guard，再做后续匹配。
-    async fn query_record_dedup(&self, host: &str, qtype: u16) -> Result<IpAddr> {
+    async fn query_record_dedup(&self, host: &str, qtype: u16) -> Result<RecordSet> {
         let k = (host.to_owned(), qtype);
 
         // 角色 enum 定义为函数局部：依赖 watch 通道类型，无外部使用者。
@@ -266,7 +283,7 @@ impl Resolver {
                 };
                 match extracted {
                     Some(Some(arc)) => match arc.as_ref() {
-                        Ok(ip) => Ok(*ip),
+                        Ok(records) => Ok(records.clone()),
                         // leader 发布的是 Err 标记；用 neg_err 重建与 cache hit 路径
                         // 完全一致的 Error 变体（DnsNoIpv4 / Other("no AAAA …")），
                         // 不退化为 Error::Other(string)——保留对外错误变体语义。
@@ -299,10 +316,10 @@ impl Resolver {
 
                 let result = self.query_record(host, qtype).await;
                 // 写入缓存：成功 → 正向；任何失败 → 负缓存
-                self.store_cache(host.to_owned(), qtype, result.as_ref().ok().copied());
+                self.store_cache(host.to_owned(), qtype, result.as_ref().ok().cloned());
                 // 把可共享版本（Err 折叠为单位标记）广播给所有 waiter。
                 let shared: SingleflightResult = match &result {
-                    Ok(ip) => Ok(*ip),
+                    Ok(records) => Ok(records.clone()),
                     Err(_) => Err(()),
                 };
                 // send 失败仅当所有 Receiver 都 drop——in_flight map 还持有一份
@@ -316,8 +333,8 @@ impl Resolver {
         }
     }
 
-    /// 内部：查指定 qtype 的单条记录。
-    async fn query_record(&self, host: &str, qtype: u16) -> Result<IpAddr> {
+    /// 内部：查指定 qtype 的完整记录集。
+    async fn query_record(&self, host: &str, qtype: u16) -> Result<RecordSet> {
         #[cfg(test)]
         if let Some(m) = &self.mock {
             return m.query(host, qtype).await;
@@ -328,7 +345,7 @@ impl Resolver {
         }
     }
 
-    async fn resolve_system(&self, host: &str, qtype: u16) -> Result<IpAddr> {
+    async fn resolve_system(&self, host: &str, qtype: u16) -> Result<RecordSet> {
         // tokio::net::lookup_host 同时给 v4 + v6，按 qtype filter
         let host_port = format!("{host}:0");
         let fut = lookup_host(host_port);
@@ -342,12 +359,21 @@ impl Resolver {
                 counter!(M_DNS_QUERY_FAIL).increment(1);
                 Error::Io(e)
             })?;
+        let mut records = Vec::new();
         for sa in iter {
-            match (qtype, sa) {
-                (QTYPE_A, SocketAddr::V4(v4)) => return Ok(IpAddr::V4(*v4.ip())),
-                (QTYPE_AAAA, SocketAddr::V6(v6)) => return Ok(IpAddr::V6(*v6.ip())),
-                _ => continue,
+            let ip = match (qtype, sa) {
+                (QTYPE_A, SocketAddr::V4(v4)) => Some(IpAddr::V4(*v4.ip())),
+                (QTYPE_AAAA, SocketAddr::V6(v6)) => Some(IpAddr::V6(*v6.ip())),
+                _ => None,
+            };
+            if let Some(ip) = ip {
+                if !records.contains(&ip) {
+                    records.push(ip);
+                }
             }
+        }
+        if !records.is_empty() {
+            return Ok(Arc::new(records));
         }
         counter!(M_DNS_QUERY_FAIL).increment(1);
         Err(if qtype == QTYPE_A {
@@ -357,17 +383,16 @@ impl Resolver {
         })
     }
 
-    async fn resolve_tunnel(&self, host: &str, qtype: u16) -> Result<IpAddr> {
-        let query = build_dns_query(host, qtype);
+    async fn resolve_tunnel(&self, host: &str, qtype: u16) -> Result<RecordSet> {
         for server in &self.servers {
             let dest = match server {
                 SocketAddr::V4(v4) => SocketAddr::V4(*v4),
                 SocketAddr::V6(v6) => SocketAddr::V6(*v6),
             };
-            match self.query_one(&query, dest, qtype).await {
-                Ok(ip) => {
-                    debug!(host, %ip, %dest, qtype, "tunnel DNS resolved");
-                    return Ok(ip);
+            match self.query_one(host, dest, qtype).await {
+                Ok(records) => {
+                    debug!(host, count = records.len(), %dest, qtype, "tunnel DNS resolved");
+                    return Ok(records);
                 }
                 Err(e) => {
                     warn!(host, %dest, qtype, error = %e, "tunnel DNS failed, trying next");
@@ -382,13 +407,38 @@ impl Resolver {
         })
     }
 
-    async fn query_one(&self, query: &[u8], server: SocketAddr, qtype: u16) -> Result<IpAddr> {
+    async fn query_one(&self, host: &str, server: SocketAddr, qtype: u16) -> Result<RecordSet> {
         let tunnel = self.tunnel.as_ref().ok_or(Error::TunnelNotReady)?;
-        let sock = tunnel.bind_udp()?;
-        sock.send_to(query, server).await?;
+        let sock = if server.is_ipv6() {
+            tunnel
+                .bind_udp_v6()?
+                .ok_or_else(|| Error::other("DNS server is IPv6 but tunnel has no IPv6 route"))?
+        } else {
+            tunnel.bind_udp()?
+        };
+        let id = rand::random::<u16>();
+        let query = build_dns_query(host, qtype, id)?;
+        sock.send_to(&query, server).await?;
         let mut buf = vec![0u8; 1500];
-        let (n, _src) = sock.recv_from(&mut buf, self.timeout).await?;
-        parse_dns_answer(&buf[..n], qtype)
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::other(format!("DNS query to {server} timed out")));
+            }
+            let (n, src) = sock.recv_from(&mut buf, remaining).await?;
+            // 每次查询都有独立本地端口，但仍要忽略伪造/迟到的无关包，
+            // 避免攻击者用一个错误数据报立即中断正在进行的合法查询。
+            if src != server {
+                debug!(expected = %server, actual = %src, "ignoring DNS reply from unexpected source");
+                continue;
+            }
+            if n < 2 || u16::from_be_bytes([buf[0], buf[1]]) != id {
+                debug!(%server, "ignoring DNS reply with unexpected transaction ID");
+                continue;
+            }
+            return parse_dns_answers(&buf[..n], qtype, id).map(Arc::new);
+        }
     }
 }
 
@@ -403,17 +453,34 @@ fn neg_err(host: &str, qtype: u16) -> Error {
 
 /// 把缓存/查询结果合并为 happy-eyeballs 顺序：v6 在前 → v4 在后。
 fn merge_dual(
-    v6: Option<IpAddr>,
-    v4: Option<IpAddr>,
+    v6: Option<RecordSet>,
+    v4: Option<RecordSet>,
     port: u16,
     host: &str,
 ) -> Result<Vec<SocketAddr>> {
-    let mut out = Vec::with_capacity(2);
-    if let Some(IpAddr::V6(v6)) = v6 {
-        out.push(SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0)));
-    }
-    if let Some(IpAddr::V4(v4)) = v4 {
-        out.push(SocketAddr::V4(SocketAddrV4::new(v4, port)));
+    let v6 = v6.unwrap_or_else(|| Arc::new(Vec::new()));
+    let v4 = v4.unwrap_or_else(|| Arc::new(Vec::new()));
+    let mut out = Vec::with_capacity(v6.len() + v4.len());
+    let mut v6_iter = v6.iter().filter_map(|ip| match ip {
+        IpAddr::V6(ip) => Some(*ip),
+        IpAddr::V4(_) => None,
+    });
+    let mut v4_iter = v4.iter().filter_map(|ip| match ip {
+        IpAddr::V4(ip) => Some(*ip),
+        IpAddr::V6(_) => None,
+    });
+    loop {
+        let next_v6 = v6_iter.next();
+        let next_v4 = v4_iter.next();
+        if next_v6.is_none() && next_v4.is_none() {
+            break;
+        }
+        if let Some(ip) = next_v6 {
+            out.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
+        }
+        if let Some(ip) = next_v4 {
+            out.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
     }
     if out.is_empty() {
         return Err(Error::DnsNoIpv4(host.to_owned()));
@@ -424,38 +491,62 @@ fn merge_dual(
 
 // ── DNS wire format ─────────────────────────────────────────────────────────
 
-fn build_dns_query(host: &str, qtype: u16) -> Vec<u8> {
+fn build_dns_query(host: &str, qtype: u16, id: u16) -> Result<Vec<u8>> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || !host.is_ascii() {
+        return Err(Error::other("DNS host must be non-empty ASCII/punycode"));
+    }
     let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&0x1234u16.to_be_bytes()); // ID
+    buf.extend_from_slice(&id.to_be_bytes());
     buf.extend_from_slice(&0x0100u16.to_be_bytes()); // 标准查询 + 递归
     buf.extend_from_slice(&1u16.to_be_bytes()); // qd
     buf.extend_from_slice(&0u16.to_be_bytes()); // an
     buf.extend_from_slice(&0u16.to_be_bytes()); // ns
     buf.extend_from_slice(&0u16.to_be_bytes()); // ar
     for label in host.split('.') {
-        if label.is_empty() {
-            continue;
+        if label.is_empty() || label.len() > 63 {
+            return Err(Error::other(format!(
+                "invalid DNS label length in host {host:?}"
+            )));
         }
         let b = label.as_bytes();
-        let len = b.len().min(63) as u8;
-        buf.push(len);
-        buf.extend_from_slice(&b[..len as usize]);
+        buf.push(b.len() as u8);
+        buf.extend_from_slice(b);
+        if buf.len().saturating_sub(12) + 1 > 255 {
+            return Err(Error::other("DNS name exceeds 255 wire bytes"));
+        }
     }
     buf.push(0);
     buf.extend_from_slice(&qtype.to_be_bytes()); // qtype = A or AAAA
     buf.extend_from_slice(&1u16.to_be_bytes()); // IN
-    buf
+    Ok(buf)
 }
 
-fn parse_dns_answer(reply: &[u8], qtype: u16) -> Result<IpAddr> {
+fn parse_dns_answers(reply: &[u8], qtype: u16, expected_id: u16) -> Result<Vec<IpAddr>> {
     if reply.len() < 12 {
         return Err(Error::other("DNS reply too short"));
+    }
+    let id = u16::from_be_bytes([reply[0], reply[1]]);
+    if id != expected_id {
+        return Err(Error::other("DNS transaction ID mismatch"));
+    }
+    let flags = u16::from_be_bytes([reply[2], reply[3]]);
+    if flags & 0x8000 == 0 {
+        return Err(Error::other("DNS packet is not a response"));
+    }
+    if flags & 0x0200 != 0 {
+        return Err(Error::other("truncated DNS UDP response"));
+    }
+    let rcode = flags & 0x000f;
+    if rcode != 0 {
+        return Err(Error::other(format!("DNS response error rcode={rcode}")));
     }
     let qd = u16::from_be_bytes([reply[4], reply[5]]) as usize;
     let an = u16::from_be_bytes([reply[6], reply[7]]) as usize;
     if an == 0 {
         return Err(Error::other("DNS reply has no answer (NXDOMAIN or empty)"));
     }
+    let mut records = Vec::new();
     let mut off = 12;
     for _ in 0..qd {
         off = skip_name(reply, off)?;
@@ -465,38 +556,63 @@ fn parse_dns_answer(reply: &[u8], qtype: u16) -> Result<IpAddr> {
     }
     for _ in 0..an {
         off = skip_name(reply, off)?;
-        if off + 10 > reply.len() {
+        let header_end = off
+            .checked_add(10)
+            .ok_or_else(|| Error::other("DNS answer offset overflow"))?;
+        if header_end > reply.len() {
             return Err(Error::other("DNS answer truncated"));
         }
         let rtype = u16::from_be_bytes([reply[off], reply[off + 1]]);
+        let class = u16::from_be_bytes([reply[off + 2], reply[off + 3]]);
         let rdlen = u16::from_be_bytes([reply[off + 8], reply[off + 9]]) as usize;
-        off += 10;
-        if off + rdlen > reply.len() {
+        off = header_end;
+        let rdata_end = off
+            .checked_add(rdlen)
+            .ok_or_else(|| Error::other("DNS rdata offset overflow"))?;
+        if rdata_end > reply.len() {
             return Err(Error::other("DNS rdata truncated"));
         }
-        if rtype == qtype {
+        if class == 1 && rtype == qtype {
             match (qtype, rdlen) {
                 (QTYPE_A, 4) => {
-                    return Ok(IpAddr::V4(Ipv4Addr::new(
+                    let ip = IpAddr::V4(Ipv4Addr::new(
                         reply[off],
                         reply[off + 1],
                         reply[off + 2],
                         reply[off + 3],
-                    )));
+                    ));
+                    if !records.contains(&ip) {
+                        records.push(ip);
+                    }
                 }
                 (QTYPE_AAAA, 16) => {
                     let mut o = [0u8; 16];
                     o.copy_from_slice(&reply[off..off + 16]);
-                    return Ok(IpAddr::V6(Ipv6Addr::from(o)));
+                    let ip = IpAddr::V6(Ipv6Addr::from(o));
+                    if !records.contains(&ip) {
+                        records.push(ip);
+                    }
                 }
                 _ => {}
             }
         }
-        off += rdlen;
+        off = rdata_end;
     }
-    Err(Error::other(format!(
-        "DNS reply has no qtype={qtype} record"
-    )))
+    if records.is_empty() {
+        Err(Error::other(format!(
+            "DNS reply has no qtype={qtype} record"
+        )))
+    } else {
+        Ok(records)
+    }
+}
+
+#[cfg(test)]
+fn parse_dns_answer(reply: &[u8], qtype: u16) -> Result<IpAddr> {
+    parse_dns_answers(reply, qtype, 0x1234)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::other("DNS reply contains no usable answer"))
 }
 
 fn skip_name(buf: &[u8], mut off: usize) -> Result<usize> {
@@ -509,9 +625,20 @@ fn skip_name(buf: &[u8], mut off: usize) -> Result<usize> {
             return Ok(off + 1);
         }
         if b & 0xc0 == 0xc0 {
-            return Ok(off + 2);
+            let end = off
+                .checked_add(2)
+                .ok_or_else(|| Error::other("DNS compression pointer overflow"))?;
+            if end > buf.len() {
+                return Err(Error::other("DNS compression pointer truncated"));
+            }
+            return Ok(end);
         }
-        off += 1 + b as usize;
+        if b & 0xc0 != 0 {
+            return Err(Error::other("invalid DNS label tag"));
+        }
+        off = off
+            .checked_add(1 + b as usize)
+            .ok_or_else(|| Error::other("DNS name offset overflow"))?;
     }
 }
 
@@ -529,6 +656,7 @@ impl Resolver {
             timeout: Duration::from_secs(1),
             cache_ttl,
             negative_ttl,
+            max_cache_entries: 4096,
             tunnel: None,
             cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -542,13 +670,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    type MockAnswers = HashMap<(String, u16), std::result::Result<Vec<IpAddr>, String>>;
+
     /// 测试用 DNS backend：可记录调用次数、注入固定结果、延迟。
     pub(crate) struct MockBackend {
         pub call_count: AtomicUsize,
         pub delay: Duration,
         /// (host, qtype) → 结果。缺失则返回 NXDOMAIN 风格 Err。
-        pub answers:
-            parking_lot::Mutex<HashMap<(String, u16), std::result::Result<IpAddr, String>>>,
+        pub answers: parking_lot::Mutex<MockAnswers>,
     }
 
     impl MockBackend {
@@ -561,17 +690,25 @@ mod tests {
         }
 
         pub fn set(&self, host: &str, qtype: u16, ip: IpAddr) {
-            self.answers.lock().insert((host.to_owned(), qtype), Ok(ip));
+            self.answers
+                .lock()
+                .insert((host.to_owned(), qtype), Ok(vec![ip]));
         }
 
-        pub async fn query(&self, host: &str, qtype: u16) -> Result<IpAddr> {
+        pub fn set_many(&self, host: &str, qtype: u16, records: Vec<IpAddr>) {
+            self.answers
+                .lock()
+                .insert((host.to_owned(), qtype), Ok(records));
+        }
+
+        pub async fn query(&self, host: &str, qtype: u16) -> Result<RecordSet> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
             let ans = self.answers.lock().get(&(host.to_owned(), qtype)).cloned();
             match ans {
-                Some(Ok(ip)) => Ok(ip),
+                Some(Ok(records)) => Ok(Arc::new(records)),
                 Some(Err(msg)) => Err(Error::other(msg)),
                 None => Err(neg_err(host, qtype)),
             }
@@ -623,6 +760,39 @@ mod tests {
             calls >= 2,
             "expected at least 2 calls (A + AAAA), got {calls}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_dual_preserves_all_addresses_and_interleaves_families() {
+        let mock = MockBackend::new(Duration::ZERO);
+        let v4a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let v4b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let v6a = IpAddr::V6("2001:db8::1".parse().unwrap());
+        let v6b = IpAddr::V6("2001:db8::2".parse().unwrap());
+        mock.set_many("many.test", QTYPE_A, vec![v4a, v4b]);
+        mock.set_many("many.test", QTYPE_AAAA, vec![v6a, v6b]);
+        let resolver =
+            Resolver::new_for_test(Duration::from_secs(60), Duration::from_secs(5), mock);
+
+        let got = resolver.resolve_dual("many.test", 443).await.unwrap();
+        let got_ips: Vec<_> = got.into_iter().map(|addr| addr.ip()).collect();
+        assert_eq!(got_ips, vec![v6a, v4a, v6b, v4b]);
+    }
+
+    #[test]
+    fn dns_cache_has_a_hard_entry_limit() {
+        let mock = MockBackend::new(Duration::ZERO);
+        let mut resolver =
+            Resolver::new_for_test(Duration::from_secs(60), Duration::from_secs(5), mock);
+        resolver.max_cache_entries = 2;
+        for idx in 0..10 {
+            resolver.store_cache(
+                format!("{idx}.test"),
+                QTYPE_A,
+                Some(Arc::new(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, idx))])),
+            );
+        }
+        assert_eq!(resolver.cache.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -690,7 +860,7 @@ mod tests {
 
     #[test]
     fn build_a_query() {
-        let q = build_dns_query("example.com", QTYPE_A);
+        let q = build_dns_query("example.com", QTYPE_A, 0x1234).unwrap();
         assert_eq!(&q[0..2], &0x1234u16.to_be_bytes());
         // qtype = 0x0001 (A) 在末尾倒数 4 字节起
         let qtype_off = q.len() - 4;
@@ -699,9 +869,16 @@ mod tests {
 
     #[test]
     fn build_aaaa_query() {
-        let q = build_dns_query("example.com", QTYPE_AAAA);
+        let q = build_dns_query("example.com", QTYPE_AAAA, 0x1234).unwrap();
         let qtype_off = q.len() - 4;
         assert_eq!(&q[qtype_off..qtype_off + 2], &QTYPE_AAAA.to_be_bytes());
+    }
+
+    #[test]
+    fn build_query_rejects_malformed_names_instead_of_truncating() {
+        assert!(build_dns_query("bad..example", QTYPE_A, 1).is_err());
+        assert!(build_dns_query(&format!("{}.test", "x".repeat(64)), QTYPE_A, 1).is_err());
+        assert!(build_dns_query("例子.测试", QTYPE_A, 1).is_err());
     }
 
     #[test]

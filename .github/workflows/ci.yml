@@ -24,15 +24,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: rustfmt --edition 2021 --check src/main.rs tests/*.rs
 
-      # 当前代码尚有少量 dead-code 警告（未来 M2+ 接口）；
-      # 这里允许 warning，只在 error 时失败
+      - name: cargo fmt (vendored forks)
+        run: rustfmt --edition 2021 --check vendor/wireguard-netstack/src/netstack.rs vendor/warp-wireguard-gen/src/api.rs
+
       - name: cargo clippy
-        run: cargo clippy --all-targets --release -- -A dead_code
+        run: cargo clippy --all-targets --release --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
       - name: cargo build --release
         run: cargo build --release --locked

@@ -5,9 +5,11 @@
 
 use crate::config::MetricsConfig;
 use crate::error::{Error, Result};
-use axum::{routing::get, Router};
+use axum::{http::StatusCode, routing::get, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -42,21 +44,47 @@ pub const M_CONTAINER_OPEN_PROXY_WARN: &str = "warp_rust_container_open_proxy_wa
 // 单条 Prometheus 告警 `increase(warp_rust_open_proxy_allowed_total[5m]) > 0`
 // 即可监听全部高风险放行姿势。
 pub const M_OPEN_PROXY_ALLOWED: &str = "warp_rust_open_proxy_allowed_total";
+pub const M_DIAL_ATTEMPT: &str = "warp_rust_dial_attempt_total";
+pub const M_DIAL_FAILURE: &str = "warp_rust_dial_failure_total";
+pub const M_DIAL_TIMEOUT: &str = "warp_rust_dial_timeout_total";
+
+/// 在启动期最早安装 recorder，使配置安全校验和隧道初始化阶段
+/// 产生的 counter/gauge 不会在 HTTP 服务开始前丢失。
+pub fn install_recorder() -> Result<PrometheusHandle> {
+    PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| Error::other(format!("install prometheus recorder: {e}")))
+}
+
 /// 装配 Prometheus exporter，在 `cfg.bind` 上启动一个 axum 服务。正常停机时
 /// 返回 Ok(())。
-pub async fn serve(cfg: MetricsConfig, cancel: CancellationToken) -> Result<()> {
+pub async fn serve(
+    cfg: MetricsConfig,
+    cancel: CancellationToken,
+    healthy: Arc<AtomicBool>,
+    handle: PrometheusHandle,
+) -> Result<()> {
     if !cfg.enabled {
         info!("metrics disabled in config");
         return Ok(());
     }
 
-    let handle: PrometheusHandle = PrometheusBuilder::new()
-        .install_recorder()
-        .map_err(|e| Error::other(format!("install prometheus recorder: {e}")))?;
-
     let app = Router::new()
         .route("/metrics", get(move || render(handle.clone())))
-        .route("/healthz", get(|| async { "ok" }));
+        .route("/livez", get(|| async { "ok" }))
+        .route(
+            "/healthz",
+            get(move || {
+                let healthy = healthy.clone();
+                async move {
+                    if healthy.load(Ordering::Acquire) {
+                        (StatusCode::OK, "ok")
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "tunnel unhealthy")
+                    }
+                }
+            }),
+        );
 
     let addr: SocketAddr = cfg.bind;
     info!(%addr, "metrics endpoint listening");

@@ -7,14 +7,13 @@
 use crate::config::WarpConfig;
 use crate::error::{Error, Result};
 use crate::warp::persistence;
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use warp_wireguard_gen::{
-    get_config, register, update_license, RegistrationOptions, WarpCredentials,
-};
+use warp_wireguard_gen::{get_config, register, RegistrationOptions, WarpCredentials};
 use wireguard_netstack::WireGuardConfig;
 
 /// 持久化文件的形状
@@ -33,10 +32,20 @@ pub struct AccountSnapshot {
     pub credentials: WarpCredentials,
 }
 
+/// 尚未激活的账号候选。只有候选隧道完成 WireGuard 握手后，
+/// supervisor 才会持久化 `account_file` 并原子切换隧道。
+pub struct AccountCandidate {
+    pub wg_config: WireGuardConfig,
+    pub account_file: AccountFile,
+}
+
 pub struct AccountManager {
     cfg: WarpConfig,
     /// 锁定一切会改 `account.json` 或调 WARP API 的操作，确保注册冷却被严格遵守
     api_lock: Mutex<()>,
+    /// 内存中的最近重注册尝试。候选隧道握手失败时不会覆盖旧
+    /// account.json，因此单靠持久化时间戳会连续注册多个新账号。
+    last_register_attempt: ParkingMutex<Option<Instant>>,
 }
 
 impl AccountManager {
@@ -44,6 +53,7 @@ impl AccountManager {
         Self {
             cfg,
             api_lock: Mutex::new(()),
+            last_register_attempt: ParkingMutex::new(None),
         }
     }
 
@@ -77,11 +87,16 @@ impl AccountManager {
         }
 
         info!("no account.json found; registering with Cloudflare WARP");
-        self.register_inner().await
+        let candidate = self.register_candidate().await?;
+        persistence::save(&path, &candidate.account_file)?;
+        Ok(AccountSnapshot {
+            wg_config: candidate.wg_config,
+            credentials: candidate.account_file.credentials,
+        })
     }
 
-    /// 强制重新注册（会先校验注册冷却）。调用方需保证此前已经决定要丢弃旧 account.json。
-    pub async fn reregister(&self) -> Result<AccountSnapshot> {
+    /// 准备一个重注册候选（先校验注册冷却），但不覆盖现用账号。
+    pub async fn prepare_reregister(&self) -> Result<AccountCandidate> {
         let _guard = self.api_lock.lock().await;
         let path = self.account_path();
 
@@ -102,7 +117,22 @@ impl AccountManager {
             }
         }
 
-        self.register_inner().await
+        {
+            let mut last_attempt = self.last_register_attempt.lock();
+            if let Some(elapsed) = last_attempt.map(|last| last.elapsed()) {
+                if elapsed < self.cfg.register_cooldown {
+                    let remaining = self.cfg.register_cooldown - elapsed;
+                    return Err(Error::other(format!(
+                        "register cooldown active after recent attempt, {}s remaining",
+                        remaining.as_secs()
+                    )));
+                }
+            }
+            // 在网络调用之前记录：API 失败也必须受冷却限制。
+            *last_attempt = Some(Instant::now());
+        }
+
+        self.register_candidate().await
     }
 
     /// 单独刷新 WG 配置（被 supervisor 的周期定时器调用）。
@@ -114,7 +144,27 @@ impl AccountManager {
         Ok(wg_config)
     }
 
-    async fn register_inner(&self) -> Result<AccountSnapshot> {
+    /// 验证候选身份并拉取 WG 配置，但不覆盖当前 `account.json`。
+    pub async fn prepare_identity(&self, source: &Path) -> Result<AccountCandidate> {
+        let _guard = self.api_lock.lock().await;
+        let file = persistence::load::<AccountFile>(source)?.ok_or_else(|| {
+            Error::other(format!("identity file disappeared: {}", source.display()))
+        })?;
+        let mut wg_config = get_config(&file.credentials).await?;
+        self.apply_transport_tuning(&mut wg_config);
+        Ok(AccountCandidate {
+            wg_config,
+            account_file: file,
+        })
+    }
+
+    /// 候选隧道已经完成握手后，才调用此方法原子提交账号。
+    pub async fn commit_candidate(&self, file: &AccountFile) -> Result<()> {
+        let _guard = self.api_lock.lock().await;
+        persistence::save(&self.account_path(), file)
+    }
+
+    async fn register_candidate(&self) -> Result<AccountCandidate> {
         let options = RegistrationOptions {
             device_model: self.cfg.device_model.clone(),
             license_key: self.cfg.license_key.clone(),
@@ -131,29 +181,17 @@ impl AccountManager {
             "WARP registration ok"
         );
 
-        // 配了 license_key 时再单独绑一次（某些端点把 license 绑定放在注册之外的独立调用里）
-        if let Some(key) = &self.cfg.license_key {
-            if let Err(e) = update_license(&credentials, key).await {
-                warn!(error = %e, "update_license failed (continuing anyway)");
-            }
-        }
-
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        persistence::save(
-            &self.account_path(),
-            &AccountFile {
+        Ok(AccountCandidate {
+            wg_config,
+            account_file: AccountFile {
                 credentials: credentials.clone(),
                 registered_at: now,
             },
-        )?;
-
-        Ok(AccountSnapshot {
-            wg_config,
-            credentials,
         })
     }
 }
