@@ -3,6 +3,29 @@
 本项目的所有重要变更记录于此。版本遵循语义化版本（SemVer）。
 日期格式为 `YYYY-MM-DD`。
 
+## [0.4.4] - 2026-07-10
+
+### 修复
+
+- **修复 v0.4.3 引入的防火墙判断误报。** 端点全失败提示用 `contains("os error 1")` 判断是否 EPERM，会把 `os error 10/13/101/111`（网络不可达/权限拒绝/连接拒绝等）误判成防火墙拦截。改用精确 Display 文案 `"Operation not permitted"`，且要求**所有**尝试都是 EPERM 才提示；提示里直接用真实 peer IP 而非硬编码网段。加了回归测试。
+- **MTU 1280 之前根本没送达用户。** v0.4.2 只改了 Rust 代码默认值，但 `install.sh`、`config.toml.example`、`config.toml.docker.example`、README 仍写死 `mtu = 1420`，新装用户拿到的还是 1420。现已全部对齐 1280，并修正了原注释里“官方推荐 1280 + 重复计算外层 IP/UDP 开销”的技术错误（1280 = IPv6 最小 MTU 的保守值；Cloudflare 官方客户端约 1381；MTU 对 SYN 小包建连超时通常无效）。注：`--update` 保留旧配置，存量安装需手动改。
+
+### 加固 / 可诊断性
+
+- **终止 crash-loop。** systemd unit 增加 `StartLimitIntervalSec=300` + `StartLimitBurst=30`：配置类错误（端口被占/特权端口）会在几十秒内快速失败达上限后停下并进入 failed 状态，不再像之前那样静默重启上千次；慢速网络重试（每次 ~10s+）在窗口内凑不满，不会误停。
+- **SOCKS5 端口提前绑定。** 移到 WARP 账号 API 与 WireGuard 握手**之前**，端口冲突/权限问题在 <1s 内以可操作错误失败，不再每次重启都先跑注册 + 建联再失败。
+- **端口绑定错误可操作化。** `Address in use` → 提示用 `ss -tlnp` 定位占用者、改到 `>=1024` 空闲端口；`Permission denied` → 区分“<1024 特权端口(非 root 无 CAP_NET_BIND_SERVICE)”与“>=1024 却被 SELinux/AppArmor/沙箱拦截”。
+- **安装向导拒绝坏端口。** 选 <1024 特权端口直接拒绝并要求 >=1024；用 `ss` 预检端口占用，占用则提示换端口，避免装完才 crash-loop。
+- **健康探针不再隐藏选择性故障。** 之前 2/3 quorum 一达标就取消其余目标，会把“Google 全挂但 1.1.1.1/9.9.9.9 正常”判成健康且无痕。现在等所有目标完成，quorum 达标也会 `warn!` 记录失败目标，并新增按 target 标签的 `warp_rust_probe_target_failure_total` 指标。
+- **CI 现在实际运行 vendored fork 的测试**（`cargo test -p wireguard-netstack -p warp-wireguard-gen --lib`），把 wireguard-netstack 的 socket 泄漏回归测试纳入门禁。
+
+### 已确认但本版未做（诚实记录，后续跟进）
+
+- **端点只轮换端口、不轮换入口 IP**：`resolve_peer_endpoint` 只取 DNS 第一个 A 记录，2408/500/1701/4500 都在同一 IP 上尝试；单个 anycast IP 路由异常时无法逃逸，IPv6-only VPS 也不支持。需要把多个 A 记录/API IP 纳入候选。
+- **旧隧道代际资源滞留**：`Arc<ManagedTunnel>` 让旧隧道随长连接/UDP ASSOCIATE 存活，无代际上限/退休期；持续活动的连接可长期保留旧隧道后台任务。属逻辑滞留而非永久泄漏，需加代际上限。
+- **供应链完整性**：`install.sh` 镜像回退会同时下载二进制与 SHA256（镜像被控则一起替换）、`run-binary.sh` 不校验、Docker 关了 provenance。需引入独立签名（minisign/Sigstore/GitHub Attestations）。
+- 其它：WG TX 队列满时 1ms 重试抖动、隧道 DNS 无 TCP fallback、`--update` 启动失败无回滚、README 版本历史仅到 v0.4.1。
+
 ## [0.4.3] - 2026-07-10
 
 ### 修复 / 可诊断性

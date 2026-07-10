@@ -171,8 +171,21 @@ if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   while :; do
     read -r -p "  SOCKS5 监听端口 [1080]: " ans < /dev/tty || ans=""
     PORT="${ans:-1080}"
-    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] && break
-    warn "端口非法，请输入 1-65535"
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+      warn "端口非法，请输入 1-65535"; continue
+    fi
+    # 服务以非 root 用户运行且无 CAP_NET_BIND_SERVICE，<1024 特权端口必然
+    # 绑定失败（Permission denied），直接在向导层拦掉。
+    if [ "$PORT" -lt 1024 ]; then
+      warn "端口 $PORT < 1024 是特权端口，warp-rust 以非 root 运行绑不了；请用 >=1024（如 11080）"; continue
+    fi
+    # 端口已被占用（本机常见 V2bX/Xray 等）时提前提示，避免装完 crash-loop。
+    if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+      warn "端口 $PORT 已被占用；换一个空闲端口，或先停掉占用进程："
+      ss -tlnp "sport = :$PORT" 2>/dev/null | sed 's/^/    /'
+      continue
+    fi
+    break
   done
 
   while :; do
@@ -470,7 +483,7 @@ data_dir = "$DATA_DIR"
 device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
-mtu = 1420
+mtu = 1280
 tcp_buffer_size = 262144
 
 [health]
@@ -527,6 +540,13 @@ Description=warp-rust SOCKS5 proxy through Cloudflare WARP
 Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
+# 防 crash-loop 打爆机器：5 分钟内失败 >30 次就停下并进入 failed 状态，
+# 让运维看到明确错误（如端口被占/权限/防火墙）而不是无限静默重启上千次。
+# 进程内的隧道自愈由 supervisor 负责、不需要进程级重启；因此进程反复退出
+# 基本都是启动期配置/环境错误，停下来等人处理才是对的。慢速网络重试（每次
+# 约 10s+）在 300s 窗口内凑不满 30 次，不会误触发。
+StartLimitIntervalSec=300
+StartLimitBurst=30
 
 [Service]
 Type=simple

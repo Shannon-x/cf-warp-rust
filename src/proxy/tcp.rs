@@ -52,7 +52,46 @@ impl Drop for ActiveUdpAssociate {
     }
 }
 
+/// 绑定 SOCKS5 监听端口，并把最常见的两类部署事故翻译成可直接照做的错误。
+///
+/// 由 main 在 WARP 账号 API 调用与 WireGuard 握手**之前**调用：端口冲突/权限问题
+/// 能在 <1s 内失败，不必每次重启都先跑一遍注册 + 建联再失败。裸 `?` 只会抛
+/// "Address in use (os error 98)" / "Permission denied (os error 13)"，配合 systemd
+/// 重启会变成上千次根因不可见的静默 crash-loop。
+pub async fn bind_listener(bind: SocketAddr) -> Result<TcpListener> {
+    match TcpListener::bind(bind).await {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(Error::other(format!(
+            "SOCKS5 无法绑定 {bind}：端口已被占用。另一个进程正在监听该端口\
+             （本机若在跑 V2bX/Xray/sing-box 等代理，很可能就是它占用了 {port}）。\
+             排查：`ss -tlnp 'sport = :{port}'` 或 `lsof -iTCP:{port} -sTCP:LISTEN`。\
+             修复：把 config.toml 里 [server].bind 改到一个空闲且 >=1024 的端口\
+             （如 127.0.0.1:11080）再重启，或停掉占用该端口的进程。",
+            port = bind.port(),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // 端口 <1024 时几乎总是「非 root + 无 CAP_NET_BIND_SERVICE」；>=1024 仍
+            // PermissionDenied 时多为 SELinux/AppArmor/seccomp 或 systemd 沙箱限制。
+            let cause = if bind.port() < 1024 {
+                format!(
+                    "端口 {} < 1024 属特权端口，warp-rust 以非 root 用户运行、无 \
+                     CAP_NET_BIND_SERVICE，无权绑定。请把 [server].bind 改到 >=1024 的端口\
+                     （如 127.0.0.1:11080）。",
+                    bind.port()
+                )
+            } else {
+                "端口 >=1024 却仍被拒，通常是 SELinux/AppArmor/seccomp 或 systemd 沙箱\
+                 （如 RestrictAddressFamilies/IPAddressDeny）在拦截，请检查这些策略。"
+                    .to_string()
+            };
+            Err(Error::other(format!("SOCKS5 无法绑定 {bind}：权限不足。{cause}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn serve(
+    listener: TcpListener,
     cfg: ServerConfig,
     limits: LimitsConfig,
     resolver: Arc<Resolver>,
@@ -60,34 +99,6 @@ pub async fn serve(
     healthy: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    // 端口占用是最常见的部署事故（尤其在同机已跑 V2bX/Xray/sing-box/其它代理时）。
-    // 裸 `?` 只会抛出 "Address in use (os error 98)"，配合 systemd 无限重启会变成
-    // 上千次静默 crash-loop、根因完全不可见。这里给一条可直接照做的错误。
-    let listener = match TcpListener::bind(cfg.bind).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return Err(Error::other(format!(
-                "SOCKS5 无法绑定 {bind}：端口已被占用。另一个进程正在监听该端口\
-                 （本机若在跑 V2bX/Xray/sing-box 等代理，很可能就是它占用了 {port}）。\
-                 排查：`ss -tlnp 'sport = :{port}'` 或 `lsof -iTCP:{port} -sTCP:LISTEN`。\
-                 修复：把 config.toml 里 [server].bind 改到一个空闲且 >=1024 的端口\
-                 （如 127.0.0.1:11080）再重启，或停掉占用该端口的进程。",
-                bind = cfg.bind,
-                port = cfg.bind.port(),
-            )));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(Error::other(format!(
-                "SOCKS5 无法绑定 {bind}：权限不足。端口 {port} < 1024 属特权端口，\
-                 而 warp-rust 以非 root 的系统用户运行，无权绑定特权端口。\
-                 修复：把 config.toml 里 [server].bind 改到一个 >=1024 的端口\
-                 （如 127.0.0.1:11080）再重启。",
-                bind = cfg.bind,
-                port = cfg.bind.port(),
-            )));
-        }
-        Err(e) => return Err(e.into()),
-    };
     info!(
         addr = %cfg.bind,
         max_concurrent = limits.max_concurrent_connections,
@@ -802,6 +813,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AOrdering};
     use tokio::sync::Notify;
+
+    /// 端口已被占用时，bind_listener 必须回可操作错误（含"端口已被占用"），
+    /// 而不是裸的 "Address in use"。
+    #[tokio::test]
+    async fn bind_listener_reports_addr_in_use_actionably() {
+        let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+        let err = bind_listener(addr).await.expect_err("second bind must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("端口已被占用") && msg.contains("ss -tlnp"),
+            "错误应可操作，实际: {msg}"
+        );
+    }
+
+    /// 端口空闲时应成功绑定。
+    #[tokio::test]
+    async fn bind_listener_succeeds_on_free_port() {
+        assert!(bind_listener("127.0.0.1:0".parse().unwrap()).await.is_ok());
+    }
 
     #[tokio::test]
     async fn staggered_dial_tries_every_candidate_until_success() {

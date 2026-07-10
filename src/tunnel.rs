@@ -93,6 +93,29 @@ fn endpoint_ports(original_port: u16) -> Vec<u16> {
     ports
 }
 
+/// 当**所有** endpoint 尝试都失败且每一次都是 EPERM（内核对 sendto 返回
+/// "Operation not permitted"）时，返回一条本机防火墙放行提示；否则返回空串。
+///
+/// 关键：用精确 Display 文案 `"Operation not permitted"` 判断，而不是
+/// `contains("os error 1")`——后者会把 `os error 10/13/101/111`（网络不可达 /
+/// 权限拒绝 / 连接拒绝等）误判成 EPERM。提示里直接嵌真实 `peer_ip`，避免硬编码
+/// 可能过时的网段。
+fn firewall_hint(failures: &[String], peer_ip: std::net::IpAddr) -> String {
+    if !failures.is_empty()
+        && failures
+            .iter()
+            .all(|f| f.contains("Operation not permitted"))
+    {
+        format!(
+            " —— 所有尝试都是 EPERM，通常是本机防火墙(iptables/nftables OUTPUT)拦截了\
+             到 WARP endpoint {peer_ip} 的出站 UDP。请放行出站 UDP 到 {peer_ip} 的\
+             2408/500/1701/4500（例：`iptables -A OUTPUT -p udp -d {peer_ip} -j ACCEPT`）"
+        )
+    } else {
+        String::new()
+    }
+}
+
 impl Tunnel {
     /// 用一个已经建联完成的 `ManagedTunnel` 构造。
     pub fn from_managed(t: ManagedTunnel) -> Arc<Self> {
@@ -151,23 +174,10 @@ impl Tunnel {
             }
         }
 
-        // 全部端口都 `Operation not permitted`（EPERM）几乎总是本机防火墙
-        // （iptables/nftables OUTPUT REJECT）拦了到 WARP endpoint 的 UDP，而不是
-        // WARP 本身的问题。给一条能直接照做的放行提示。
-        let firewall_hint = if failures
-            .iter()
-            .any(|f| f.contains("Operation not permitted") || f.contains("os error 1"))
-        {
-            " —— 多为本机防火墙(iptables/nftables OUTPUT)拦截了到 WARP endpoint 的 UDP。\
-             请放行出站 UDP 到 162.159.192.0/24 与 188.114.96.0/24 的端口 2408/500/1701/4500\
-             （例：`iptables -A OUTPUT -p udp -d 162.159.192.0/24 -j ACCEPT`）"
-        } else {
-            ""
-        };
         Err(Error::other(format!(
             "all WARP WireGuard endpoint ports failed: {}{}",
             failures.join("; "),
-            firewall_hint
+            firewall_hint(&failures, cfg.peer_endpoint.ip())
         )))
     }
 
@@ -261,10 +271,54 @@ impl Tunnel {
 mod tests {
     use super::*;
 
+    use std::net::{IpAddr, Ipv4Addr};
+
     #[test]
     fn endpoint_fallback_keeps_api_port_first_without_duplicates() {
         assert_eq!(endpoint_ports(2408), vec![2408, 500, 1701, 4500]);
         assert_eq!(endpoint_ports(500), vec![500, 2408, 1701, 4500]);
         assert_eq!(endpoint_ports(12345), vec![12345, 2408, 500, 1701, 4500]);
+    }
+
+    fn ip() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(162, 159, 192, 1))
+    }
+
+    #[test]
+    fn firewall_hint_all_eperm_mentions_real_ip() {
+        let f = vec![
+            "udp/2408: Failed to create WireGuard tunnel: IO error: Operation not permitted (os error 1)".to_string(),
+            "udp/500: Failed to create WireGuard tunnel: IO error: Operation not permitted (os error 1)".to_string(),
+        ];
+        let h = firewall_hint(&f, ip());
+        assert!(h.contains("162.159.192.1"), "应嵌入真实 peer IP: {h}");
+        assert!(h.contains("iptables"));
+    }
+
+    /// 回归：`contains("os error 1")` 曾把 os error 10/13/101/111 误判成 EPERM。
+    #[test]
+    fn firewall_hint_not_triggered_by_other_errnos() {
+        for s in [
+            "udp/2408: Network is unreachable (os error 101)",
+            "udp/500: Connection refused (os error 111)",
+            "udp/1701: Permission denied (os error 13)",
+            "udp/4500: WireGuard handshake timeout",
+        ] {
+            assert!(
+                firewall_hint(&[s.to_string()], ip()).is_empty(),
+                "不应对该错误给出防火墙提示: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn firewall_hint_mixed_or_empty_is_blank() {
+        // 混合（一个 EPERM 一个超时）→ 不下结论
+        let mixed = vec![
+            "udp/2408: Operation not permitted (os error 1)".to_string(),
+            "udp/500: handshake timeout".to_string(),
+        ];
+        assert!(firewall_hint(&mixed, ip()).is_empty());
+        assert!(firewall_hint(&[], ip()).is_empty());
     }
 }

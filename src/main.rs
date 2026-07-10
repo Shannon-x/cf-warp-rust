@@ -72,6 +72,11 @@ async fn run(cli: Cli) -> Result<()> {
     let cancel = CancellationToken::new();
     signals::install(cancel.clone());
 
+    // 0. 先占好 SOCKS5 端口，再做任何昂贵操作。端口被占用/特权端口是最常见的
+    //    部署事故；提前绑定可让这类错误在 <1s 内以可操作信息失败，而不是每次
+    //    重启都先跑一遍 WARP 注册 API + WireGuard 握手再失败（既慢又刷账号）。
+    let socks_listener = proxy::bind_listener(cfg.server.bind).await?;
+
     // 1. 加载凭据；若未注册则向 Cloudflare 申请新身份
     let account = Arc::new(AccountManager::new(cfg.warp.clone()));
     let snapshot = account.load_or_register().await?;
@@ -120,6 +125,7 @@ async fn run(cli: Cli) -> Result<()> {
         (
             "SOCKS5",
             proxy::serve(
+                socks_listener,
                 server_cfg,
                 limits,
                 resolver,

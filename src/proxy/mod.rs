@@ -3,4 +3,4 @@
 pub mod tcp;
 pub mod udp;
 
-pub use tcp::serve;
+pub use tcp::{bind_listener, serve};

@@ -11,7 +11,7 @@
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
 - **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置变更检测（解析校验，不热应用）** — `config.toml` 改动会被监听并立即重新解析，TOML 语法错或字段错会马上在日志里报告；**但新配置不会自动应用到运行中的进程**，改完后需 `sudo systemctl restart warp-rust` 才生效。`systemd restart` 不会动 `data/account.json`，正在跑的 WARP 凭据/身份轮转状态都会保留。
-- **高并发内存平衡**：默认 MTU 1420、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；已建立连接和建连请求分别限流，坏线路下的客户端重试不会无界放大 socket buffer。
+- **高并发内存平衡**：默认 MTU 1280（IPv6 最小 MTU，最保守）、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；已建立连接和建连请求分别限流，坏线路下的客户端重试不会无界放大 socket buffer。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
 - **开放代理保护**（v0.1.1 + v0.3.2 收紧）：启动前校验，**拒绝**「非 loopback bind + 无 auth」组合启动。可通过 `WARP_RUST_ALLOW_OPEN_PROXY=1` 整体跳过校验（高风险）；**容器场景**还可通过 `WARP_RUST_TRUSTED_HOST_NET=1` 仅放行「容器内 0.0.0.0 + 宿主 `-p 127.0.0.1:...` 限定」这一窄场景。仓库 `scripts/run-docker.sh` / `docker-compose.yml` / `scripts/quickstart.sh` 已默认注入；**裸 `docker run -p 1080:1080 ghcr.io/...` 启动失败**（v0.3.2 BREAKING：必须显式 opt-in，杜绝意外把无鉴权 SOCKS5 挂到宿主 INADDR_ANY）。
 - **DNS 可选隧道隔离**（v0.1.1）：`[dns].mode = "tunnel"` 开启后，Domain ATYP 解析也走 WARP，不再向宿主 DNS 泄漏
@@ -322,7 +322,7 @@ cargo build --release
 | `[warp]` | `license_key` | WARP+ 订阅密钥，可选 |
 | `[warp]` | `refresh_interval` | 周期刷新 WireGuard 配置的间隔。默认 24h |
 | `[warp]` | `register_cooldown` | 两次重注册之间的最小间隔。默认 10m |
-| `[warp]` | `mtu` | WireGuard MTU。默认 1420；PMTU 不稳时可回退 1280 |
+| `[warp]` | `mtu` | WireGuard 隧道 MTU。默认 1280（IPv6 最小 MTU，最保守，wgcf 同）；确认路径 MTU 足够时可上调，范围 576..=1420 |
 | `[warp]` | `tcp_buffer_size` | smoltcp TCP 单向窗口。默认 262144；每连接约占 2 倍内存 |
 | `[limits]` | `max_concurrent_connections` / `max_pending_dials` | 总连接上限与建连阶段上限。默认 1024 / 128 |
 | `[limits]` | `relay_buffer_size` | SOCKS TCP 每方向 relay buffer。默认 65536 |

@@ -92,14 +92,16 @@ pub struct WarpConfig {
     pub refresh_interval: Duration,
     #[serde(with = "humantime_serde", default = "default_register_cooldown")]
     pub register_cooldown: Duration,
-    /// WireGuard 接口 MTU。**Cloudflare WARP 官方推荐 1280**。
+    /// WireGuard 隧道接口 MTU（隧道内层可承载的最大 IP 包）。
     ///
-    /// v0.4.2：默认从 1420 下调到 1280。1420 在很多 VPS/云网络（叠加了自身
-    /// 隧道封装、PPPoE 或 MTU<1500 的骨干）上会让满载的 WireGuard 数据包
-    /// （内层 ~1420 + 60 字节 WG 封装 + 28 IP/UDP ≈ 1508 > 1500）在路径上被丢弃：
-    /// 握手/SYN 等小包能过、隧道看似建成，但一旦承载真实数据就卡死。1280 给
-    /// 足够余量、与 WARP 官方 / wgcf / wireproxy 默认一致。带宽极好、确认路径
-    /// MTU=1500 的环境可手动调回 1420。
+    /// v0.4.2 起默认 **1280**——这是 IPv6 的最小 MTU，最保守：无论底层路径 MTU
+    /// 多小（VPS 常见自带隧道封装、PPPoE、GRE，实际路径 MTU 常 <1500），1280 的
+    /// 内层包加上 WireGuard 封装后（约 +60 字节，已含外层 IPv4+UDP 头）通常仍
+    /// ≤1340，不会因超过路径 MTU 而被丢或分片。wgcf 默认也是 1280。
+    ///
+    /// 说明（避免误导）：Cloudflare 官方客户端用更大的值（约 1381），带宽敏感
+    /// 且确认路径 MTU 足够（如物理机 1500）时可上调；范围 576..=1420。
+    /// 注意：MTU 只影响“满载大包/传输阶段”，对 SYN 这类小包的建连超时通常无效。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     /// smoltcp TCP socket 的单向 buffer 大小。实际每条 TCP 连接约占用 2 倍该值。

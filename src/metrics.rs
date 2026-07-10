@@ -20,6 +20,9 @@ pub const M_BYTES_UP: &str = "warp_rust_bytes_up_total";
 pub const M_BYTES_DOWN: &str = "warp_rust_bytes_down_total";
 pub const M_PROBE_OK: &str = "warp_rust_probe_success_total";
 pub const M_PROBE_FAIL: &str = "warp_rust_probe_failure_total";
+/// 单个探针目标失败计数（带 target 标签）。即使整轮 quorum 达标也会累计，
+/// 用于发现「某上游被选择性阻断而整体仍判健康」的情况。
+pub const M_PROBE_TARGET_FAIL: &str = "warp_rust_probe_target_failure_total";
 pub const M_TUNNEL_REBUILD: &str = "warp_rust_tunnel_rebuild_total";
 pub const M_REREGISTER: &str = "warp_rust_reregister_total";
 pub const M_ROTATE: &str = "warp_rust_rotate_identity_total";

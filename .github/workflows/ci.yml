@@ -35,5 +35,13 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets --locked
 
+      # 根包 `cargo test` 不会跑 [patch.crates-io] 指向的 vendored fork 的测试，
+      # 其中包含 wireguard-netstack 的 socket 泄漏回归测试，必须显式带上。
+      # 用 `--lib`：warp-rust 以 default-features=false 依赖该 fork（不启用
+      # config-file/doh），故其 doctest 里的 WgConfigFile/DohServerConfig 在本
+      # 构建上下文不存在、无法编译；`--lib` 只跑单元测试（含泄漏回归），跳过 doctest。
+      - name: cargo test (vendored forks)
+        run: cargo test -p wireguard-netstack -p warp-wireguard-gen --lib --locked
+
       - name: cargo build --release
         run: cargo build --release --locked

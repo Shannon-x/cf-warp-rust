@@ -28,9 +28,10 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 # 两次重注册之间的最小冷却（防风暴；Cloudflare 注册接口对源 IP 有限流）
 register_cooldown = "10m"
-# WireGuard 接口 MTU。默认 1420（标准 WireGuard / wireproxy 常用值）；
-# 若底层路径 PMTU 不足导致卡顿或丢包，可回退到 1280
-mtu = 1420
+# WireGuard 隧道 MTU。默认 1280（IPv6 最小 MTU，最保守，几乎任何底层路径都不会
+# 因超 MTU 被丢/分片；wgcf 默认亦为 1280）。带宽敏感且确认路径 MTU 足够（如物理机
+# 1500）时可上调，范围 576..=1420。注意 MTU 只影响大包/传输阶段，对 SYN 建连超时无效。
+mtu = 1280
 # smoltcp TCP socket 单向 buffer。实际每条 TCP 连接约占 2 × 该值。
 # 256KB 在常见 RTT 下兼顾单流吞吐与高并发内存；需要单流极限速度时再调大。
 tcp_buffer_size = 262144
