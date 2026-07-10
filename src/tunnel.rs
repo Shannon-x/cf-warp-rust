@@ -151,9 +151,23 @@ impl Tunnel {
             }
         }
 
+        // 全部端口都 `Operation not permitted`（EPERM）几乎总是本机防火墙
+        // （iptables/nftables OUTPUT REJECT）拦了到 WARP endpoint 的 UDP，而不是
+        // WARP 本身的问题。给一条能直接照做的放行提示。
+        let firewall_hint = if failures
+            .iter()
+            .any(|f| f.contains("Operation not permitted") || f.contains("os error 1"))
+        {
+            " —— 多为本机防火墙(iptables/nftables OUTPUT)拦截了到 WARP endpoint 的 UDP。\
+             请放行出站 UDP 到 162.159.192.0/24 与 188.114.96.0/24 的端口 2408/500/1701/4500\
+             （例：`iptables -A OUTPUT -p udp -d 162.159.192.0/24 -j ACCEPT`）"
+        } else {
+            ""
+        };
         Err(Error::other(format!(
-            "all WARP WireGuard endpoint ports failed: {}",
-            failures.join("; ")
+            "all WARP WireGuard endpoint ports failed: {}{}",
+            failures.join("; "),
+            firewall_hint
         )))
     }
 

@@ -60,7 +60,34 @@ pub async fn serve(
     healthy: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let listener = TcpListener::bind(cfg.bind).await?;
+    // 端口占用是最常见的部署事故（尤其在同机已跑 V2bX/Xray/sing-box/其它代理时）。
+    // 裸 `?` 只会抛出 "Address in use (os error 98)"，配合 systemd 无限重启会变成
+    // 上千次静默 crash-loop、根因完全不可见。这里给一条可直接照做的错误。
+    let listener = match TcpListener::bind(cfg.bind).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(Error::other(format!(
+                "SOCKS5 无法绑定 {bind}：端口已被占用。另一个进程正在监听该端口\
+                 （本机若在跑 V2bX/Xray/sing-box 等代理，很可能就是它占用了 {port}）。\
+                 排查：`ss -tlnp 'sport = :{port}'` 或 `lsof -iTCP:{port} -sTCP:LISTEN`。\
+                 修复：把 config.toml 里 [server].bind 改到一个空闲且 >=1024 的端口\
+                 （如 127.0.0.1:11080）再重启，或停掉占用该端口的进程。",
+                bind = cfg.bind,
+                port = cfg.bind.port(),
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(Error::other(format!(
+                "SOCKS5 无法绑定 {bind}：权限不足。端口 {port} < 1024 属特权端口，\
+                 而 warp-rust 以非 root 的系统用户运行，无权绑定特权端口。\
+                 修复：把 config.toml 里 [server].bind 改到一个 >=1024 的端口\
+                 （如 127.0.0.1:11080）再重启。",
+                bind = cfg.bind,
+                port = cfg.bind.port(),
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     info!(
         addr = %cfg.bind,
         max_concurrent = limits.max_concurrent_connections,
