@@ -6,7 +6,9 @@
 
 use crate::config::WarpConfig;
 use crate::error::{Error, Result};
+use crate::metrics::M_EFFECTIVE_MTU;
 use crate::warp::persistence;
+use metrics::gauge;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -64,6 +66,18 @@ impl AccountManager {
     fn apply_transport_tuning(&self, wg_config: &mut WireGuardConfig) {
         wg_config.mtu = Some(self.cfg.mtu);
         wg_config.tcp_buffer_size = Some(self.cfg.tcp_buffer_size);
+        // 所有拿到 WG 配置的路径（首次注册 / 加载已有凭据 / 定期 refresh）都收口
+        // 在这里，因此这是唯一能保证「生效 MTU 一定被暴露出来」的位置。
+        //
+        // v0.4.5 之前只有首次注册那条分支打印过 mtu，而绝大多数存量部署走的是
+        // 「已有 account.json」分支——升级之后完全无从确认自己到底跑在 1280 还是
+        // 遗留的 1420 上，"MTU 真正送达" 这个主张也就无法验证。
+        gauge!(M_EFFECTIVE_MTU).set(f64::from(self.cfg.mtu));
+        info!(
+            mtu = self.cfg.mtu,
+            tcp_buffer_size = self.cfg.tcp_buffer_size,
+            "effective tunnel transport tuning"
+        );
     }
 
     /// 已有持久化凭据时加载并向 Cloudflare 拉一份最新 WG 配置；否则发起一次全新注册。

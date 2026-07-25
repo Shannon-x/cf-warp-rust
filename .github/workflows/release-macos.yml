@@ -22,11 +22,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+
   build:
     name: build (aarch64-apple-darwin)
+    needs: verify
     runs-on: macos-latest    # GitHub 默认 macos-latest = Apple Silicon (M 系列)
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

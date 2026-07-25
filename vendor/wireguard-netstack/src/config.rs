@@ -70,7 +70,11 @@ impl WgConfigFile {
     /// Parse a WireGuard configuration file from the given path.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-            Error::ConfigParse(format!("Failed to read config file {:?}: {}", path.as_ref(), e))
+            Error::ConfigParse(format!(
+                "Failed to read config file {:?}: {}",
+                path.as_ref(),
+                e
+            ))
         })?;
         Self::parse(&content)
     }
@@ -134,7 +138,8 @@ impl WgConfigFile {
     /// Convert to WireGuardConfig, resolving the endpoint hostname via DoH if needed.
     /// Uses the default Cloudflare DNS for resolution.
     pub async fn into_wireguard_config(self) -> Result<WireGuardConfig> {
-        self.into_wireguard_config_with_dns(DohServerConfig::default()).await
+        self.into_wireguard_config_with_dns(DohServerConfig::default())
+            .await
     }
 
     /// Convert to WireGuardConfig, resolving the endpoint hostname via DoH with custom DNS.
@@ -155,24 +160,26 @@ impl WgConfigFile {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn into_wireguard_config_with_dns(self, dns_config: DohServerConfig) -> Result<WireGuardConfig> {
+    pub async fn into_wireguard_config_with_dns(
+        self,
+        dns_config: DohServerConfig,
+    ) -> Result<WireGuardConfig> {
         // First try to parse as IP:port, otherwise resolve via DoH
-        let peer_endpoint =
-            match format!("{}:{}", self.endpoint_host, self.endpoint_port).parse() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    // Resolve using DNS-over-HTTPS (direct mode, before tunnel is up)
-                    log::info!(
-                        "Resolving WireGuard endpoint '{}' via DoH ({})...",
-                        self.endpoint_host,
-                        dns_config.hostname
-                    );
-                    let doh_resolver = DohResolver::new_direct_with_config(dns_config);
-                    doh_resolver
-                        .resolve_addr(&self.endpoint_host, self.endpoint_port)
-                        .await?
-                }
-            };
+        let peer_endpoint = match format!("{}:{}", self.endpoint_host, self.endpoint_port).parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                // Resolve using DNS-over-HTTPS (direct mode, before tunnel is up)
+                log::info!(
+                    "Resolving WireGuard endpoint '{}' via DoH ({})...",
+                    self.endpoint_host,
+                    dns_config.hostname
+                );
+                let doh_resolver = DohResolver::new_direct_with_config(dns_config);
+                doh_resolver
+                    .resolve_addr(&self.endpoint_host, self.endpoint_port)
+                    .await?
+            }
+        };
 
         log::info!("WireGuard endpoint resolved to: {}", peer_endpoint);
 
@@ -180,6 +187,7 @@ impl WgConfigFile {
             private_key: self.private_key,
             peer_public_key: self.peer_public_key,
             peer_endpoint,
+            peer_endpoint_candidates: vec![peer_endpoint],
             tunnel_ip: self.address,
             tunnel_ipv6: None, // 通过 WgConfigFile 这条路径暂不解析 v6（v0.2.0 主要由 warp-wireguard-gen 设置）
             preshared_key: self.preshared_key,
@@ -195,9 +203,9 @@ fn decode_key(b64: &str) -> Result<[u8; 32]> {
     let bytes = STANDARD
         .decode(b64)
         .map_err(|_| Error::InvalidKey(b64.to_string()))?;
-    bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| Error::InvalidKey(format!("Key must be 32 bytes, got {} bytes", v.len())))
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        Error::InvalidKey(format!("Key must be 32 bytes, got {} bytes", v.len()))
+    })
 }
 
 /// Parse an endpoint string (host:port).

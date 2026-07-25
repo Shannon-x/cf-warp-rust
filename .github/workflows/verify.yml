@@ -1,0 +1,105 @@
+name: reusable-verify
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit or tag to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/wireguard-netstack/Cargo.toml --all -- --check
+          cargo fmt --manifest-path vendor/warp-wireguard-gen/Cargo.toml --all -- --check
+
+      # 注意：根包 warp-rust 没有 [workspace] members，`--workspace` 并不会把
+      # vendored fork 带进来（它们是 [patch.crates-io] 依赖）。而且主项目以
+      # default-features = false 依赖 wireguard-netstack，feature unification 之后
+      # config.rs / dns.rs 根本不参与编译。必须用 --manifest-path + --all-features
+      # 单独进 vendored 目录，否则这两个文件永远不会被 lint 或测试到。
+      - name: cargo clippy
+        run: |
+          cargo clippy --all-targets --release --locked -- -D warnings
+          cargo clippy --manifest-path vendor/wireguard-netstack/Cargo.toml \
+            --all-targets --all-features --locked -- -D warnings
+          cargo clippy --manifest-path vendor/warp-wireguard-gen/Cargo.toml \
+            --all-targets --all-features --locked -- -D warnings
+
+      # debug profile 跑测试：release 会关掉 debug_assertions 和 overflow-checks，
+      # 而这个项目大量处理分片偏移/长度算术，正是那两项最该兜住的地方。
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      # vendored fork 同样要全 feature，并且不加 --all-targets —— 那会跳过
+      # doctest，而 config.rs / dns.rs 的示例只有 doctest 覆盖。
+      - name: cargo test (vendored forks)
+        run: |
+          cargo test --manifest-path vendor/wireguard-netstack/Cargo.toml \
+            --all-features --locked
+          cargo test --manifest-path vendor/warp-wireguard-gen/Cargo.toml \
+            --all-features --locked
+
+      - name: shell checks
+        run: |
+          bash -n install.sh scripts/*.sh tests/shell/*.sh
+          shellcheck install.sh scripts/*.sh tests/shell/*.sh
+          for test_script in tests/shell/*.sh; do bash "$test_script"; done
+
+      - name: cargo build
+        run: cargo build --release --locked
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      # 与 Cargo.toml 的 rust-version 保持一致。stable job 不会发现「用了 1.91
+      # 之后才稳定的 API」这类回退，必须单独钉住版本编译一次。
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.91
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: assert declared rust-version matches this job
+        run: |
+          declared="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "warp-rust") | .rust_version')"
+          if [ "$declared" != "1.91" ]; then
+            echo "Cargo.toml rust-version=$declared but the MSRV job pins 1.91" >&2
+            exit 1
+          fi
+
+      - name: cargo check
+        run: |
+          cargo check --all-targets --locked
+          cargo check --manifest-path vendor/wireguard-netstack/Cargo.toml \
+            --all-features --locked
+          cargo check --manifest-path vendor/warp-wireguard-gen/Cargo.toml \
+            --all-features --locked

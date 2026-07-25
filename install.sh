@@ -334,6 +334,25 @@ verify_sha256() {
   fi
 }
 
+# 只读取现有配置 [warp] 段的 mtu，不输出其它字段（配置可能含 SOCKS 密码）。
+read_configured_warp_mtu() {
+  local file="$1"
+  awk '
+    /^[[:space:]]*\[warp\][[:space:]]*(#.*)?$/ { in_warp=1; next }
+    in_warp && /^[[:space:]]*\[/ { exit }
+    in_warp {
+      line=$0
+      sub(/#.*/, "", line)
+      if (line ~ /^[[:space:]]*mtu[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/) {
+        sub(/^[^=]*=/, "", line)
+        gsub(/[[:space:]]/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$file"
+}
+
 # ── 操作：status ────────────────────────────────────────────────────────────
 if [ "$ACTION" = "status" ]; then
   systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
@@ -404,6 +423,15 @@ EXTRACTED="$TMP/warp-rust-${VERSION}-${TARGET}"
 # ── 操作：update（仅替换二进制，不动配置/数据/服务文件）────────────────────
 if [ "$ACTION" = "update" ]; then
   [ -f "$SERVICE_FILE" ] || die "未检测到已安装的 warp-rust（找不到 $SERVICE_FILE）。请改用全新安装"
+
+  EXISTING_MTU=""
+  if [ -f "$CONF_FILE" ]; then
+    EXISTING_MTU="$(read_configured_warp_mtu "$CONF_FILE" || true)"
+  fi
+  if [ -n "$EXISTING_MTU" ] && [ "$EXISTING_MTU" != "1280" ]; then
+    warn "检测到现有配置 [warp].mtu = $EXISTING_MTU；v0.4.5+ 推荐 1280。"
+    warn "--update 会保留配置且不会自动改写。请评估后手动修改 $CONF_FILE 并重启服务。"
+  fi
 
   info "停止服务以替换二进制..."
   systemctl stop "$SERVICE_NAME"

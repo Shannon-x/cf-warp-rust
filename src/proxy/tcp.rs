@@ -84,7 +84,9 @@ pub async fn bind_listener(bind: SocketAddr) -> Result<TcpListener> {
                  （如 RestrictAddressFamilies/IPAddressDeny）在拦截，请检查这些策略。"
                     .to_string()
             };
-            Err(Error::other(format!("SOCKS5 无法绑定 {bind}：权限不足。{cause}")))
+            Err(Error::other(format!(
+                "SOCKS5 无法绑定 {bind}：权限不足。{cause}"
+            )))
         }
         Err(e) => Err(e.into()),
     }
@@ -820,7 +822,9 @@ mod tests {
     async fn bind_listener_reports_addr_in_use_actionably() {
         let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = held.local_addr().unwrap();
-        let err = bind_listener(addr).await.expect_err("second bind must fail");
+        let err = bind_listener(addr)
+            .await
+            .expect_err("second bind must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("端口已被占用") && msg.contains("ss -tlnp"),

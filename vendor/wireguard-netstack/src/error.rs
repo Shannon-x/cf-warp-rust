@@ -68,6 +68,31 @@ pub enum Error {
     #[error("TCP receive failed: {0}")]
     TcpRecv(String),
 
+    #[error("UDP send buffer full")]
+    UdpSendBufferFull,
+
+    #[error("UDP send timed out after {0:?} while waiting for buffer capacity")]
+    UdpSendTimeout(std::time::Duration),
+
+    #[error("UDP datagram too large for {family}: {size} bytes exceeds {max} byte limit")]
+    UdpPacketTooLarge {
+        family: &'static str,
+        size: usize,
+        max: usize,
+    },
+
+    #[error("UDP send failed: {0}")]
+    UdpSend(String),
+
+    #[error(
+        "UDP fragments could not be flushed within {0} poll rounds; \
+         datagram dropped instead of being truncated on the wire"
+    )]
+    UdpFragmentFlush(usize),
+
+    #[error("UDP receive failed: {0}")]
+    UdpRecv(String),
+
     #[error("Read timeout")]
     ReadTimeout,
 

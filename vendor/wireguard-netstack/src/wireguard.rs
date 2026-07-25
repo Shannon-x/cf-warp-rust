@@ -9,12 +9,12 @@ use gotatun::noise::{Tunn, TunnResult};
 use gotatun::packet::Packet;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use parking_lot::Mutex;
-use zerocopy::IntoBytes;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use zerocopy::IntoBytes;
 
 use crate::error::{Error, Result};
 use crate::netstack::{DEFAULT_MTU, DEFAULT_TCP_BUFFER_SIZE};
@@ -30,6 +30,9 @@ pub struct WireGuardConfig {
     pub peer_public_key: [u8; 32],
     /// Peer's endpoint (IP:port).
     pub peer_endpoint: SocketAddr,
+    /// Additional peer endpoints discovered from DNS/API. The active
+    /// `peer_endpoint` remains first priority; callers may try these on failure.
+    pub peer_endpoint_candidates: Vec<SocketAddr>,
     /// Our IPv4 address inside the tunnel.
     pub tunnel_ip: Ipv4Addr,
     /// Our IPv6 address inside the tunnel (v0.2.0：可选；Cloudflare WARP 双栈下会给）
@@ -87,8 +90,14 @@ impl WireGuardTunnel {
             Arc::new(RateLimiter::new(&peer_public_key, 0)),
         );
 
-        // Bind UDP socket to any available port
-        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        // Bind a socket matching the peer address family. An IPv4-bound UDP socket
+        // cannot send to an IPv6 WARP endpoint on all supported platforms.
+        let bind_addr = if config.peer_endpoint.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let udp_socket = UdpSocket::bind(bind_addr).await?;
 
         // Increase socket receive buffer to avoid packet loss
         let sock_ref = socket2::SockRef::from(&udp_socket);
@@ -101,10 +110,7 @@ impl WireGuardTunnel {
         log::info!("UDP recv buffer size: {:?}", sock_ref.recv_buffer_size());
         log::info!("UDP send buffer size: {:?}", sock_ref.send_buffer_size());
 
-        log::info!(
-            "WireGuard UDP socket bound to {}",
-            udp_socket.local_addr()?
-        );
+        log::info!("WireGuard UDP socket bound to {}", udp_socket.local_addr()?);
 
         // Create channels for packet communication
         // incoming: packets received from the tunnel (decrypted)
@@ -153,6 +159,11 @@ impl WireGuardTunnel {
     /// Get the sender for outgoing packets.
     pub fn outgoing_sender(&self) -> mpsc::Sender<BytesMut> {
         self.outgoing_tx.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn try_take_outgoing_packet(&self) -> Option<BytesMut> {
+        self.outgoing_rx.lock().await.try_recv().ok()
     }
 
     /// Get the receiver for incoming packets (takes ownership of the receiver).

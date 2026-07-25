@@ -28,7 +28,13 @@ env:
   IMAGE_NAME: shannon-x/cf-warp-rust
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ github.sha }}
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -132,9 +138,17 @@ jobs:
       - name: Create & push manifest list
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          mapfile -t tag_values < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args=()
+          for tag_value in "${tag_values[@]}"; do
+            tag_args+=("-t" "$tag_value")
+          done
+
+          digest_args=()
+          for digest_file in *; do
+            digest_args+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${digest_file}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
 
       - name: Inspect image
         run: |

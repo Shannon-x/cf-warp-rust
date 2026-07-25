@@ -81,7 +81,7 @@ data_dir = "./data"
 device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
-mtu = 1420
+mtu = 1280
 tcp_buffer_size = 262144
 
 [health]
