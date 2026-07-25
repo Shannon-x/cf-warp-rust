@@ -17,13 +17,14 @@
 
 use crate::dns::Resolver;
 use crate::error::{Error, Result};
-use crate::metrics::M_IDLE_TIMEOUT;
+use crate::metrics::{M_IDLE_TIMEOUT, M_UDP_CLIENT_RX_DROPPED};
 use crate::tunnel::{Tunnel, TunnelUdpHandle};
 use metrics::counter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -61,6 +62,29 @@ impl TunnelUdpPair {
     }
 }
 
+/// client→tunnel 转发队列深度。
+///
+/// 转发一个报文可能 await 很久：域名 ATYP 要走 DNS 解析，隧道 TX buffer 满时
+/// 还有最长 200ms 的有界回压等待。这段时间如果 recv 循环停下来，客户端报文就
+/// 堆在**内核** socket buffer 里被静默丢弃——没有指标、没有日志。把 recv 和
+/// forward 拆开之后，recv 永不阻塞，溢出发生在这个队列上并被计数。
+///
+/// 64 个槽在典型 UDP 报文（<1.5KiB）下约占 100KiB；配合 [`C2T_MAX_DATAGRAM`]
+/// 的入队上限，最坏驻留也被压在 ~512KiB，足以吸收突发又不至于让回压失去意义。
+const C2T_QUEUE_DEPTH: usize = 64;
+
+/// 入队前的报文长度上限（含 SOCKS5 UDP 头）。
+///
+/// netstack 侧的硬上限是 `UdpHandle::max_payload_for`：IPv4 受 smoltcp 出站
+/// fragmenter 缓冲限制为 8164 字节，IPv6 为 `MTU - 48`。超过它的报文在转发侧
+/// **必然**被 `UdpPacketTooLarge` 拒掉——如果放进队列，就是拿最多 64 × 64KiB
+/// ≈ 4.2MiB 的驻留内存去搬运一堆注定送不出去的数据，还会把真正能发的报文挤掉。
+/// 在入队处直接挡住，队列的最坏内存也因此从 ~4.2MiB 降到 ~512KiB。
+///
+/// 8KiB + 22（IPv6 ATYP 的最大 SOCKS5 头）向上取整，宁可略宽让转发侧给出精确的
+/// 家族相关错误，也不要在这里比 netstack 更严。
+const C2T_MAX_DATAGRAM: usize = 8 * 1024 + 64;
+
 pub async fn run_relay(
     relay_bind: UdpSocket,
     tunnel: Arc<Tunnel>,
@@ -73,14 +97,12 @@ pub async fn run_relay(
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let relay_bind = Arc::new(relay_bind);
     let activity = Arc::new(Notify::new());
+    let (c2t_tx, mut c2t_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(C2T_QUEUE_DEPTH);
 
-    // client → tunnel：按 dest family 选 v4/v6 socket
+    // client → tunnel（收取侧）：只做来源校验和入队，绝不 await 转发。
     let mut c2t = AbortOnDropHandle::new({
         let relay_bind = relay_bind.clone();
-        let pair = pair.clone();
         let client_addr = client_addr.clone();
-        let resolver = resolver.clone();
-        let activity = activity.clone();
         let parent = parent.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
@@ -104,7 +126,54 @@ pub async fn run_relay(
                         }
                         *known_client = Some(src);
                         drop(known_client);
-                        match forward_client_to_tunnel(&buf[..n], &pair, &resolver).await {
+                        // 超过 netstack 硬上限的报文在转发侧必然被拒，放进队列
+                        // 只会白占内存并挤掉能发的报文——在这里就挡掉。
+                        if n > C2T_MAX_DATAGRAM {
+                            counter!(M_UDP_CLIENT_RX_DROPPED, "reason" => "oversized")
+                                .increment(1);
+                            warn!(
+                                size = n,
+                                max = C2T_MAX_DATAGRAM,
+                                "dropping oversized SOCKS5 UDP datagram; tunnel cannot carry it"
+                            );
+                            continue;
+                        }
+                        match c2t_tx.try_send(buf[..n].to_vec()) {
+                            Ok(()) => {}
+                            // 过载时这里会高频命中，日志留在 debug 避免刷屏；
+                            // 上面的 counter 才是给运维看的信号。oversized 相反：
+                            // 它是客户端/配置问题，不该被 counter 淹没，所以用 warn。
+                            Err(TrySendError::Full(_)) => {
+                                counter!(M_UDP_CLIENT_RX_DROPPED, "reason" => "queue_full")
+                                    .increment(1);
+                                debug!(
+                                    depth = C2T_QUEUE_DEPTH,
+                                    "client→tunnel queue full; dropping datagram"
+                                );
+                            }
+                            Err(TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+            }
+        })
+    });
+
+    // client → tunnel（转发侧）：DNS 解析与隧道回压等待都发生在这里，与收取
+    // 侧解耦，因此再慢也不会让内核吞掉客户端报文。
+    let mut c2t_fwd = AbortOnDropHandle::new({
+        let pair = pair.clone();
+        let resolver = resolver.clone();
+        let activity = activity.clone();
+        let parent = parent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = parent.cancelled() => break,
+                    packet = c2t_rx.recv() => {
+                        let Some(packet) = packet else { break };
+                        match forward_client_to_tunnel(&packet, &pair, &resolver).await {
                             Ok(()) => activity.notify_one(),
                             Err(e) => warn!(error = %e, "client→tunnel forward failed"),
                         }
@@ -221,6 +290,13 @@ pub async fn run_relay(
                 parent.cancel();
                 break 2;
             }
+            result = &mut c2t_fwd => {
+                if let Err(e) = result {
+                    warn!(error = ?e, "client→tunnel forward task failed");
+                }
+                parent.cancel();
+                break 3;
+            }
             _ = activity.notified() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
@@ -240,6 +316,10 @@ pub async fn run_relay(
     if completed != 2 {
         t2c.abort();
         let _ = t2c.await;
+    }
+    if completed != 3 {
+        c2t_fwd.abort();
+        let _ = c2t_fwd.await;
     }
     Ok(())
 }

@@ -205,9 +205,7 @@ mod base64_serde {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(d)?;
-        let bytes = STANDARD
-            .decode(&s)
-            .map_err(serde::de::Error::custom)?;
+        let bytes = STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
         bytes
             .try_into()
             .map_err(|_| serde::de::Error::custom("invalid key length, expected 32 bytes"))
@@ -231,12 +229,10 @@ mod base64_opt_serde {
         let opt: Option<String> = Option::deserialize(d)?;
         match opt {
             Some(s) => {
-                let bytes = STANDARD
-                    .decode(&s)
-                    .map_err(serde::de::Error::custom)?;
-                let arr: [u8; 3] = bytes
-                    .try_into()
-                    .map_err(|_| serde::de::Error::custom("invalid client_id length, expected 3 bytes"))?;
+                let bytes = STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
+                let arr: [u8; 3] = bytes.try_into().map_err(|_| {
+                    serde::de::Error::custom("invalid client_id length, expected 3 bytes")
+                })?;
                 Ok(Some(arr))
             }
             None => Ok(None),

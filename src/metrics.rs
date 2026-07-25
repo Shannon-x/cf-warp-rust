@@ -24,9 +24,22 @@ pub const M_PROBE_FAIL: &str = "warp_rust_probe_failure_total";
 /// 用于发现「某上游被选择性阻断而整体仍判健康」的情况。
 pub const M_PROBE_TARGET_FAIL: &str = "warp_rust_probe_target_failure_total";
 pub const M_TUNNEL_REBUILD: &str = "warp_rust_tunnel_rebuild_total";
+/// 实际下发给 WireGuard 隧道的 MTU。让「配置到底生效没有」在运行期可验证，
+/// 而不是只能靠安装脚本那两行一闪而过的 warn。
+pub const M_EFFECTIVE_MTU: &str = "warp_rust_effective_mtu";
+pub const M_ACTIVE_TUNNEL_GENERATIONS: &str = "warp_rust_active_tunnel_generations";
+pub const M_TUNNEL_GENERATIONS_FORCED_RETIRE: &str =
+    "warp_rust_tunnel_generation_forced_retire_total";
 pub const M_REREGISTER: &str = "warp_rust_reregister_total";
 pub const M_ROTATE: &str = "warp_rust_rotate_identity_total";
 pub const M_UDP_ASSOCIATES_ACTIVE: &str = "warp_rust_udp_associates_active";
+/// client→tunnel 方向在入队前被丢弃的客户端报文数，带 `reason` label
+/// （`queue_full` / `oversized`）。
+///
+/// 这个指标存在的意义：转发侧（域名解析 + 隧道回压等待）可能 await 很久，
+/// 如果直接在 recv 循环里 await，丢包会发生在**内核** socket buffer 里——
+/// 完全不可观测。把丢包点搬到我们自己的有界队列后，回压才是可度量的。
+pub const M_UDP_CLIENT_RX_DROPPED: &str = "warp_rust_udp_client_rx_dropped_total";
 // v0.1.1：DoS 防护与 DNS 解析相关
 pub const M_CONNS_REJECTED: &str = "warp_rust_conns_rejected_total";
 pub const M_CONNS_REJECTED_UNHEALTHY: &str = "warp_rust_conns_rejected_tunnel_unhealthy_total";

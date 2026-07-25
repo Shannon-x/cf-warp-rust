@@ -27,12 +27,33 @@ doh = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 gotatun = "0.2"
 
 # 用户态 TCP/IP 栈。`socket-udp` 是本 fork 新增的；`proto-ipv6` v0.2.0 新增。
-smoltcp = { version = "0.12", default-features = false, features = [
+#
+# v0.4.5 分片相关的 feature 说明（不要凭名字猜语义）：
+# - `proto-ipv4-fragmentation`：同时打开 IPv4 出站分片和入站重组，是大 UDP
+#   报文能走通的前提。
+# - `fragmentation-buffer-size-8192`：**出站** fragmenter 的静态缓冲，直接决定
+#   `UdpHandle::max_payload_for` 的 IPv4 上限（8192 - 20 - 8 = 8164）。
+# - `reassembly-buffer-count-4`：并发**入站**重组槽位数。残包会占槽直到 60s
+#   超时，4 个是内存与突发容量的折中。
+# - `assembler-max-segment-count-16`：单个重组槽能容纳多少个「洞」。默认 4 对
+#   7 片报文的乱序到达没有余量；16 足够且每个 socket 只多几百字节。注意它同时
+#   作用于 TCP 乱序段重组，调大对 TCP 也是改善。
+# - 不配 `reassembly-buffer-size-*`：`std` 蕴含 `alloc`，此时
+#   `PacketAssembler::buffer` 是动态 `Vec<u8>`，该 feature 完全不参与编译，
+#   配上只会让人误以为入站有 8KiB 上限保护。
+# - 不配 `proto-ipv6-fragmentation`：smoltcp 0.13.1 里它只作用于 6LoWPAN
+#   (`sixlowpan.rs`)，在本项目的 `medium-ip` 路径下不提供任何 IPv6 分片或重组
+#   能力。出站 IPv6 超 MTU 由 `max_payload_for` 显式拒绝。
+smoltcp = { version = "0.13.1", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
+    "proto-ipv4-fragmentation",
     "proto-ipv6",
     "socket-tcp",
     "socket-udp",
+    "fragmentation-buffer-size-8192",
+    "reassembly-buffer-count-4",
+    "assembler-max-segment-count-16",
     "std",
     "log",
 ] }

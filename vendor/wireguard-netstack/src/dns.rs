@@ -73,7 +73,10 @@ impl DohServerConfig {
     pub fn adguard() -> Self {
         Self {
             hostname: "dns.adguard-dns.com".into(),
-            ips: vec![Ipv4Addr::new(94, 140, 14, 14), Ipv4Addr::new(94, 140, 15, 15)],
+            ips: vec![
+                Ipv4Addr::new(94, 140, 14, 14),
+                Ipv4Addr::new(94, 140, 15, 15),
+            ],
         }
     }
 
@@ -117,7 +120,10 @@ impl DnsConfig {
     }
 
     /// Create a DNS configuration with different servers for pre and post connection.
-    pub fn with_different_servers(pre_connection: DohServerConfig, post_connection: DohServerConfig) -> Self {
+    pub fn with_different_servers(
+        pre_connection: DohServerConfig,
+        post_connection: DohServerConfig,
+    ) -> Self {
         Self {
             pre_connection,
             post_connection,
@@ -326,9 +332,7 @@ impl DohResolver {
 
         // Connect and perform TLS handshake based on transport mode
         let response = match &self.transport {
-            Transport::Direct => {
-                self.query_direct(addr, &http_request, &dns_query).await?
-            }
+            Transport::Direct => self.query_direct(addr, &http_request, &dns_query).await?,
             Transport::Tunnel(netstack) => {
                 self.query_tunneled(netstack.clone(), addr, &http_request, &dns_query)
                     .await?
@@ -352,8 +356,9 @@ impl DohResolver {
         let tcp_stream = TcpStream::connect(addr).await?;
 
         // TLS handshake
-        let server_name = rustls::pki_types::ServerName::try_from(self.server_config.hostname.clone())
-            .map_err(|e| Error::TlsHandshake(format!("Invalid server name: {}", e)))?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(self.server_config.hostname.clone())
+                .map_err(|e| Error::TlsHandshake(format!("Invalid server name: {}", e)))?;
 
         log::debug!("Starting TLS handshake with DoH server {} (direct)", addr);
         let mut tls_stream = self
@@ -407,13 +412,11 @@ impl DohResolver {
         };
 
         // TLS handshake
-        let server_name = rustls::pki_types::ServerName::try_from(self.server_config.hostname.clone())
-            .map_err(|e| Error::TlsHandshake(format!("Invalid server name: {}", e)))?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(self.server_config.hostname.clone())
+                .map_err(|e| Error::TlsHandshake(format!("Invalid server name: {}", e)))?;
 
-        log::debug!(
-            "Starting TLS handshake with DoH server {} (tunneled)",
-            addr
-        );
+        log::debug!("Starting TLS handshake with DoH server {} (tunneled)", addr);
         let mut tls_stream = self
             .tls_connector
             .connect(server_name, tcp_stream)
@@ -540,8 +543,8 @@ fn parse_doh_response(response: &[u8], hostname: &str) -> Result<Vec<Ipv4Addr>> 
     }
 
     // Check HTTP status
-    let headers =
-        std::str::from_utf8(&response[..header_end]).map_err(|_| Error::InvalidHttpResponse("invalid headers".into()))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| Error::InvalidHttpResponse("invalid headers".into()))?;
 
     let status_line = headers.lines().next().unwrap_or("");
     if !status_line.contains("200") {
@@ -674,10 +677,7 @@ impl tokio::io::AsyncRead for TunnelTcpStream {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )));
+                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
                 }
             }
         }
@@ -713,10 +713,7 @@ impl tokio::io::AsyncWrite for TunnelTcpStream {
                     return std::task::Poll::Ready(Ok(n));
                 }
                 Err(e) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )));
+                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
                 }
             }
         }

@@ -7,9 +7,9 @@
 - **首次启动自动注册** Cloudflare WARP 账号；凭据持久化到 `data/account.json`（权限 0600）。后续重启复用同一身份，不会重复消耗注册配额。
 - **SOCKS5 CONNECT 与 UDP ASSOCIATE 同时支持。** UDP 报文走 WireGuard 隧道里的用户态 UDP socket，DNS、QUIC 等场景端到端可用，不是只能跑 TCP。
 - **用户态 WireGuard**，基于 [`wireguard-netstack`](https://crates.io/crates/wireguard-netstack)（本仓库在 `vendor/` 下做了 fork，新增 UDP 暴露）。**无需 `wg-quick`、无需 TUN 设备、无需 root**。
-- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。默认每 30 秒并发探测 3 个独立公网目标，2 个成功才判定出口健康；默认 WARP UDP 端口失败时自动回退 2408/500/1701/4500。
+- **带自愈的 supervisor**，四级恢复阶梯：重连 → 刷新配置 → 重新注册（带 10 分钟冷却防止 Cloudflare 限流）→ 轮转到 `data/identities/` 中的下一个身份。默认每 30 秒并发探测 3 个独立公网目标，2 个成功才判定出口健康；WARP 连接会保留全部 DNS A/AAAA 与 API 地址，并按 `(IP, port)` 在 2408/500/1701/4500 间有界故障转移。
 - **SIGTERM/SIGINT 优雅停机**，所有子任务响应 CancellationToken，WireGuard 后台任务正常 abort，无残留。
-- **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、隧道重建次数、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
+- **Prometheus 指标** 暴露在 `/metrics` 端点（默认 `127.0.0.1:9090`）：连接数、流量字节、探针成败、UDP 回压/丢包、隧道重建与活跃 generation、重注册次数、身份轮转次数、活跃 UDP ASSOCIATE 数。
 - **配置变更检测（解析校验，不热应用）** — `config.toml` 改动会被监听并立即重新解析，TOML 语法错或字段错会马上在日志里报告；**但新配置不会自动应用到运行中的进程**，改完后需 `sudo systemctl restart warp-rust` 才生效。`systemd restart` 不会动 `data/account.json`，正在跑的 WARP 凭据/身份轮转状态都会保留。
 - **高并发内存平衡**：默认 MTU 1280（IPv6 最小 MTU，最保守）、256KiB/方向 smoltcp TCP 窗口、64KiB/方向 SOCKS relay buffer；已建立连接和建连请求分别限流，坏线路下的客户端重试不会无界放大 socket buffer。
 - **DoS 防护**（v0.1.1）：内置最大并发上限、握手超时、idle 超时、鉴权失败延迟（防暴破），全部可在 `[limits]` 调
@@ -305,6 +305,8 @@ v0.3.2 起新增 `WARP_RUST_TRUSTED_HOST_NET=1`：声明「宿主已用 `-p 127.
 
 ## 手动编译
 
+需要 Rust 1.91 或更新版本。
+
 ```bash
 cp config.toml.example config.toml
 cargo build --release
@@ -472,7 +474,14 @@ curl -f http://127.0.0.1:9090/livez
 | `warp_rust_reregister_total` | counter | WARP 重注册数 |
 | `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
 | `warp_rust_udp_associates_active` | gauge | 当前活跃 UDP ASSOCIATE |
+| `warp_rust_udp_tx_buffer_full_total` | counter | 因 netstack UDP 发送缓冲满而进入等待/重试的**报文数**（每报文至多 +1；与下面两项同量纲，可直接算 `recovered / buffer_full` 恢复率） |
+| `warp_rust_udp_tx_recovered_total` | counter | UDP 发送缓冲满后在 200ms 窗口内恢复成功的报文数 |
+| `warp_rust_udp_tx_dropped_total{reason}` | counter | UDP 最终丢弃数；原因包括 `buffer_timeout`、`packet_too_large`、`send_error`、`generation_retired`、`fragment_flush` |
+| `warp_rust_udp_client_rx_dropped_total{reason}` | counter | client→tunnel 方向在入队前丢弃的客户端报文数。`queue_full`：转发队列积压（隧道回压或域名解析慢），持续非零说明上行速率超过隧道承载能力；`oversized`：报文超过隧道能携带的上限，转发侧必然拒绝，通常是客户端未遵守 MTU |
+| `warp_rust_effective_mtu` | gauge | 实际下发给 WireGuard 隧道的 MTU。升级后确认配置是否真的生效：`curl -s localhost:9090/metrics \| grep effective_mtu`，v0.4.5 起应为 1280 |
 | `warp_rust_netstack_sockets_active` | gauge | 当前 netstack 内 socket 数（TCP+UDP）。**内存健康核心指标**：稳态应贴合活跃连接数；若活跃连接平稳而此值单调上升，即为 socket 泄漏（v0.3.3 已修） |
+| `warp_rust_active_tunnel_generations` | gauge | 当前仍被新旧连接持有的完整隧道/netstack 代际数；热替换时可短暂大于 1 |
+| `warp_rust_tunnel_generation_forced_retire_total` | counter | drain deadline、绝对寿命或显式清理触发的旧 generation 强制退休次数 |
 | `warp_rust_dns_query_total` / `dns_cache_hit_total` | counter | DNS 查询 / 缓存命中 |
 | `warp_rust_wg_tx_backpressure_total` | counter | WG 出口通道满时触发回压重试次数 |
 | `warp_rust_wg_tx_dropped_total` | counter | WG 出口通道关闭时丢弃的包（异常预警） |
@@ -541,7 +550,10 @@ sudo journalctl -u warp-rust --since '5 min ago' | grep -E 'fallback UDP port|HA
 
 - **支持 IPv4 与 IPv6 出口（v0.2.0+）。** WARP 给的 `addresses.v6` 会被解析并配置到 netstack；SOCKS5 客户端给 IPv6 目标地址、或 SOCKS5 UDP ATYP=0x04，都能通过 WARP IPv6 出口访问。Domain ATYP 会保留完整 A/AAAA 集合并按 Happy Eyeballs 错峰尝试。
 - **`DOMAIN` 类型目标地址走宿主机 DNS。** 这样最快、与 `/etc/resolv.conf` 一致，但解析查询本身不走 WARP。如果宿主机上已经有别的 VPN 客户端劫持了 `cloudflare.com` 等常用域名（macOS 上的 1.1.1.1 客户端就会这样），请用 `curl --resolve` 或者直接传 IP 来验证；这是宿主机环境问题，不是代理本身的 bug。开启 `[dns].mode = "tunnel"` 后域名走隧道内 1.1.1.1:53。
-- **SOCKS5 BIND 不支持**，**UDP 分片不支持**：协议层留作后续版本增强。
+- **SOCKS5 BIND 与 SOCKS5 `FRAG != 0` 不支持。** 这指 SOCKS5 自身的应用层分片字段。隧道
+  netstack 已支持有界 IPv4 IP 分片/重组，IPv4 UDP payload 上限为 8164 bytes；smoltcp
+  尚不能发送 IPv6 分片，所以 IPv6 UDP payload 上限为 `MTU - 48`（默认 MTU 1280 时为
+  1232 bytes），超限会明确报错并计入 `packet_too_large`，不会静默丢包。
 - **许可证。** 本二进制链接了两个 GPL-3.0 crate（`warp-wireguard-gen` 与本地 fork 的 `wireguard-netstack`），因此最终二进制为 **GPL-3.0-or-later**。详见 `LICENSE` 与 [SECURITY.md](SECURITY.md)。
 
 ## 代码结构

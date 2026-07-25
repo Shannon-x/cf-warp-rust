@@ -32,7 +32,8 @@ use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer, State as TcpState};
 use smoltcp::socket::udp::{
-    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata,
+    SendError as UdpSendError, Socket as UdpSocket,
 };
 use smoltcp::socket::Socket;
 use smoltcp::time::Instant;
@@ -49,9 +50,10 @@ use tokio::sync::mpsc::error::TrySendError;
 
 /// MTU for the virtual interface.
 ///
-/// v0.3.0（warp-rust fork）：对齐 wireproxy / 标准 WireGuard 的 1420。
-/// 如果底层路径 PMTU 不足，用户仍可在 config 里 `[warp].mtu = 1280` 回退。
-pub const DEFAULT_MTU: usize = 1420;
+/// v0.4.5（warp-rust fork）：默认 1280，覆盖常见 VPS 叠加隧道/PPPoE 路径，
+/// 并与主程序、安装器、示例和全部启动脚本保持一致。确认 PMTU 足够时上层仍可
+/// 显式配置更大值。
+pub const DEFAULT_MTU: usize = 1280;
 
 /// Size of TCP socket buffers.
 ///
@@ -221,6 +223,51 @@ impl Device for VirtualDevice {
     }
 }
 
+/// 只唤醒状态真正就绪的对应 socket，避免全局 `notify_waiters` 导致 N 条连接在
+/// 每个包上同时抢一把 NetStack 锁（惊群）。
+///
+/// 任何在锁内推进过 `Interface::poll` 的地方都必须调用它——`NetStack::poll` 只在
+/// 自己那次 poll 返回非 `None` 时唤醒，如果别处已经把 ingress 消化掉了，poll loop
+/// 随后会拿到 `PollResult::None` 而静默跳过唤醒，读者要等到下一个包或 1 秒兜底
+/// 才会醒。
+fn notify_ready_sockets(
+    sockets: &SocketSet<'static>,
+    signals: &HashMap<SocketHandle, Arc<SocketSignals>>,
+) {
+    for (handle, socket) in sockets.iter() {
+        let Some(signal) = signals.get(&handle) else {
+            continue;
+        };
+        match socket {
+            Socket::Tcp(socket) => {
+                let state = socket.state();
+                if matches!(
+                    state,
+                    TcpState::Established | TcpState::Closed | TcpState::TimeWait
+                ) {
+                    signal.connect.notify_waiters();
+                }
+                if socket.can_recv() || !socket.may_recv() {
+                    signal.read.notify_waiters();
+                }
+                if socket.can_send() || !socket.may_send() {
+                    signal.write.notify_waiters();
+                }
+            }
+            Socket::Udp(socket) => {
+                if socket.can_recv() {
+                    signal.udp_read.notify_waiters();
+                }
+                if socket.can_send() {
+                    signal.udp_write.notify_waiters();
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
 /// Shared state for the network stack.
 struct NetStackInner {
     interface: Interface,
@@ -235,6 +282,7 @@ struct SocketSignals {
     read: tokio::sync::Notify,
     write: tokio::sync::Notify,
     udp_read: tokio::sync::Notify,
+    udp_write: tokio::sync::Notify,
 }
 
 /// A userspace TCP/IP network stack.
@@ -646,38 +694,8 @@ impl NetStack {
             let poll_result = interface.poll(timestamp, device, sockets);
             let processed = poll_result != PollResult::None;
 
-            // 只唤醒状态真正就绪的对应 socket，避免全局 notify_waiters 导致
-            // N 条连接在每个包上同时抢一把 NetStack 锁（惊群）。
             if processed {
-                for (handle, socket) in sockets.iter() {
-                    let Some(signal) = signals.get(&handle) else {
-                        continue;
-                    };
-                    match socket {
-                        Socket::Tcp(socket) => {
-                            let state = socket.state();
-                            if matches!(
-                                state,
-                                TcpState::Established | TcpState::Closed | TcpState::TimeWait
-                            ) {
-                                signal.connect.notify_waiters();
-                            }
-                            if socket.can_recv() || !socket.may_recv() {
-                                signal.read.notify_waiters();
-                            }
-                            if socket.can_send() || !socket.may_send() {
-                                signal.write.notify_waiters();
-                            }
-                        }
-                        Socket::Udp(socket) => {
-                            if socket.can_recv() {
-                                signal.udp_read.notify_waiters();
-                            }
-                        }
-                        #[allow(unreachable_patterns)]
-                        _ => {}
-                    }
-                }
+                notify_ready_sockets(sockets, signals);
             }
 
             // Drain transmitted packets and send through WireGuard
@@ -840,7 +858,8 @@ impl NetStack {
                 } else {
                     match interface.poll_at(now, sockets) {
                         Some(at) if at > now => {
-                            let ms = (at - now).total_millis().max(0) as u64;
+                            // `at > now` 已经保证差值为正，无需再 max(0)。
+                            let ms = (at - now).total_millis();
                             // 限制最长 1 秒，让 kick() 能定期把控制权拿回来
                             Duration::from_millis(ms.min(1000))
                         }
@@ -895,6 +914,7 @@ impl TcpConnection {
     ///   - 循环里 `Closed`/`TimeWait`/30s 超时的 `Err` 返回；
     ///   - 等待 socket signal 时被上层取消——happy-eyeballs 败者 future 被
     ///     `select!` drop、健康探针 `timeout()` 到期 drop 等。
+    ///
     /// `TcpConnection::Drop` 只在对象构造成功后才存在，救不了上述路径。
     ///
     /// 用一个栈上 RAII guard 兜底：未 disarm 时其 `Drop` 调 `remove_socket`。guard
@@ -1076,6 +1096,71 @@ impl Drop for TcpConnection {
 /// DNS/QUIC 流量同时不会让内存膨胀
 const UDP_PKT_SLOTS: usize = 32;
 const UDP_PAYLOAD_BYTES: usize = 1500 * UDP_PKT_SLOTS;
+/// 单个 association 等待 smoltcp UDP TX buffer 腾出空间的总时限。
+///
+/// 正常 poll loop 会在一次事件循环内排空 socket；200ms 给突发流量足够的回压
+/// 窗口，同时避免坏隧道让单个 SOCKS5 UDP association 无限卡住。
+const UDP_SEND_WAIT_TIMEOUT: Duration = Duration::from_millis(200);
+const IPV4_HEADER_BYTES: usize = 20;
+const IPV6_HEADER_BYTES: usize = 40;
+const UDP_HEADER_BYTES: usize = 8;
+/// 一个需要分片的报文最多允许占用多少轮 `Interface::poll` 把分片推完。
+///
+/// 8164 字节的上限在 MTU 1280 下最多 7 片，一次 `poll()` 通常能吐 2 片，32 轮
+/// 留了充足余量。真正跑满只可能是 device queue 被 WireGuard 侧长期打满。
+const MAX_FRAGMENT_FLUSH_ROUNDS: usize = 32;
+
+/// 把一个刚入队的、需要 IP 分片的报文的**全部**分片推进 device queue。
+///
+/// 必须在 `NetStackInner` 的同一个临界区内完成：smoltcp 的 `Fragmenter` 是每个
+/// `Interface` **唯一一份**（`iface::fragmentation::Fragmenter`），而 `dispatch_ip`
+/// 在开始一个新的分片序列时会无条件覆写 `packet_len / sent_bytes / buffer`，
+/// 没有任何 in-flight 保护。一旦在分片途中释放锁，另一个大报文就能通过
+/// `socket_egress` 抢先进入 `dispatch_ip` 并把前一个报文的剩余分片彻底冲掉——
+/// 线路上只留下没有末片的半截数据，对端占着重组槽直到超时，而两次
+/// `send_slice` 都返回了 `Ok(())`。
+///
+/// 收敛判据用「末片出现」（`more_frags == 0 && frag_offset > 0`）；这是精确的，
+/// 不受其它 socket 的出站包干扰。`poll_at` 兜住「实际没触发分片」的边界情况：
+/// 它在 fragmenter 非空时优先返回 `Instant::from_millis(0)`，所以只要它不再
+/// 返回 0，fragmenter 一定是空的。
+///
+/// 降级行为：真的跑满 `MAX_FRAGMENT_FLUSH_ROUNDS`（意味着 device queue 被
+/// WireGuard 出口长期打满）时返回错误让调用方计数并丢弃。此时已经吐出的前几片
+/// 仍会随 poll loop 发出去，对端会因重组超时把它们丢掉——这里刻意不去
+/// `truncate` tx_queue，因为那几轮 poll 里同时可能产生其它 socket 的正常报文，
+/// 误删它们的代价比让对端超时更高。
+fn flush_pending_fragments(
+    interface: &mut Interface,
+    device: &mut VirtualDevice,
+    sockets: &mut SocketSet<'static>,
+    signals: &HashMap<SocketHandle, Arc<SocketSignals>>,
+) -> Result<()> {
+    let start = device.tx_queue.len();
+    for _ in 0..MAX_FRAGMENT_FLUSH_ROUNDS {
+        let timestamp = Instant::now();
+        if interface.poll(timestamp, device, sockets) != PollResult::None {
+            // 这几轮 poll 也会消化 ingress；不在这里唤醒的话，poll loop 之后会
+            // 拿到 PollResult::None 而跳过唤醒，读者被无谓地拖到下一次事件。
+            notify_ready_sockets(sockets, signals);
+        }
+
+        let flushed = device.tx_queue.iter().skip(start).any(|bytes| {
+            Ipv4Packet::new_checked(bytes.as_ref())
+                .map(|packet| !packet.more_frags() && packet.frag_offset() > 0)
+                .unwrap_or(false)
+        });
+        if flushed {
+            return Ok(());
+        }
+        // 报文最终没有触发分片（例如长度恰好等于单片容量）时不会有末片，
+        // 此时 fragmenter 本来就是空的，poll_at 会给出确定的收敛信号。
+        if interface.poll_at(timestamp, sockets) != Some(Instant::from_millis(0)) {
+            return Ok(());
+        }
+    }
+    Err(Error::UdpFragmentFlush(MAX_FRAGMENT_FLUSH_ROUNDS))
+}
 
 impl NetStack {
     /// 创建一个绑定到 `(tunnel_ip, local_port)` 的 UDP socket。传 `0` 让实现
@@ -1195,11 +1280,30 @@ impl NetStack {
                 )
             }
         };
+        // smoltcp 只对 IPv4 做出站分片；判据与 `dispatch_ip` 里的
+        // `total_ip_len > mtu` 保持一致。
+        let needs_fragmentation = dest.is_ipv4()
+            && payload.len() + IPV4_HEADER_BYTES + UDP_HEADER_BYTES > self.wg_tunnel.mtu() as usize;
+
         let mut inner = self.inner.lock();
-        let socket = inner.sockets.get_mut::<UdpSocket>(handle);
-        socket
-            .send_slice(payload, endpoint)
-            .map_err(|e| Error::TcpSend(format!("UDP send: {}", e)))?;
+        let NetStackInner {
+            ref mut interface,
+            ref mut device,
+            ref mut sockets,
+            ref signals,
+        } = *inner;
+        let socket = sockets.get_mut::<UdpSocket>(handle);
+        match socket.send_slice(payload, endpoint) {
+            Ok(()) => {}
+            Err(UdpSendError::BufferFull) => return Err(Error::UdpSendBufferFull),
+            Err(UdpSendError::Unaddressable) => {
+                return Err(Error::UdpSend(format!("unaddressable destination {dest}")))
+            }
+        }
+
+        if needs_fragmentation {
+            flush_pending_fragments(interface, device, sockets, signals)?;
+        }
         Ok(())
     }
 
@@ -1217,7 +1321,7 @@ impl NetStack {
         }
         let (n, meta) = socket
             .recv_slice(buf)
-            .map_err(|e| Error::TcpRecv(format!("UDP recv: {}", e)))?;
+            .map_err(|e| Error::UdpRecv(e.to_string()))?;
         let src = match meta.endpoint.addr {
             IpAddress::Ipv4(a) => SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(a.octets()[0], a.octets()[1], a.octets()[2], a.octets()[3]),
@@ -1257,12 +1361,92 @@ impl UdpHandle {
         self.local_port
     }
 
-    /// 发送一个数据报，并主动 poll 一次让 WireGuard 立即把它转出去
-    /// v0.2.0：接受 SocketAddr（v4/v6 都可）
+    fn max_payload_for(&self, dest: SocketAddr) -> usize {
+        let mtu = self.netstack.wg_tunnel.mtu() as usize;
+        match dest {
+            // IPv4 可由 smoltcp 分片；显式受 8KiB fragmenter 限制，避免超限时
+            // smoltcp 只写 debug 后静默返回 Ok。
+            SocketAddr::V4(_) => smoltcp::config::FRAGMENTATION_BUFFER_SIZE
+                .saturating_sub(IPV4_HEADER_BYTES + UDP_HEADER_BYTES),
+            // smoltcp 0.13 不做 IPv6 出站分片，因此必须限制为一枚内层 IPv6 包。
+            SocketAddr::V6(_) => mtu.saturating_sub(IPV6_HEADER_BYTES + UDP_HEADER_BYTES),
+        }
+    }
+
+    /// 发送一个数据报。TX buffer 满时等待本 socket 的可写通知并有限重试；
+    /// 只有总 deadline 到期才向调用方报告丢包。
     pub async fn send_to(&self, payload: &[u8], dest: SocketAddr) -> Result<()> {
-        self.netstack.udp_send_to(self.handle, payload, dest)?;
-        self.netstack.kick();
-        Ok(())
+        let max = self.max_payload_for(dest);
+        if payload.len() > max {
+            metrics::counter!(
+                "warp_rust_udp_tx_dropped_total",
+                "reason" => "packet_too_large"
+            )
+            .increment(1);
+            return Err(Error::UdpPacketTooLarge {
+                family: if dest.is_ipv4() { "ipv4" } else { "ipv6" },
+                size: payload.len(),
+                max,
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + UDP_SEND_WAIT_TIMEOUT;
+        let mut was_full = false;
+        loop {
+            // 先注册通知再检查状态，避免 poll loop 恰好在 BufferFull 判断和
+            // await 之间腾出空间而产生 lost wakeup。
+            let notified = self.signals.udp_write.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match self.netstack.udp_send_to(self.handle, payload, dest) {
+                Ok(()) => {
+                    self.netstack.kick();
+                    if was_full {
+                        metrics::counter!("warp_rust_udp_tx_recovered_total").increment(1);
+                    }
+                    return Ok(());
+                }
+                Err(Error::UdpSendBufferFull) => {
+                    // 每个**报文**只记一次，而不是每次重试都记：recovered 和
+                    // dropped 都是按报文计数的，三者同量纲后
+                    // `recovered / buffer_full` 才是可用的恢复率 SLI。
+                    if !was_full {
+                        was_full = true;
+                        metrics::counter!("warp_rust_udp_tx_buffer_full_total").increment(1);
+                    }
+                    self.netstack.kick();
+                }
+                Err(e) => {
+                    // 分片 flush 失败单独归因：它意味着 WireGuard 出口长期打满，
+                    // 与「目标不可寻址」这类 send_error 是完全不同的运维信号。
+                    let reason = if matches!(e, Error::UdpFragmentFlush(_)) {
+                        "fragment_flush"
+                    } else {
+                        "send_error"
+                    };
+                    metrics::counter!("warp_rust_udp_tx_dropped_total", "reason" => reason)
+                        .increment(1);
+                    return Err(e);
+                }
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                metrics::counter!(
+                    "warp_rust_udp_tx_dropped_total",
+                    "reason" => "buffer_timeout"
+                )
+                .increment(1);
+                return Err(Error::UdpSendTimeout(UDP_SEND_WAIT_TIMEOUT));
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    // 下一轮再尝试一次；若空间已经腾出则成功，否则按 deadline 丢弃。
+                }
+            }
+        }
     }
 
     /// 接收一个数据报。最多等待 `timeout`；超时返回 `Err(ReadTimeout)`。
@@ -1318,15 +1502,19 @@ mod connect_leak_tests {
     //! 断言无残留。
     use super::*;
     use crate::wireguard::{WireGuardConfig, WireGuardTunnel};
-    use std::net::Ipv4Addr;
+    use smoltcp::wire::Ipv6Packet;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
-    async fn test_netstack() -> Arc<NetStack> {
+    async fn test_netstack_and_tunnel(
+        tunnel_ipv6: Option<Ipv6Addr>,
+    ) -> (Arc<NetStack>, Arc<WireGuardTunnel>) {
         let config = WireGuardConfig {
             private_key: [7u8; 32],
             peer_public_key: [9u8; 32],
             peer_endpoint: "127.0.0.1:51820".parse().unwrap(),
+            peer_endpoint_candidates: vec!["127.0.0.1:51820".parse().unwrap()],
             tunnel_ip: Ipv4Addr::new(10, 0, 0, 2),
-            tunnel_ipv6: None, // 关键：无 v6 出口
+            tunnel_ipv6,
             preshared_key: None,
             keepalive_seconds: None,
             mtu: Some(1280),
@@ -1335,7 +1523,15 @@ mod connect_leak_tests {
         let wg = WireGuardTunnel::new(config)
             .await
             .expect("construct wg tunnel for test");
-        NetStack::new(wg)
+        (NetStack::new(wg.clone()), wg)
+    }
+
+    async fn test_netstack_with_v6(tunnel_ipv6: Option<Ipv6Addr>) -> Arc<NetStack> {
+        test_netstack_and_tunnel(tunnel_ipv6).await.0
+    }
+
+    async fn test_netstack() -> Arc<NetStack> {
+        test_netstack_with_v6(None).await
     }
 
     /// 路径 A：向无 v6 隧道拨 v6 目标 → `netstack.connect` 经 `?` 返回
@@ -1391,6 +1587,230 @@ mod connect_leak_tests {
             assert_eq!(ns.socket_count(), 1);
         }
         assert_eq!(ns.socket_count(), 0, "UdpHandle::Drop 必须移除 socket");
+    }
+
+    #[tokio::test]
+    async fn udp_payload_boundaries_are_explicit_for_ipv4_and_ipv6() {
+        let (ns, wg) = test_netstack_and_tunnel(Some("fd00::2".parse().unwrap())).await;
+        let v4 = ns.create_udp_socket(0).expect("bind v4 udp");
+        let v6 = ns.create_udp_socket_with(0, true).expect("bind v6 udp");
+        let dst_v4 = SocketAddr::new("1.1.1.1".parse().unwrap(), v4.local_port());
+        let dst_v6: SocketAddr = "[2606:4700:4700::1111]:53".parse().unwrap();
+
+        assert_eq!(v4.max_payload_for(dst_v4), 8192 - 20 - 8);
+        assert_eq!(v6.max_payload_for(dst_v6), 1280 - 40 - 8);
+
+        for size in [1232usize, 1252, 1500, 4096] {
+            v4.send_to(&vec![0u8; size], dst_v4)
+                .await
+                .unwrap_or_else(|e| panic!("IPv4 payload {size} should be accepted: {e}"));
+            // 推进 interface 并直接检查送入 WireGuard 的内层 IP 包：大包必须
+            // 真正产出连续 fragments，而不是 send_to 返回成功后静默消失。
+            for _ in 0..8 {
+                ns.poll();
+            }
+            let mut emitted = Vec::new();
+            while let Some(packet) = wg.try_take_outgoing_packet().await {
+                emitted.push(packet);
+            }
+            assert!(!emitted.is_empty(), "IPv4 payload {size} was silently lost");
+            assert_eq!(
+                emitted.len() > 1,
+                size > 1252,
+                "unexpected fragmentation count for payload {size}: {}",
+                emitted.len()
+            );
+            let mut next_offset = 0usize;
+            for (index, bytes) in emitted.iter().enumerate() {
+                let packet = Ipv4Packet::new_checked(bytes.as_ref()).expect("valid IPv4 fragment");
+                assert_eq!(packet.frag_offset() as usize, next_offset);
+                next_offset += packet.payload().len();
+                assert_eq!(
+                    packet.more_frags(),
+                    index + 1 < emitted.len(),
+                    "invalid more-fragments flag for payload {size}"
+                );
+            }
+            assert_eq!(next_offset, size + UDP_HEADER_BYTES);
+
+            // 把 fragments 的 IP 方向反转后喂回同一 netstack，验证重组后的
+            // UDP payload 长度与内容完整。两端 UDP port 相同、IP 地址仅互换，
+            // 因此原 UDP pseudo-header checksum 仍然有效。
+            for bytes in &mut emitted {
+                let mut packet =
+                    Ipv4Packet::new_checked(bytes.as_mut()).expect("mutable IPv4 fragment");
+                packet.set_src_addr(Ipv4Address::new(1, 1, 1, 1));
+                packet.set_dst_addr(Ipv4Address::new(10, 0, 0, 2));
+                packet.fill_checksum();
+            }
+            for bytes in emitted {
+                ns.push_rx_packet(bytes);
+            }
+            for _ in 0..8 {
+                ns.poll();
+            }
+            let mut received = vec![0xff; size + 32];
+            let (received_len, source) = v4
+                .recv_from(&mut received, Duration::from_millis(20))
+                .await
+                .unwrap_or_else(|e| panic!("IPv4 payload {size} did not reassemble: {e}"));
+            assert_eq!(received_len, size);
+            assert_eq!(source.ip(), dst_v4.ip());
+            assert_eq!(&received[..received_len], vec![0u8; size]);
+        }
+
+        v6.send_to(&vec![0u8; 1232], dst_v6)
+            .await
+            .expect("IPv6 payload at MTU boundary should be accepted");
+        ns.poll();
+        let emitted_v6 = wg
+            .try_take_outgoing_packet()
+            .await
+            .expect("IPv6 payload at MTU boundary must reach WireGuard");
+        let emitted_v6 =
+            Ipv6Packet::new_checked(emitted_v6.as_ref()).expect("valid emitted IPv6 packet");
+        assert_eq!(emitted_v6.payload_len(), 1232 + UDP_HEADER_BYTES as u16);
+        assert_eq!(emitted_v6.total_len(), 1280);
+        assert!(wg.try_take_outgoing_packet().await.is_none());
+
+        let err = v6
+            .send_to(&vec![0u8; 1252], dst_v6)
+            .await
+            .expect_err("oversized IPv6 UDP must be rejected explicitly");
+        assert!(matches!(
+            err,
+            Error::UdpPacketTooLarge {
+                family: "ipv6",
+                size: 1252,
+                max: 1232
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_buffer_full_waits_and_recovers_after_poll() {
+        let ns = test_netstack().await;
+        let udp = Arc::new(ns.create_udp_socket(0).expect("bind udp"));
+        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+
+        // 不启动 poll loop，先占满 32 个 metadata slot。
+        for _ in 0..UDP_PKT_SLOTS {
+            udp.send_to(&[1u8], dst).await.expect("fill UDP TX queue");
+        }
+
+        let pending = {
+            let udp = udp.clone();
+            tokio::spawn(async move { udp.send_to(&[2u8], dst).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !pending.is_finished(),
+            "full queue should apply backpressure"
+        );
+
+        ns.poll();
+        pending
+            .await
+            .expect("send task join")
+            .expect("send should recover after writable notification");
+    }
+
+    #[tokio::test]
+    async fn udp_buffer_full_reports_udp_timeout_not_tcp_error() {
+        let ns = test_netstack().await;
+        let udp = ns.create_udp_socket(0).expect("bind udp");
+        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+
+        for _ in 0..UDP_PKT_SLOTS {
+            udp.send_to(&[1u8], dst).await.expect("fill UDP TX queue");
+        }
+        let err = udp
+            .send_to(&[2u8], dst)
+            .await
+            .expect_err("queue without poll must time out");
+        assert!(matches!(err, Error::UdpSendTimeout(d) if d == UDP_SEND_WAIT_TIMEOUT));
+        assert!(!err.to_string().contains("TCP send failed"));
+    }
+
+    /// 把 WireGuard 侧收到的全部出站包按 IPv4 ident 聚合成
+    /// `ident -> (payload 字节总数, 是否见到 more_frags=false 的末片)`。
+    async fn collect_ipv4_datagrams(
+        wg: &WireGuardTunnel,
+    ) -> std::collections::BTreeMap<u16, (usize, bool)> {
+        let mut out: std::collections::BTreeMap<u16, (usize, bool)> = Default::default();
+        while let Some(bytes) = wg.try_take_outgoing_packet().await {
+            let Ok(packet) = Ipv4Packet::new_checked(bytes.as_ref()) else {
+                continue;
+            };
+            let entry = out.entry(packet.ident()).or_insert((0, false));
+            entry.0 += packet.payload().len();
+            if !packet.more_frags() {
+                entry.1 = true;
+            }
+        }
+        out
+    }
+
+    /// 回归（v0.4.5）：smoltcp 的 `Fragmenter` 是每个 `Interface` **唯一一份**，
+    /// 且 `dispatch_ip` 在进入分片分支时无条件覆写 `packet_len / sent_bytes /
+    /// buffer`，没有任何 in-flight 保护。只要第二个待分片报文在前一个报文的
+    /// 分片还没吐完时进入 egress，前一个报文就会在线路上被永久截断——末片
+    /// 永远不出现，对端占着重组槽直到超时，而 `send_to` 两次都返回 `Ok(())`。
+    ///
+    /// 这里同时覆盖两条触发路径：不同 socket 并发、以及同一个 socket 背靠背
+    /// 连发。修复前两条都会失败。
+    #[tokio::test]
+    async fn concurrent_large_udp_datagrams_are_never_truncated() {
+        const PAYLOAD: usize = 4096;
+        let expected = PAYLOAD + UDP_HEADER_BYTES;
+        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+
+        // 路径 A：两个不同的 UDP socket 各发一个需要分片的报文。
+        {
+            let (ns, wg) = test_netstack_and_tunnel(None).await;
+            let a = ns.create_udp_socket(0).expect("bind udp a");
+            let b = ns.create_udp_socket(0).expect("bind udp b");
+            a.send_to(&vec![0xa1; PAYLOAD], dst).await.expect("send a");
+            b.send_to(&vec![0xb2; PAYLOAD], dst).await.expect("send b");
+            for _ in 0..64 {
+                ns.poll();
+            }
+            let grouped = collect_ipv4_datagrams(&wg).await;
+            assert_eq!(
+                grouped.len(),
+                2,
+                "两个 datagram 应各有独立 ident: {grouped:?}"
+            );
+            for (ident, (bytes, saw_last)) in &grouped {
+                assert_eq!(*bytes, expected, "ident={ident} 的分片被截断: {grouped:?}");
+                assert!(saw_last, "ident={ident} 从未发出末片: {grouped:?}");
+            }
+        }
+
+        // 路径 B：同一个 socket 背靠背连发两个需要分片的报文。
+        {
+            let (ns, wg) = test_netstack_and_tunnel(None).await;
+            let udp = ns.create_udp_socket(0).expect("bind udp");
+            udp.send_to(&vec![0xc3; PAYLOAD], dst)
+                .await
+                .expect("send first");
+            udp.send_to(&vec![0xd4; PAYLOAD], dst)
+                .await
+                .expect("send second");
+            for _ in 0..64 {
+                ns.poll();
+            }
+            let grouped = collect_ipv4_datagrams(&wg).await;
+            assert_eq!(
+                grouped.len(),
+                2,
+                "背靠背的两个 datagram 应各有独立 ident: {grouped:?}"
+            );
+            for (ident, (bytes, saw_last)) in &grouped {
+                assert_eq!(*bytes, expected, "ident={ident} 的分片被截断: {grouped:?}");
+                assert!(saw_last, "ident={ident} 从未发出末片: {grouped:?}");
+            }
+        }
     }
 }
 #[test]

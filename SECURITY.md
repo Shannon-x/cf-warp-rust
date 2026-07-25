@@ -13,7 +13,7 @@
 | 修改 iptables / nftables / pfctl / 防火墙 | ❌ 不会 |
 | 改写 `/etc/resolv.conf` 或 DNS 设置 | ❌ 不会 |
 | 申请 `CAP_NET_ADMIN` / root 权限 | ❌ 不需要 |
-| 占用宿主 socket | ✅ 仅 1 个出站 UDP 到 162.159.x:2408；1 个 SOCKS5 监听端口；1 个 metrics 监听端口 |
+| 占用宿主 socket | ✅ 稳态 1 个 WARP 出站 UDP；端点故障转移时最多并发探测 2 个；另有 1 个 SOCKS5 和 1 个 metrics 监听端口 |
 | 写入文件 | ✅ 仅在 `data_dir`（默认 `./data/`）写凭据 JSON（权限 0600） |
 
 **进程被 kill 之后系统就完全恢复原样**——重启系统也不会发现任何痕迹。
@@ -25,7 +25,7 @@ ss -tunap | wc -l         # 或 netstat -an | wc -l
 ip rule show              # Linux
 netstat -nr               # macOS / *BSD
 
-# 启动 warp-rust 之后再跑一遍，对比 —— 只会多出一个出站 UDP 和两个监听端口
+# 启动 warp-rust 之后再跑一遍，对比 —— 稳态多一个出站 UDP 和两个监听端口
 ```
 
 ## 2. 默认本地访问
@@ -81,6 +81,11 @@ bind = "127.0.0.1:1080"
   - 带 60s TTL 和硬容量上限的缓存，命中无额外 RTT
   - 对极度隐私敏感的场景必开
 - **TCP socket 资源泄漏修复**：v0.1.0 在 SOCKS5 / 健康探针每次连接关闭时会把 smoltcp socket（128 KB buffer）留在 SocketSet 永不释放。v0.1.1 起 Drop 强制 `remove_socket`，**RSS 长期稳定**。
+- **隧道 generation 上限**：热替换会让旧连接暂时保留旧 netstack，但一个代际**被替换
+  之后**只有 5 分钟 drain 窗口（代际很老时窗口会被压缩，使总寿命收敛到「创建时刻 +
+  26 小时」，下限 30 秒）；到期取消仍挂在旧代际上的操作并释放整个 netstack。当前活跃
+  代际不受此定时器约束。用 `warp_rust_active_tunnel_generations` 监控完整隧道代际数，
+  稳态应为 1。
 
 ## 4. 凭据与密钥保护
 

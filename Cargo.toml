@@ -1,7 +1,8 @@
 [package]
 name = "warp-rust"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
+rust-version = "1.91"
 license = "GPL-3.0-or-later"
 description = "Long-running SOCKS5 proxy through Cloudflare WARP, with auto-register and self-healing"
 authors = ["warp-rust contributors"]

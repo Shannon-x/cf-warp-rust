@@ -26,8 +26,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
-  || { echo "端口非法：$PORT" >&2; exit 2; }
+# 先判正则再比大小：`||` 短路保证 PORT 非数字时不会走到 -lt/-gt 比较。
+# `{1,5}` 不只是收紧格式——没有它，超过 int64 的数字会让 `[ -lt ]` 直接报错并
+# 返回非零，两个比较双双"为假"，反而把 99999999999999999999 判成合法端口。
+# 用显式 if 而不是 `A && B || C`——后者在 shellcheck 眼里是 SC2015。
+if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "端口非法：$PORT" >&2
+  exit 2
+fi
 
 # pipefail-safe：先把随机字节全部读入 shell 变量，再过滤，再用 bash substring
 # 截取，全程无下游管道 → 不可能触发 SIGPIPE。
@@ -81,7 +87,7 @@ data_dir = "./data"
 device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
-mtu = 1420
+mtu = 1280
 tcp_buffer_size = 262144
 
 [health]

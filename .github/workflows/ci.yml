@@ -11,37 +11,6 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
-        run: rustfmt --edition 2021 --check src/main.rs tests/*.rs
-
-      - name: cargo fmt (vendored forks)
-        run: rustfmt --edition 2021 --check vendor/wireguard-netstack/src/netstack.rs vendor/warp-wireguard-gen/src/api.rs
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --release --locked -- -D warnings
-
-      - name: cargo test
-        run: cargo test --all-targets --locked
-
-      # 根包 `cargo test` 不会跑 [patch.crates-io] 指向的 vendored fork 的测试，
-      # 其中包含 wireguard-netstack 的 socket 泄漏回归测试，必须显式带上。
-      # 用 `--lib`：warp-rust 以 default-features=false 依赖该 fork（不启用
-      # config-file/doh），故其 doctest 里的 WgConfigFile/DohServerConfig 在本
-      # 构建上下文不存在、无法编译；`--lib` 只跑单元测试（含泄漏回归），跳过 doctest。
-      - name: cargo test (vendored forks)
-        run: cargo test -p wireguard-netstack -p warp-wireguard-gen --lib --locked
-
-      - name: cargo build --release
-        run: cargo build --release --locked
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ github.sha }}

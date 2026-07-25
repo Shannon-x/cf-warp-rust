@@ -264,23 +264,20 @@ async fn get_config_with_client_id(
         }
     };
 
-    // v0.2.3（warp-rust fork）：优先 DNS 解析 peer.endpoint.host，让 Cloudflare
-    // 自家的 DNS/Anycast 调度选当前最优 IP；失败时 fallback 到 API 返回的 v4。
-    //
-    // 旧实现「直接固定 API 返回的 v4 IP」的问题：
-    //   · 这个 IP 24h 内被某条骨干网限速 / 误屏蔽时，无法切换
-    //   · API 缓存的 IP 与 Cloudflare DNS 实际推荐的 IP 不一致时，命中差的那个
-    //   · WARP endpoint 设计上就是给 DNS-driven 调度用的稳定入口
-    let peer_endpoint = resolve_peer_endpoint(&peer.endpoint).await?;
+    // 保留 DNS 返回的全部 A/AAAA，并把 API v4/v6 追加为兜底。上层按
+    // (IP, port) 尝试，而不是只在第一枚 IPv4 上轮换端口。
+    let peer_endpoint_candidates = resolve_peer_endpoints(&peer.endpoint).await?;
+    let peer_endpoint = peer_endpoint_candidates[0];
 
     // Parse client_id if present
     let client_id = parse_client_id(resp.config.client_id.as_deref())?;
 
     log::info!(
-        "Configuration retrieved: tunnel_ip={}, tunnel_ipv6={:?}, endpoint={}, client_id={:?}",
+        "Configuration retrieved: tunnel_ip={}, tunnel_ipv6={:?}, endpoint={}, endpoint_candidates={}, client_id={:?}",
         tunnel_ip,
         tunnel_ipv6,
         peer_endpoint,
+        peer_endpoint_candidates.len(),
         client_id.map(|id| format!("0x{:02x}{:02x}{:02x}", id[0], id[1], id[2]))
     );
 
@@ -288,6 +285,7 @@ async fn get_config_with_client_id(
         private_key: credentials.private_key,
         peer_public_key,
         peer_endpoint,
+        peer_endpoint_candidates,
         tunnel_ip,
         tunnel_ipv6,
         preshared_key: None,
@@ -323,83 +321,107 @@ pub async fn update_license(credentials: &WarpCredentials, license_key: &str) ->
 }
 
 // ============================================================================
-// v0.2.3（warp-rust fork）：WARP peer endpoint 解析
+// v0.4.5（warp-rust fork）：WARP peer endpoint 候选解析
 // ============================================================================
 //
-// 设计目标：让 WG peer endpoint 跟随 Cloudflare DNS/Anycast 调度，而不是把
-// API 返回的某一个 IPv4 IP 写死。流程：
+// 设计目标：让 WG peer endpoint 跟随 Cloudflare DNS/Anycast 调度，并在某一
+// ingress IP 路由不良时切到其它 A/AAAA/API 地址。流程：
 //
-//   1. 先用 tokio::net::lookup_host(host) 解析 "engage.cloudflareclient.com:2408"
-//      返回的第一个 IPv4 SocketAddr。这是 happy path，让 Cloudflare 自家 DNS
-//      把请求引到当前最优入口（不同地区不同 IP）。
-//   2. DNS 失败、无 v4 记录、或返回空时，fallback 到 API 响应里 peer.endpoint.v4
-//      并配合 host 字段提取的端口。保留兼容性，离线/隔离环境也能跑通。
-//   3. fallback 自己解析失败（v4 文本非法）→ 显式 Error::InvalidEndpoint，
-//      不 unwrap、不 panic。
+//   1. lookup_host 收集全部 A/AAAA，按系统 resolver 顺序保留并去重。
+//   2. 追加 API endpoint.v4/v6，端口以 endpoint.host 为准。
+//   3. DNS 与 API 全部无有效地址才返回 InvalidEndpoint。
 //
-// fallback_endpoint 拆成纯函数（无 IO）方便加单元测试覆盖各种格式边界。
+// parse_api_endpoint / merge_endpoint_candidates 是纯函数，便于覆盖格式与去重边界。
 
-/// 异步解析 WARP peer endpoint：DNS 优先，失败 fallback 到 API 提供的 v4。
-async fn resolve_peer_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
+fn endpoint_port(endpoint: &Endpoint) -> u16 {
+    endpoint
+        .host
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(2408)
+}
+
+fn push_unique(candidates: &mut Vec<SocketAddr>, candidate: SocketAddr) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn parse_api_endpoint(raw: &str, port: u16) -> Option<SocketAddr> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(socket) = raw.parse::<SocketAddr>() {
+        return Some(SocketAddr::new(socket.ip(), port));
+    }
+    raw.parse().ok().map(|ip| SocketAddr::new(ip, port))
+}
+
+fn merge_endpoint_candidates(
+    dns_candidates: impl IntoIterator<Item = SocketAddr>,
+    endpoint: &Endpoint,
+) -> Result<Vec<SocketAddr>> {
+    let mut candidates = Vec::new();
+    for candidate in dns_candidates {
+        push_unique(&mut candidates, candidate);
+    }
+
+    let port = endpoint_port(endpoint);
+    if let Some(v4) = parse_api_endpoint(&endpoint.v4, port) {
+        push_unique(&mut candidates, v4);
+    }
+    if let Some(v6) = parse_api_endpoint(&endpoint.v6, port) {
+        push_unique(&mut candidates, v6);
+    }
+
+    if candidates.is_empty() {
+        return Err(Error::InvalidEndpoint(format!(
+            "DNS/API endpoint candidates empty: host='{}' v4='{}' v6='{}'",
+            endpoint.host, endpoint.v4, endpoint.v6
+        )));
+    }
+    Ok(candidates)
+}
+
+/// 异步解析全部 WARP peer endpoint：DNS A/AAAA 优先，API v4/v6 兜底。
+async fn resolve_peer_endpoints(endpoint: &Endpoint) -> Result<Vec<SocketAddr>> {
     let host_str = endpoint.host.trim();
+    let mut dns_candidates = Vec::new();
     match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(host_str)).await {
         Err(_) => {
             log::warn!(
-                "WARP endpoint DNS '{}' timed out; fallback to API v4='{}'",
+                "WARP endpoint DNS '{}' timed out; using API v4/v6 fallbacks",
                 host_str,
-                endpoint.v4,
             );
         }
         Ok(Ok(iter)) => {
             for sa in iter {
-                if let SocketAddr::V4(_) = sa {
-                    log::info!("WARP endpoint via DNS: '{}' -> {}", host_str, sa,);
-                    return Ok(sa);
-                }
+                push_unique(&mut dns_candidates, sa);
             }
-            log::warn!(
-                "WARP endpoint DNS '{}' returned no IPv4; fallback to API v4='{}'",
-                host_str,
-                endpoint.v4,
-            );
+            if dns_candidates.is_empty() {
+                log::warn!(
+                    "WARP endpoint DNS '{}' returned no addresses; using API fallbacks",
+                    host_str,
+                );
+            }
         }
         Ok(Err(e)) => {
             log::warn!(
-                "WARP endpoint DNS '{}' failed: {}; fallback to API v4='{}'",
+                "WARP endpoint DNS '{}' failed: {}; using API v4/v6 fallbacks",
                 host_str,
                 e,
-                endpoint.v4,
             );
         }
     }
-    fallback_endpoint(endpoint)
-}
-
-/// 不做 IO 的 fallback 解析：从 peer.endpoint.v4 取 IP，从 peer.endpoint.host
-/// 取端口，组装出 SocketAddr。两种字段都可能格式异常，全部走 Result。
-fn fallback_endpoint(endpoint: &Endpoint) -> Result<SocketAddr> {
-    // v4 字段通常是 "162.159.x.x:0"，去掉端口部分（:0 没意义）
-    let v4_ip_str = endpoint
-        .v4
-        .rsplit_once(':')
-        .map(|(ip, _)| ip)
-        .unwrap_or(endpoint.v4.as_str())
-        .trim();
-
-    // host 字段通常是 "engage.cloudflareclient.com:2408"
-    let port = endpoint
-        .host
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.trim().parse::<u16>().ok())
-        .unwrap_or(2408);
-
-    let assembled = format!("{}:{}", v4_ip_str, port);
-    assembled.parse::<SocketAddr>().map_err(|_| {
-        Error::InvalidEndpoint(format!(
-            "fallback parse failed: v4='{}' host='{}' assembled='{}'",
-            endpoint.v4, endpoint.host, assembled
-        ))
-    })
+    let candidates = merge_endpoint_candidates(dns_candidates, endpoint)?;
+    log::info!(
+        "WARP endpoint candidates for '{}': {:?}",
+        host_str,
+        candidates
+    );
+    Ok(candidates)
 }
 
 #[cfg(test)]
@@ -415,51 +437,111 @@ mod tests {
     }
 
     #[test]
-    fn fallback_parses_v4_with_zero_port_suffix() {
-        // 典型 WARP API 响应格式：v4 带 :0 后缀
-        let sa = fallback_endpoint(&ep(
-            "engage.cloudflareclient.com:2408",
-            "162.159.192.7:0",
-            "[2606:4700::]:2408",
-        ))
+    fn api_fallback_parses_v4_and_v6_with_host_port() {
+        let candidates = merge_endpoint_candidates(
+            [],
+            &ep(
+                "engage.cloudflareclient.com:2408",
+                "162.159.192.7:0",
+                "[2606:4700::7]:0",
+            ),
+        )
         .unwrap();
-        assert_eq!(sa.to_string(), "162.159.192.7:2408");
+        assert_eq!(
+            candidates,
+            vec![
+                "162.159.192.7:2408".parse().unwrap(),
+                "[2606:4700::7]:2408".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
     fn fallback_handles_bare_v4_no_port() {
-        // 防御：v4 字段如果就是裸 IP 没冒号
-        let sa = fallback_endpoint(&ep("engage.cloudflareclient.com:2408", "162.159.192.7", ""))
-            .unwrap();
-        assert_eq!(sa.to_string(), "162.159.192.7:2408");
+        let candidates = merge_endpoint_candidates(
+            [],
+            &ep("engage.cloudflareclient.com:2408", "162.159.192.7", ""),
+        )
+        .unwrap();
+        assert_eq!(candidates[0].to_string(), "162.159.192.7:2408");
     }
 
     #[test]
     fn fallback_handles_missing_host_port_defaults_2408() {
-        // host 没端口（极少见）→ 默认 2408（WARP 标准）
-        let sa =
-            fallback_endpoint(&ep("engage.cloudflareclient.com", "162.159.192.7:0", "")).unwrap();
-        assert_eq!(sa.port(), 2408);
+        let candidates = merge_endpoint_candidates(
+            [],
+            &ep("engage.cloudflareclient.com", "162.159.192.7:0", ""),
+        )
+        .unwrap();
+        assert_eq!(candidates[0].port(), 2408);
     }
 
     #[test]
-    fn fallback_rejects_invalid_v4_text() {
-        // 非法 IPv4 文本 → Err，不 panic
-        let err = fallback_endpoint(&ep("engage.cloudflareclient.com:2408", "not.an.ip:0", ""))
-            .unwrap_err();
+    fn fallback_rejects_when_dns_and_api_are_all_invalid() {
+        let err = merge_endpoint_candidates(
+            [],
+            &ep("engage.cloudflareclient.com:2408", "not.an.ip:0", "bad-v6"),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("fallback parse failed"), "got: {msg}");
+        assert!(msg.contains("candidates empty"), "got: {msg}");
     }
 
     #[test]
     fn fallback_rejects_garbage_port_uses_default() {
-        // host 端口非数字 → 走默认 2408（容忍）
-        let sa = fallback_endpoint(&ep(
-            "engage.cloudflareclient.com:not-a-port",
-            "162.159.192.7:0",
-            "",
-        ))
+        let candidates = merge_endpoint_candidates(
+            [],
+            &ep(
+                "engage.cloudflareclient.com:not-a-port",
+                "162.159.192.7:0",
+                "",
+            ),
+        )
         .unwrap();
-        assert_eq!(sa.port(), 2408);
+        assert_eq!(candidates[0].port(), 2408);
+    }
+
+    #[test]
+    fn dns_and_api_candidates_are_ordered_and_deduplicated() {
+        let dns = vec![
+            "162.159.192.7:2408".parse().unwrap(),
+            "[2606:4700::7]:2408".parse().unwrap(),
+            "162.159.192.7:2408".parse().unwrap(),
+        ];
+        let candidates = merge_endpoint_candidates(
+            dns,
+            &ep(
+                "engage.cloudflareclient.com:2408",
+                "162.159.192.7:0",
+                "[2606:4700::8]:0",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                "162.159.192.7:2408".parse().unwrap(),
+                "[2606:4700::7]:2408".parse().unwrap(),
+                "[2606:4700::8]:2408".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn every_dns_address_is_retained() {
+        let dns = (1..=20)
+            .map(|last| format!("162.159.192.{last}:2408").parse().unwrap())
+            .collect::<Vec<_>>();
+        let candidates = merge_endpoint_candidates(
+            dns.clone(),
+            &ep(
+                "engage.cloudflareclient.com:2408",
+                "188.114.96.7:0",
+                "[2606:4700::7]:0",
+            ),
+        )
+        .unwrap();
+        assert_eq!(&candidates[..dns.len()], dns.as_slice());
+        assert_eq!(candidates.len(), dns.len() + 2);
     }
 }

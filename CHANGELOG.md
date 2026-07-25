@@ -3,6 +3,66 @@
 本项目的所有重要变更记录于此。版本遵循语义化版本（SemVer）。
 日期格式为 `YYYY-MM-DD`。
 
+## [0.4.5] - 2026-07-24
+
+### UDP 正确性与可观测性
+
+- **UDP 发送缓冲满不再直接丢包。** 每个 UDP socket 增加可写通知，缓冲满时等待并有界重试
+  200ms；只有超时才返回明确的 `UdpSendTimeout`。新增 buffer-full、重试恢复和按原因丢弃
+  指标，错误也不再误报为 `TCP send failed`。
+- **大 UDP 报文明确定义。** 启用 8KiB 上限的 IPv4 分片/重组与有界重组池，
+  4096-byte IPv4 UDP payload 可正常交给 netstack 分片；smoltcp 尚不能发送 IPv6 分片，
+  因此 IPv6 payload 超过 `MTU - 48`（MTU 1280 时为 1232）会立即返回
+  `UdpPacketTooLarge` 并计入 drop 指标，不再“返回成功后静默丢包”。
+- **修复大 UDP 报文互相覆盖导致的线路截断。** smoltcp 的 `Fragmenter` 是每个
+  `Interface` 唯一一份，且 `dispatch_ip` 在开始新的分片序列时会无条件覆写它。只要
+  第二个待分片报文在前一个的分片还没吐完时进入 egress（不同 socket 并发、或同一
+  socket 背靠背连发都可以触发），前一个报文就会被永久截断在线路上——末片永远不
+  发出，对端占着重组槽直到超时，而 `send_to` 仍返回 `Ok(())`。现在需要分片的报文
+  会在同一个 netstack 临界区内把全部分片推完再释放锁；真正 flush 不掉（WireGuard
+  出口长期打满）时返回 `UdpFragmentFlush` 并计入 `reason="fragment_flush"`，宁可
+  显式丢弃也不发半截数据。新增覆盖两条触发路径的回归测试。
+- 升级 smoltcp `0.12.0 → 0.13.1`，采用其 IPv4 非末片 8-byte 对齐修复和重组后包长
+  修复；项目源码编译的最低 Rust 版本相应变为 1.91。
+- 入站分片重组的 assembler 段数上限从默认 4 提高到 16，给 7 片报文的乱序到达留出
+  余量；同时移除两个名不副实的 smoltcp feature：`proto-ipv6-fragmentation` 在
+  `medium-ip` 路径下只作用于 6LoWPAN，`reassembly-buffer-size-8192` 在 `std`
+  （蕴含 `alloc`）下完全不参与编译。
+- 新增 1232、1252、1500、4096 字节边界测试，以及 UDP buffer-full 恢复与超时错误分类测试。
+- **client→tunnel 转发与收取解耦。** 转发一个报文可能长时间 await（域名解析、
+  隧道 TX 回压的 200ms 等待），过去它直接在 recv 循环里 await，这段时间客户端报文
+  堆在**内核** socket buffer 里被静默丢弃，既无指标也无日志。现在两者用深度 64 的
+  有界队列拆开：recv 永不阻塞，溢出发生在自己的队列上并计入
+  `warp_rust_udp_client_rx_dropped_total`。
+- `warp_rust_udp_tx_buffer_full_total` 改为按**报文**计数（此前每次重试都 +1），
+  与 recovered / dropped 同量纲，`recovered / buffer_full` 因此成为可用的恢复率 SLI。
+
+### 可靠性与资源上限
+
+- **WARP 故障转移覆盖多个入口 IP。** 保留 DNS 的全部 A/AAAA 与 API 返回的 v4/v6 地址，
+  去重后按 `(IP, port)` 组合尝试；先尝试每个 IP 的原始端口，再轮换
+  2408/500/1701/4500，不再只在第一个故障 IP 上换四次端口。端点探测并发上限为 2。
+- **防火墙 EPERM 提示不再被 IPv6 候选淹掉。** 上一条改动让候选里必然出现 IPv6，
+  而纯 IPv4 的 VPS 上 v6 尝试会返回 EAFNOSUPPORT / ENETUNREACH；旧判据要求**每一条**
+  失败都是 EPERM，于是这条从 v0.4.3 就有的可操作提示在真实环境里 100% 出不来（单元
+  测试只喂纯 IPv4 字符串，所以一直是绿的）。现在先排除「该地址族本机不可用」这类
+  与防火墙无关的失败，再判定 EPERM，并且只把**实际被拒绝**的 IP 写进 iptables /
+  ip6tables 建议里。
+- **旧隧道 generation 有界退休。** 热替换后的旧隧道默认 drain 5 分钟，代际很老时这个
+  窗口会被压缩，使总寿命收敛到「创建时刻 + 26 小时」；但压缩有 30 秒下限，绝不会退化
+  成立即硬切——在途连接被硬切时 relay 只能把它翻译成对客户端的干净 FIN，流式响应会
+  静默截断。到期后取消仍占用旧代际的 TCP/UDP 操作并释放完整 netstack。注意活跃代际
+  本身不受任何定时器约束，计时从**被替换**那一刻才开始。新增活跃 generation gauge 与
+  强制退休 counter。
+- **MTU 配置面统一为 1280。** Rust 默认值、二进制脚本、Docker 脚本、quickstart 与安装器
+  全部一致；`install.sh --update` 检测存量非 1280 配置并明确警告，但不擅自覆写用户配置。
+
+### 发布门禁
+
+- 抽出可复用的 `verify` workflow；CI、Linux/Windows Release、macOS Release 与 GHCR
+  镜像构建都必须先通过主项目及 vendored fork 的 `cargo fmt --all`、Clippy、测试和
+  shell 回归检查。验证失败时，构建/上传任务不会运行。
+
 ## [0.4.4] - 2026-07-10
 
 ### 修复
@@ -147,6 +207,8 @@
 
 - WARP peer endpoint 优先 DNS 解析，IP 仅作 fallback。
 
+[0.4.5]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.5
+[0.4.4]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.4
 [0.4.1]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.4.0
 [0.3.3]: https://github.com/Shannon-x/cf-warp-rust/releases/tag/v0.3.3
