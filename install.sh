@@ -171,7 +171,7 @@ if [ "$ACTION" = "install" ] && [ "$INTERACTIVE" = 1 ]; then
   while :; do
     read -r -p "  SOCKS5 监听端口 [1080]: " ans < /dev/tty || ans=""
     PORT="${ans:-1080}"
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
       warn "端口非法，请输入 1-65535"; continue
     fi
     # 服务以非 root 用户运行且无 CAP_NET_BIND_SERVICE，<1024 特权端口必然
@@ -222,8 +222,13 @@ fi
 [ -z "$EXPOSE" ] && EXPOSE=0
 [ -z "$USER_NAME" ] && USER_NAME="warp"
 
-[[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
-  || die "端口非法：$PORT"
+# 先判正则再比大小：`||` 短路保证 PORT 非数字时不会走到 -lt/-gt 比较。
+# `{1,5}` 不只是收紧格式——没有它，超过 int64 的数字会让 `[ -lt ]` 直接报错并
+# 返回非零，两个比较双双"为假"，反而把 99999999999999999999 判成合法端口。
+# 用显式 if 而不是 `A && B || C`——后者在 shellcheck 眼里是 SC2015。
+if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  die "端口非法：$PORT"
+fi
 
 # ── 交互完后立刻显示配置摘要，让用户知道脚本继续走 ─────────────────────────
 if [ "$ACTION" = "install" ]; then
