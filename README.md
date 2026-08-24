@@ -471,6 +471,9 @@ curl -f http://127.0.0.1:9090/livez
 | `warp_rust_probe_success_total` / `probe_failure_total` | counter | 健康探针成败数 |
 | `warp_rust_dial_attempt_total` / `dial_failure_total` / `dial_timeout_total` | counter | 多候选拨号尝试、失败与整体超时 |
 | `warp_rust_tunnel_rebuild_total` | counter | 隧道重建数（自愈触发） |
+| `warp_rust_handshake_stale_total` | counter | WireGuard 会话超过 180s 未成功握手、被判定不健康的次数。活跃会话每 ~120s 重握手，持续增长说明隧道会话反复失效 |
+| `warp_rust_egress_degraded_total` | counter | 「拨号探针通过、但业务出口成功率低于 20%」这类选择性故障被判定的次数。**持续增长意味着探针目标可达而业务目标不可达**——要么出口被对端选择性屏蔽，要么 `health.targets` 选得不能代表业务路径 |
+| `warp_rust_conns_rejected_log_suppressed_total` | counter | 达到连接上限被拒的连接中，因日志限速未单独打印的条数。与 `conns_rejected_total` 一起看可还原真实过载规模 |
 | `warp_rust_reregister_total` | counter | WARP 重注册数 |
 | `warp_rust_rotate_identity_total` | counter | 身份池轮转数 |
 | `warp_rust_udp_associates_active` | gauge | 当前活跃 UDP ASSOCIATE |

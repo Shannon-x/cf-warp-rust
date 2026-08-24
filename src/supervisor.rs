@@ -1,10 +1,11 @@
 //! 中央状态机。负责跑恢复阶梯、根据探针失败重建隧道、按周期刷新 WG 配置。
 
 use crate::config::Config;
+use crate::egress::EgressStats;
 use crate::error::Result;
 use crate::health;
 use crate::metrics::{M_REREGISTER, M_ROTATE, M_TUNNEL_REBUILD};
-use crate::tunnel::Tunnel;
+use crate::tunnel::{ReplaceReason, Tunnel};
 use crate::warp::identity_pool::IdentityPool;
 use crate::warp::AccountManager;
 use metrics::counter;
@@ -54,6 +55,9 @@ pub struct Supervisor {
     /// 会立即推动恢复阶梯，造成无谓的重注册/身份轮换风暴。
     last_recovery_completed: Mutex<Option<Instant>>,
     healthy: Arc<AtomicBool>,
+    /// 业务拨号成败统计。SOCKS5 侧写入，健康探针每轮取走并评估——这是
+    /// supervisor 唯一能看见「业务路径」的窗口。
+    egress: Arc<EgressStats>,
 }
 
 impl Supervisor {
@@ -78,11 +82,17 @@ impl Supervisor {
             consecutive_failures: Mutex::new(0),
             last_recovery_completed: Mutex::new(None),
             healthy: Arc::new(AtomicBool::new(false)),
+            egress: Arc::new(EgressStats::new()),
         })
     }
 
     pub fn health_flag(&self) -> Arc<AtomicBool> {
         self.healthy.clone()
+    }
+
+    /// 交给 SOCKS5 监听器记录业务拨号成败。
+    pub fn egress_stats(&self) -> Arc<EgressStats> {
+        self.egress.clone()
     }
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
@@ -94,8 +104,9 @@ impl Supervisor {
             let tunnel = self.tunnel.clone();
             let cfg = self.cfg.health.clone();
             let tx = self.events_tx.clone();
+            let egress = self.egress.clone();
             let child = cancel.child_token();
-            background.spawn(health::probe_loop(tunnel, cfg, tx, child));
+            background.spawn(health::probe_loop(tunnel, cfg, egress, tx, child));
         }
 
         // 配置刷新定时器
@@ -185,7 +196,7 @@ impl Supervisor {
             }
             SupervisorEvent::RefreshTimerFired => {
                 debug!("scheduled config refresh");
-                if let Err(e) = self.action_rebuild_config().await {
+                if let Err(e) = self.action_rebuild_config(ReplaceReason::Refresh).await {
                     warn!(error = %e, "scheduled refresh failed");
                 }
             }
@@ -222,7 +233,9 @@ impl Supervisor {
         let result = match action {
             RecoveryAction::None => return Ok(()),
             RecoveryAction::Reconnect => self.action_reconnect().await,
-            RecoveryAction::RebuildConfig => self.action_rebuild_config().await,
+            RecoveryAction::RebuildConfig => {
+                self.action_rebuild_config(ReplaceReason::Recovery).await
+            }
             RecoveryAction::Reregister => self.action_reregister().await,
             RecoveryAction::RotateIdentity => self.action_rotate().await,
         };
@@ -248,16 +261,18 @@ impl Supervisor {
 
     async fn action_reconnect(&self) -> Result<()> {
         let wg = self.wg_config.lock().await.clone();
-        let active_wg = self.tunnel.rebuild(wg).await?;
+        let active_wg = self.tunnel.rebuild(wg, ReplaceReason::Recovery).await?;
         *self.wg_config.lock().await = active_wg;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
     }
 
-    async fn action_rebuild_config(&self) -> Result<()> {
+    /// `reason` 必须由调用方给出：这个函数既是恢复阶梯的第二级，又被 24h 周期
+    /// 刷新复用，两者对「旧隧道还有没有救」的判断完全相反。
+    async fn action_rebuild_config(&self, reason: ReplaceReason) -> Result<()> {
         let creds = self.creds.lock().await.clone();
         let wg = self.account.refresh_config(&creds).await?;
-        let active_wg = self.tunnel.rebuild(wg).await?;
+        let active_wg = self.tunnel.rebuild(wg, reason).await?;
         *self.wg_config.lock().await = active_wg;
         counter!(M_TUNNEL_REBUILD).increment(1);
         Ok(())
@@ -275,7 +290,8 @@ impl Supervisor {
                     .await?;
                 *self.creds.lock().await = candidate.account_file.credentials.clone();
                 *self.wg_config.lock().await = connected.config;
-                self.tunnel.replace(connected.managed);
+                self.tunnel
+                    .replace(connected.managed, ReplaceReason::Recovery);
                 counter!(M_REREGISTER).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
                 Ok(())
@@ -285,7 +301,7 @@ impl Supervisor {
                     error = %e,
                     "reregister 失败（多半 register_cooldown 未到），fallback 到 rebuild_config"
                 );
-                self.action_rebuild_config().await
+                self.action_rebuild_config(ReplaceReason::Recovery).await
             }
         }
     }
@@ -305,7 +321,8 @@ impl Supervisor {
                     .await?;
                 *self.creds.lock().await = candidate.account_file.credentials.clone();
                 *self.wg_config.lock().await = connected.config;
-                self.tunnel.replace(connected.managed);
+                self.tunnel
+                    .replace(connected.managed, ReplaceReason::Recovery);
                 counter!(M_ROTATE).increment(1);
                 counter!(M_TUNNEL_REBUILD).increment(1);
             }

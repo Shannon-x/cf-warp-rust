@@ -10,11 +10,13 @@
 
 use crate::config::{AuthConfig, LimitsConfig, ServerConfig};
 use crate::dns::Resolver;
+use crate::egress::EgressStats;
 use crate::error::{Error, Result};
 use crate::metrics::{
     M_AUTH_FAIL, M_BYTES_DOWN, M_BYTES_UP, M_CONNS_CLOSED, M_CONNS_OPENED, M_CONNS_REJECTED,
-    M_CONNS_REJECTED_DIAL_PRESSURE, M_CONNS_REJECTED_UNHEALTHY, M_DIAL_ATTEMPT, M_DIAL_FAILURE,
-    M_DIAL_TIMEOUT, M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT, M_UDP_ASSOCIATES_ACTIVE,
+    M_CONNS_REJECTED_DIAL_PRESSURE, M_CONNS_REJECTED_LOG_SUPPRESSED, M_CONNS_REJECTED_UNHEALTHY,
+    M_DIAL_ATTEMPT, M_DIAL_FAILURE, M_DIAL_TIMEOUT, M_HANDSHAKE_TIMEOUT, M_IDLE_TIMEOUT,
+    M_UDP_ASSOCIATES_ACTIVE,
 };
 use crate::proxy::udp;
 use crate::tunnel::{Tunnel, TunnelTcpConnection};
@@ -22,6 +24,7 @@ use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{ReplyError, Socks5Command};
 use metrics::{counter, gauge};
+use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -92,6 +95,46 @@ pub async fn bind_listener(bind: SocketAddr) -> Result<TcpListener> {
     }
 }
 
+/// 连接上限拒绝日志的限速闸门。
+///
+/// 达到 `max_concurrent_connections` 之后，**每个**被拒连接都会走到同一条
+/// warn。过载时这瞬间就是日志洪水（现场 journald 单窗口压制过 3885 条），
+/// 既淹掉真正有用的日志，又白烧 CPU 和磁盘——而过载恰恰是最需要日志可读的
+/// 时候。每秒放行一条，其余计数后随下一条一起汇总。
+struct RejectionLogGate {
+    last_logged: ParkingMutex<Option<Instant>>,
+    suppressed: AtomicU64,
+}
+
+impl RejectionLogGate {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self {
+            last_logged: ParkingMutex::new(None),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// 允许输出时返回「上次输出以来被抑制的条数」，否则返回 `None`。
+    fn should_log(&self) -> Option<u64> {
+        let now = Instant::now();
+        let mut last = self.last_logged.lock();
+        match *last {
+            Some(previous) if now.duration_since(previous) < Self::INTERVAL => {
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
+                counter!(M_CONNS_REJECTED_LOG_SUPPRESSED).increment(1);
+                None
+            }
+            _ => {
+                *last = Some(now);
+                Some(self.suppressed.swap(0, Ordering::Relaxed))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     cfg: ServerConfig,
@@ -99,6 +142,7 @@ pub async fn serve(
     resolver: Arc<Resolver>,
     tunnel: Arc<Tunnel>,
     healthy: Arc<AtomicBool>,
+    egress: Arc<EgressStats>,
     cancel: CancellationToken,
 ) -> Result<()> {
     info!(
@@ -110,6 +154,7 @@ pub async fn serve(
     );
 
     let semaphore = Arc::new(Semaphore::new(limits.max_concurrent_connections));
+    let reject_log = RejectionLogGate::new();
     let dial_semaphore = Arc::new(Semaphore::new(limits.max_pending_dials));
     let server_ip = cfg.bind.ip();
     let limits = Arc::new(limits);
@@ -153,7 +198,14 @@ pub async fn serve(
                     Ok(p) => p,
                     Err(_) => {
                         counter!(M_CONNS_REJECTED).increment(1);
-                        warn!(%peer, "连接被拒绝：达到 max_concurrent_connections");
+                        if let Some(suppressed) = reject_log.should_log() {
+                            warn!(
+                                %peer,
+                                max_concurrent = limits.max_concurrent_connections,
+                                suppressed,
+                                "连接被拒绝：达到 max_concurrent_connections"
+                            );
+                        }
                         drop(stream);
                         continue;
                     }
@@ -164,6 +216,7 @@ pub async fn serve(
                 let auth = cfg.auth.clone();
                 let limits = limits.clone();
                 let healthy = healthy.clone();
+                let egress = egress.clone();
                 let dial_semaphore = dial_semaphore.clone();
                 let parent_cancel = cancel.clone();
                 connections.spawn(async move {
@@ -171,7 +224,7 @@ pub async fn serve(
                     let _permit = permit;
                     if let Err(e) = handle(
                         stream, peer, server_ip, tunnel, resolver, auth, limits, healthy,
-                        dial_semaphore, parent_cancel,
+                        egress, dial_semaphore, parent_cancel,
                     )
                     .await
                     {
@@ -193,6 +246,7 @@ async fn handle(
     auth: Option<AuthConfig>,
     limits: Arc<LimitsConfig>,
     healthy: Arc<AtomicBool>,
+    egress: Arc<EgressStats>,
     dial_semaphore: Arc<Semaphore>,
     parent_cancel: CancellationToken,
 ) -> Result<()> {
@@ -285,8 +339,19 @@ async fn handle(
     // v0.2.1：候选列表通过 happy eyeballs 拨号；upstream_addr 是实际胜出的地址
     let (upstream_addr, upstream) =
         match happy_eyeballs_dial(tunnel.clone(), candidates, &limits).await {
-            Ok(v) => v,
+            Ok(v) => {
+                // 业务拨号成败是健康判定的第三个信号。没有它，supervisor 对
+                // 「探针全绿但业务全挂」的选择性出口故障是完全失明的。
+                egress.record(true);
+                v
+            }
             Err(e) => {
+                // TunnelNotReady 是我们自己在重建窗口里主动拒绝的，不代表出口
+                // 有问题；把它算进失败率会让重建期间的正常拒绝反过来触发下一轮
+                // 重建，形成自激循环。
+                if !matches!(e, Error::TunnelNotReady) {
+                    egress.record(false);
+                }
                 log_dial_failure(peer, &target, &e);
                 let reply = match &e {
                     Error::TunnelNotReady => ReplyError::GeneralFailure,
