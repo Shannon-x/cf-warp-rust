@@ -7,6 +7,7 @@
 mod config;
 mod config_watch;
 mod dns;
+mod egress;
 mod error;
 mod health;
 mod metrics;
@@ -106,6 +107,7 @@ async fn run(cli: Cli) -> Result<()> {
         active_wg_config,
     );
     let health_flag = supervisor.health_flag();
+    let egress_stats = supervisor.egress_stats();
 
     let mut services = tokio::task::JoinSet::new();
     let supervisor_cancel = cancel.clone();
@@ -121,6 +123,7 @@ async fn run(cli: Cli) -> Result<()> {
     let socks_cancel = cancel.clone();
     let socks_tunnel = tunnel.clone();
     let socks_health = health_flag.clone();
+    let socks_egress = egress_stats.clone();
     services.spawn(async move {
         (
             "SOCKS5",
@@ -131,6 +134,7 @@ async fn run(cli: Cli) -> Result<()> {
                 resolver,
                 socks_tunnel,
                 socks_health,
+                socks_egress,
                 socks_cancel,
             )
             .await,

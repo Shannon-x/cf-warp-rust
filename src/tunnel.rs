@@ -92,6 +92,17 @@ impl TunnelUdpHandle {
 }
 
 const DEFAULT_TUNNEL_DRAIN_GRACE: Duration = Duration::from_secs(5 * 60);
+/// **故障恢复**时旧代际的 drain 窗口，远短于正常刷新的 5 分钟。
+///
+/// 旧代际是因为被判定不健康才被替换的，挂在它上面的连接基本不可能自行恢复
+/// （现场表现为一律拨号超时）。但它们在被 retire 之前会一直占着全局
+/// `max_concurrent_connections` 名额，于是新请求被 `连接被拒绝：达到
+/// max_concurrent_connections` 挡在门外——故障被硬生生延长整整 5 分钟。
+/// 现场时间线里 07:11:39 重建、07:16:39 旧隧道才退休，正好是这个常量。
+///
+/// 15 秒足够让真正还在传输的连接收尾（它们本来也熬不过一个 12s 的拨号超时），
+/// 又能迅速把名额还给新请求。
+const DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE: Duration = Duration::from_secs(15);
 const DEFAULT_TUNNEL_MAX_GENERATION_AGE: Duration = Duration::from_secs(26 * 60 * 60);
 /// 无论绝对寿命怎么压缩，被替换的代际都至少保留这么长的 drain 窗口。
 ///
@@ -101,16 +112,37 @@ const DEFAULT_TUNNEL_MAX_GENERATION_AGE: Duration = Duration::from_secs(26 * 60 
 const MIN_TUNNEL_DRAIN_GRACE: Duration = Duration::from_secs(30);
 static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 替换隧道的原因。决定旧代际能 drain 多久——这两种情形对「旧隧道还有没有
+/// 救」的判断完全相反，不能共用一个窗口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceReason {
+    /// 周期性配置刷新。旧隧道大概率仍然可用，给足 drain 窗口让长连接自然结束。
+    Refresh,
+    /// 故障恢复。旧隧道已被判定不健康，继续占着连接名额只会挤掉新请求。
+    Recovery,
+}
+
 #[derive(Clone, Copy)]
 struct GenerationPolicy {
     drain_grace: Duration,
+    recovery_drain_grace: Duration,
     max_age: Duration,
+}
+
+impl GenerationPolicy {
+    fn grace_for(&self, reason: ReplaceReason) -> Duration {
+        match reason {
+            ReplaceReason::Refresh => self.drain_grace,
+            ReplaceReason::Recovery => self.recovery_drain_grace,
+        }
+    }
 }
 
 impl Default for GenerationPolicy {
     fn default() -> Self {
         Self {
             drain_grace: DEFAULT_TUNNEL_DRAIN_GRACE,
+            recovery_drain_grace: DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE,
             max_age: DEFAULT_TUNNEL_MAX_GENERATION_AGE,
         }
     }
@@ -120,15 +152,16 @@ impl Default for GenerationPolicy {
 ///
 /// 语义（注意不是「每个 generation 有 26 小时绝对寿命」——活跃代际不受任何
 /// 定时器约束，只有**被替换后**才开始计时）：
-/// - 常态下就是 `drain_grace`，让在途连接自然收尾；
+/// - 起点是 `reason` 对应的 grace：正常刷新 5 分钟，故障恢复 15 秒；
 /// - 代际已经很老时，用 `max_age - age` 压缩这个窗口，使总寿命收敛到
 ///   `created_at + max_age`；
-/// - 但压缩有下限 `MIN_TUNNEL_DRAIN_GRACE`，绝不会退化成立即硬切。
-fn retirement_delay(age: Duration, policy: GenerationPolicy) -> Duration {
-    policy
-        .drain_grace
+/// - 但压缩有下限，绝不会退化成立即硬切。下限本身还要再 `min` 一次 grace，
+///   这样故障恢复的 15 秒不会被 30 秒的下限反过来拉长。
+fn retirement_delay(age: Duration, policy: GenerationPolicy, reason: ReplaceReason) -> Duration {
+    let grace = policy.grace_for(reason);
+    grace
         .min(policy.max_age.saturating_sub(age))
-        .max(MIN_TUNNEL_DRAIN_GRACE.min(policy.drain_grace))
+        .max(MIN_TUNNEL_DRAIN_GRACE.min(grace))
 }
 
 struct TunnelGeneration {
@@ -150,8 +183,8 @@ impl TunnelGeneration {
         }
     }
 
-    fn schedule_retirement(self: &Arc<Self>, policy: GenerationPolicy) {
-        let delay = retirement_delay(self.created_at.elapsed(), policy);
+    fn schedule_retirement(self: &Arc<Self>, policy: GenerationPolicy, reason: ReplaceReason) {
+        let delay = retirement_delay(self.created_at.elapsed(), policy, reason);
         let weak = Arc::downgrade(self);
         let id = self.id;
         if delay.is_zero() {
@@ -167,6 +200,7 @@ impl TunnelGeneration {
                         warn!(
                             generation = id,
                             ?delay,
+                            ?reason,
                             "retiring drained tunnel generation"
                         );
                         generation.force_retire();
@@ -385,11 +419,18 @@ impl Tunnel {
     }
 
     /// 重新建联，并原子地替换掉原来的隧道。旧隧道的后台任务会随 Drop 被 abort。
-    pub async fn rebuild(&self, cfg: WireGuardConfig) -> Result<WireGuardConfig> {
-        info!("rebuilding WireGuard tunnel");
+    ///
+    /// `reason` 决定旧代际的 drain 窗口：故障恢复时旧隧道已经不可用，必须尽快
+    /// 把它占用的连接名额还回来，不能按正常刷新那样 drain 5 分钟。
+    pub async fn rebuild(
+        &self,
+        cfg: WireGuardConfig,
+        reason: ReplaceReason,
+    ) -> Result<WireGuardConfig> {
+        info!(?reason, "rebuilding WireGuard tunnel");
         let connected = Self::connect_candidate(cfg).await?;
         let active_config = connected.config.clone();
-        self.replace(connected.managed);
+        self.replace(connected.managed, reason);
         Ok(active_config)
     }
 
@@ -473,18 +514,32 @@ impl Tunnel {
     }
 
     /// 候选隧道和账号都已验证/持久化后，做最后的原子切换。
-    pub fn replace(&self, new: ManagedTunnel) {
+    pub fn replace(&self, new: ManagedTunnel, reason: ReplaceReason) {
         let new = Arc::new(TunnelGeneration::new(new));
         let old = self.inner.swap(Arc::new(Some(new)));
         if let Some(old) = old.as_ref() {
-            old.schedule_retirement(self.generation_policy);
+            old.schedule_retirement(self.generation_policy, reason);
             debug!(
                 generation = old.id,
-                drain_grace = ?self.generation_policy.drain_grace,
+                ?reason,
+                grace = ?self.generation_policy.grace_for(reason),
                 max_age = ?self.generation_policy.max_age,
                 "previous tunnel generation draining"
             );
         }
+    }
+
+    /// 距上次成功的 WireGuard 握手过了多久；从未握手成功时为 `None`。
+    ///
+    /// 活跃会话每 ~120s 会重新握手，所以这个值显著超过 120s 就说明会话已经
+    /// 陈旧——此时拨号必然失败，健康探针不必再干等一个完整的 8s 超时。
+    /// 这个能力 vendored crate 一直提供，但在 v0.4.5 之前 `src/` 里零调用。
+    pub fn time_since_last_handshake(&self) -> Option<Duration> {
+        let snapshot = self.inner.load_full();
+        snapshot
+            .as_ref()
+            .as_ref()
+            .and_then(|generation| generation.managed.time_since_last_handshake())
     }
 
     /// 取当前代际的快照。已经被退休的代际视同「隧道未就绪」。
@@ -637,16 +692,21 @@ mod tests {
     fn retired_generation_uses_drain_and_absolute_deadlines() {
         let policy = GenerationPolicy {
             drain_grace: Duration::from_secs(300),
+            recovery_drain_grace: DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE,
             max_age: Duration::from_secs(26 * 60 * 60),
         };
         // 常态：完整的 drain 窗口。
         assert_eq!(
-            retirement_delay(Duration::ZERO, policy),
+            retirement_delay(Duration::ZERO, policy, ReplaceReason::Refresh),
             Duration::from_secs(300)
         );
         // 接近绝对寿命：窗口被压缩，总寿命收敛到 created_at + max_age。
         assert_eq!(
-            retirement_delay(Duration::from_secs(26 * 60 * 60 - 120), policy),
+            retirement_delay(
+                Duration::from_secs(26 * 60 * 60 - 120),
+                policy,
+                ReplaceReason::Refresh
+            ),
             Duration::from_secs(120)
         );
     }
@@ -661,10 +721,15 @@ mod tests {
     fn retirement_delay_never_collapses_to_immediate_hard_cut() {
         let policy = GenerationPolicy {
             drain_grace: Duration::from_secs(300),
+            recovery_drain_grace: DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE,
             max_age: Duration::from_secs(26 * 60 * 60),
         };
         for age_hours in [26, 27, 48, 240] {
-            let delay = retirement_delay(Duration::from_secs(age_hours * 60 * 60), policy);
+            let delay = retirement_delay(
+                Duration::from_secs(age_hours * 60 * 60),
+                policy,
+                ReplaceReason::Refresh,
+            );
             assert_eq!(
                 delay, MIN_TUNNEL_DRAIN_GRACE,
                 "age={age_hours}h 时 drain 窗口不应归零"
@@ -672,9 +737,80 @@ mod tests {
         }
         // 刚好卡在下限附近也不能低于 MIN。
         assert_eq!(
-            retirement_delay(Duration::from_secs(26 * 60 * 60 - 5), policy),
+            retirement_delay(
+                Duration::from_secs(26 * 60 * 60 - 5),
+                policy,
+                ReplaceReason::Refresh
+            ),
             MIN_TUNNEL_DRAIN_GRACE
         );
+    }
+
+    /// 回归（v0.4.6）：故障恢复时旧代际必须**很快**退休，不能按正常刷新那样
+    /// drain 5 分钟。
+    ///
+    /// 现场时间线：07:11:39 判定故障并重建隧道，07:16:39 旧隧道才退休——正好
+    /// 5 分钟。这期间旧代际上那些已经拨号超时、永远不会恢复的连接一直占着全局
+    /// `max_concurrent_connections` 名额，新请求被「连接被拒绝：达到
+    /// max_concurrent_connections」挡在门外，故障因此被硬生生延长了 5 分钟。
+    #[test]
+    fn recovery_retires_the_old_generation_far_sooner_than_refresh() {
+        let policy = GenerationPolicy::default();
+
+        let refresh = retirement_delay(Duration::ZERO, policy, ReplaceReason::Refresh);
+        let recovery = retirement_delay(Duration::ZERO, policy, ReplaceReason::Recovery);
+
+        assert_eq!(
+            refresh, DEFAULT_TUNNEL_DRAIN_GRACE,
+            "正常刷新保持完整 drain"
+        );
+        assert_eq!(recovery, DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE);
+        assert!(
+            recovery < refresh,
+            "故障恢复的 drain 窗口必须显著短于正常刷新: {recovery:?} vs {refresh:?}"
+        );
+        // 现场那 5 分钟的占用是问题的核心，退休必须在一个数量级以内完成。
+        assert!(
+            recovery <= Duration::from_secs(30),
+            "恢复期 drain 不应超过 30s，实际 {recovery:?}"
+        );
+    }
+
+    /// 30 秒的通用下限不能反过来把 15 秒的恢复窗口拉长——那会让上面那条修复
+    /// 失效一半。
+    #[test]
+    fn recovery_grace_is_not_inflated_by_the_generic_floor() {
+        let policy = GenerationPolicy::default();
+        assert!(
+            DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE < MIN_TUNNEL_DRAIN_GRACE,
+            "这条测试的前提是恢复窗口比通用下限还短"
+        );
+        for age_hours in [0, 1, 26, 48] {
+            let delay = retirement_delay(
+                Duration::from_secs(age_hours * 60 * 60),
+                policy,
+                ReplaceReason::Recovery,
+            );
+            assert_eq!(
+                delay, DEFAULT_TUNNEL_RECOVERY_DRAIN_GRACE,
+                "age={age_hours}h 时恢复窗口被改变了"
+            );
+        }
+    }
+
+    /// 恢复窗口同样不能归零——旧代际上可能还有正在正常传输的连接，硬切会被
+    /// relay 翻译成对客户端的干净 FIN，表现为响应静默截断。
+    #[test]
+    fn recovery_grace_still_never_reaches_zero() {
+        let policy = GenerationPolicy::default();
+        for age_hours in [26, 27, 240] {
+            let delay = retirement_delay(
+                Duration::from_secs(age_hours * 60 * 60),
+                policy,
+                ReplaceReason::Recovery,
+            );
+            assert!(!delay.is_zero(), "age={age_hours}h 时恢复窗口归零了");
+        }
     }
 
     /// policy 本身把 drain_grace 配得比下限还短时，下限不应该反过来把它拉长。
@@ -682,14 +818,15 @@ mod tests {
     fn retirement_delay_respects_a_shorter_configured_grace() {
         let policy = GenerationPolicy {
             drain_grace: Duration::from_secs(5),
+            recovery_drain_grace: Duration::from_secs(5),
             max_age: Duration::from_secs(60),
         };
         assert_eq!(
-            retirement_delay(Duration::ZERO, policy),
+            retirement_delay(Duration::ZERO, policy, ReplaceReason::Refresh),
             Duration::from_secs(5)
         );
         assert_eq!(
-            retirement_delay(Duration::from_secs(600), policy),
+            retirement_delay(Duration::from_secs(600), policy, ReplaceReason::Refresh),
             Duration::from_secs(5)
         );
     }

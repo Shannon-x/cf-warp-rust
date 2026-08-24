@@ -24,6 +24,15 @@ pub const M_PROBE_FAIL: &str = "warp_rust_probe_failure_total";
 /// 用于发现「某上游被选择性阻断而整体仍判健康」的情况。
 pub const M_PROBE_TARGET_FAIL: &str = "warp_rust_probe_target_failure_total";
 pub const M_TUNNEL_REBUILD: &str = "warp_rust_tunnel_rebuild_total";
+/// WireGuard 会话陈旧（超过重握手周期仍无成功握手）被健康探针判定为不健康的次数。
+pub const M_HANDSHAKE_STALE: &str = "warp_rust_handshake_stale_total";
+/// 「拨号探针通过、但业务出口成功率过低」这一选择性故障被判定的次数。
+///
+/// 这个指标持续增长意味着探针目标可达而业务目标不可达——要么出口被对端选择性
+/// 屏蔽，要么探针目标选得不能代表业务路径。
+pub const M_EGRESS_DEGRADED: &str = "warp_rust_egress_degraded_total";
+/// 达到 max_concurrent_connections 而被拒的连接中，因日志限速被抑制的条数。
+pub const M_CONNS_REJECTED_LOG_SUPPRESSED: &str = "warp_rust_conns_rejected_log_suppressed_total";
 /// 实际下发给 WireGuard 隧道的 MTU。让「配置到底生效没有」在运行期可验证，
 /// 而不是只能靠安装脚本那两行一闪而过的 warn。
 pub const M_EFFECTIVE_MTU: &str = "warp_rust_effective_mtu";
