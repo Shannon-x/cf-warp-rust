@@ -121,8 +121,34 @@ fn default_mtu() -> u16 {
     1280
 }
 
+/// v0.4.7：256KiB → 128KiB。
+///
+/// 每条已建立连接实打实占用 `2 × tcp_buffer_size`（smoltcp 的 SocketBuffer 是
+/// 创建时就 `vec![0u8; N]` 预分配的，不是按需增长），再加 `2 × relay_buffer_size`。
+/// 旧默认下每条连接 640KiB，1024 条就吃掉 640MiB——这正是并发上不去的真实原因，
+/// 而不是 `max_concurrent_connections` 那个数字本身。
+///
+/// 128KiB 的取舍：单连接吞吐受 BDP 限制约 `128KiB / RTT`，150ms 时约 7Mbps。
+/// 测速类场景通常多线程并发，8 线程仍可跑到 ~56Mbps；而每连接内存减半让相同
+/// 内存下的并发翻倍。需要单连接高吞吐时把它调回 262144。
+/// 读取本机物理内存总量。拿不到时返回 `None`，调用方回退到固定阈值。
+///
+/// 只实现 Linux（/proc/meminfo）——生产部署形态就是 Linux + systemd 或容器；
+/// 其它平台按「未知」处理，不做猜测。注意容器里 /proc/meminfo 显示的是宿主机
+/// 内存，cgroup 限额更小，所以这里的判断偏乐观，容器部署仍需自行核对 limit。
+fn total_system_memory_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: usize = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
 fn default_tcp_buffer_size() -> usize {
-    256 * 1024
+    128 * 1024
 }
 
 impl Default for WarpConfig {
@@ -261,16 +287,29 @@ pub struct LimitsConfig {
     pub relay_close_grace: Duration,
 }
 
+/// v0.4.7：64KiB → 32KiB。relay 每条连接分配上下行各一块。
 fn default_relay_buffer_size() -> usize {
-    64 * 1024
+    32 * 1024
 }
 
+/// v0.4.7：128 → 512。
+///
+/// 这个信号量只覆盖「DNS 解析 + 上游建连」，进入 relay 就释放，所以它约束的是
+/// **建连速率**而非并发数：`max_pending_dials / connect_timeout` 就是每秒能接纳
+/// 的新连接上限。旧的 128/12s 在拨号大面积超时时会把速率压到 10.7 次/秒，其余
+/// 全部秒拒——现场那次故障里 40.9 次/秒的 dial_pressure 拒绝就是这么来的。
+/// 512/8s = 64 次/秒，正常路径（握手 50-300ms）下实际可达 1700+ 次/秒。
 fn default_max_pending_dials() -> usize {
-    128
+    512
 }
 
+/// v0.4.7：12s → 8s。
+///
+/// WARP 隧道内的 TCP 握手正常在 50-300ms 完成，8s 有 25 倍余量。缩短它同时抬高了
+/// 拨号池在故障期的周转率（见 [`default_max_pending_dials`]），让「一个坏目标拖垮
+/// 整个端口」的窗口变窄。
 fn default_connect_timeout() -> Duration {
-    Duration::from_secs(12)
+    Duration::from_secs(8)
 }
 
 fn default_happy_eyeballs_delay() -> Duration {
@@ -292,7 +331,10 @@ fn default_relay_close_grace() -> Duration {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_connections: 1024,
+            // v0.4.7：1024 → 4096。配合每连接内存减半（640KiB → 320KiB），
+            // 理论上界约 1.25GiB。上限仍是 16384，但注意 netstack 的 TCP
+            // ephemeral 端口池只有 32768 个，那是单实例的架构天花板。
+            max_concurrent_connections: 4096,
             max_pending_dials: default_max_pending_dials(),
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: default_connect_timeout(),
@@ -583,11 +625,42 @@ impl Config {
             .saturating_mul(self.limits.max_parallel_dials.saturating_sub(1))
             .saturating_mul(self.limits.max_pending_dials);
         let capacity = established_capacity.saturating_add(extra_dial_capacity);
-        if capacity > 2 * 1024 * 1024 * 1024usize {
-            tracing::warn!(
-                estimated_capacity_bytes = capacity,
-                "配置的理论连接缓冲容量超过 2GiB；请调低 tcp_buffer_size、relay_buffer_size 或并发上限"
-            );
+        // 与本机物理内存比对，而不是只跟一个写死的 2GiB 比。
+        //
+        // 这些 buffer 不是「按需增长」：smoltcp 的 SocketBuffer 在 socket 创建时就
+        // `vec![0u8; N]` 预分配，relay 每条连接也各分配上下行两块。所以满并发时
+        // capacity 是实打实要占的物理内存，配错了直接 OOM 而不是变慢。
+        match total_system_memory_bytes() {
+            Some(total) => {
+                let ratio = capacity as f64 / total as f64;
+                if ratio >= 0.8 {
+                    return Err(format!(
+                        "[limits] 满并发时连接缓冲约需 {:.1} GiB，达到本机内存 {:.1} GiB 的 {:.0}%，\
+                         启动后极可能 OOM。请调低 max_concurrent_connections，或减小 \
+                         [warp] tcp_buffer_size / [limits] relay_buffer_size。\
+                         参考：每条连接占用 = 2×tcp_buffer_size + 2×relay_buffer_size",
+                        capacity as f64 / 1073741824.0,
+                        total as f64 / 1073741824.0,
+                        ratio * 100.0
+                    ));
+                }
+                if ratio >= 0.5 {
+                    tracing::warn!(
+                        estimated_capacity_bytes = capacity,
+                        total_memory_bytes = total,
+                        percent = format!("{:.0}%", ratio * 100.0),
+                        "满并发时连接缓冲将占用超过一半物理内存；请确认这是有意为之"
+                    );
+                }
+            }
+            None => {
+                if capacity > 2 * 1024 * 1024 * 1024usize {
+                    tracing::warn!(
+                        estimated_capacity_bytes = capacity,
+                        "配置的理论连接缓冲容量超过 2GiB；请调低 tcp_buffer_size、relay_buffer_size 或并发上限"
+                    );
+                }
+            }
         }
         // 鉴权字段健全性
         if let Some(auth) = &self.server.auth {

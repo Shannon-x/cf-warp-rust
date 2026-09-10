@@ -358,6 +358,115 @@ read_configured_warp_mtu() {
   ' "$file"
 }
 
+# 在 [section] 内读一个数值/字符串 key（去注释去引号）。找不到输出空串。
+read_toml_key() {
+  local file="$1" section="$2" key="$3"
+  awk -v sect="$section" -v key="$key" '
+    $0 ~ "^[[:space:]]*\\[" sect "\\][[:space:]]*(#.*)?$" { inside=1; next }
+    inside && /^[[:space:]]*\[/ { exit }
+    inside {
+      line=$0; sub(/#.*/, "", line)
+      if (line ~ "^[[:space:]]*" key "[[:space:]]*=") {
+        sub(/^[^=]*=/, "", line)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        gsub(/"/, "", line)
+        print line; exit
+      }
+    }
+  ' "$file"
+}
+
+# 在 [section] 内把 key 改成 value；key 不存在则在段末插入。
+write_toml_key() {
+  local file="$1" section="$2" key="$3" value="$4" tmp
+  tmp="$(mktemp)"
+  awk -v sect="$section" -v key="$key" -v val="$value" '
+    BEGIN { inside=0; done=0 }
+    {
+      if ($0 ~ "^[[:space:]]*\\[" sect "\\][[:space:]]*(#.*)?$") { inside=1; print; next }
+      if (inside && $0 ~ /^[[:space:]]*\[/) {
+        if (!done) { print key " = " val; done=1 }
+        inside=0; print; next
+      }
+      if (inside && !done) {
+        line=$0; sub(/#.*/, "", line)
+        if (line ~ "^[[:space:]]*" key "[[:space:]]*=") { print key " = " val; done=1; next }
+      }
+      print
+    }
+    END { if (inside && !done) print key " = " val }
+  ' "$file" > "$tmp"
+  # 关键：用 cat 写回**原文件**，而不是 mv 覆盖。
+  # mv 会把 mktemp 生成的 0600 root:root 权限与属主一并带到配置文件上，而
+  # /etc/warp-rust/config.toml 是 0640 root:warp-rust —— 服务以非 root 的
+  # warp-rust 用户运行，权限一变就再也读不了配置，启动直接
+  # `fatal: figment: Permission denied (os error 13)`。
+  # cat 重定向保留原 inode、权限、属主、ACL 与 SELinux 上下文。
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# v0.4.7：把存量配置里**仍等于旧默认值**的并发限流项升级到新默认值。
+#
+# 为什么必须这么做：`max_concurrent_connections` 等值是 install.sh **写死**在生成
+# 的配置里的，而 --update 只替换二进制。于是无论升级到多新的版本，存量部署都会
+# 一直卡在 1024 —— 高并发场景下大量连接被「达到 max_concurrent_connections」直接
+# 拒绝，表现为节点超时、测速失败。
+#
+# 只改「值恰好等于旧默认值」的项：那证明用户从没定制过它。任何被手动改过的值
+# 都原样保留。改动前会备份，并逐项打印。
+retune_legacy_limits() {
+  local file="$1" changed=0 backup
+  local cur
+
+  # (section key 旧默认值 新值) 四元组
+  local -a tuning=(
+    "limits max_concurrent_connections 1024 4096"
+    "limits max_pending_dials 128 512"
+    "limits relay_buffer_size 65536 32768"
+    "warp tcp_buffer_size 262144 131072"
+  )
+
+  for entry in "${tuning[@]}"; do
+    # shellcheck disable=SC2086
+    set -- $entry
+    cur="$(read_toml_key "$file" "$1" "$2" || true)"
+    if [ "$cur" = "$3" ]; then
+      if [ "$changed" -eq 0 ]; then
+        backup="${file}.pre-v047.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$file" "$backup"
+        warn "检测到 v0.4.7 之前的并发限流默认值，正在升级（已备份到 $backup）"
+        changed=1
+      fi
+      write_toml_key "$file" "$1" "$2" "$4"
+      echo "    [$1] $2: $3 → $4"
+    fi
+  done
+
+  # connect_timeout 是带引号的字符串，单独处理
+  cur="$(read_toml_key "$file" limits connect_timeout || true)"
+  if [ "$cur" = "12s" ]; then
+    if [ "$changed" -eq 0 ]; then
+      backup="${file}.pre-v047.$(date +%Y%m%d-%H%M%S)"
+      cp -a "$file" "$backup"
+      warn "检测到 v0.4.7 之前的并发限流默认值，正在升级（已备份到 $backup）"
+      changed=1
+    fi
+    write_toml_key "$file" limits connect_timeout '"8s"'
+    echo "    [limits] connect_timeout: 12s → 8s"
+  fi
+
+  if [ "$changed" -eq 1 ]; then
+    # 只报实际发生的改动：被用户手动定制过的项不会出现在上面的清单里，
+    # 这里不能笼统地说「1024 → 4096」。
+    ok "上述并发限流项已升级为 v0.4.7 默认值（未列出的项是你自定义的，保持不动）"
+    info "需要更高并发（按内存自动计算，最高 16384）请再跑："
+    echo "      curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/tune-concurrency.sh | sudo bash"
+  else
+    info "并发限流已是自定义值或新默认值，未改动"
+  fi
+}
+
 # ── 操作：status ────────────────────────────────────────────────────────────
 if [ "$ACTION" = "status" ]; then
   systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
@@ -436,6 +545,10 @@ if [ "$ACTION" = "update" ]; then
   if [ -n "$EXISTING_MTU" ] && [ "$EXISTING_MTU" != "1280" ]; then
     warn "检测到现有配置 [warp].mtu = $EXISTING_MTU；v0.4.5+ 推荐 1280。"
     warn "--update 会保留配置且不会自动改写。请评估后手动修改 $CONF_FILE 并重启服务。"
+  fi
+
+  if [ -f "$CONF_FILE" ]; then
+    retune_legacy_limits "$CONF_FILE"
   fi
 
   info "停止服务以替换二进制..."
@@ -517,7 +630,7 @@ device_model = "warp-rust"
 refresh_interval = "24h"
 register_cooldown = "10m"
 mtu = 1280
-tcp_buffer_size = 262144
+tcp_buffer_size = 131072
 
 [health]
 interval = "30s"
@@ -541,15 +654,15 @@ bind = "127.0.0.1:9090"
 enabled = false
 
 [limits]
-max_concurrent_connections = 1024
-max_pending_dials = 128
+max_concurrent_connections = 4096
+max_pending_dials = 512
 handshake_timeout = "10s"
-connect_timeout = "12s"
+connect_timeout = "8s"
 happy_eyeballs_delay = "200ms"
 max_dial_candidates = 8
 max_parallel_dials = 2
 idle_timeout = "300s"
-relay_buffer_size = 65536
+relay_buffer_size = 32768
 auth_fail_sleep = "1s"
 relay_close_grace = "500ms"
 
