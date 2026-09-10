@@ -145,10 +145,16 @@ pub async fn serve(
     egress: Arc<EgressStats>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // 并发上限默认按物理内存自适应，不同机器上算出来的值不一样——必须打出来，
+    // 否则运维无从知道当前到底放行多少并发，也没法判断拒绝是不是上限造成的。
+    let per_conn_kib = (limits.relay_buffer_size * 2) / 1024;
     info!(
         addr = %cfg.bind,
         max_concurrent = limits.max_concurrent_connections,
+        max_pending_dials = limits.max_pending_dials,
+        relay_buffer_kib_per_conn = per_conn_kib,
         handshake_timeout = ?limits.handshake_timeout,
+        connect_timeout = ?limits.connect_timeout,
         idle_timeout = ?limits.idle_timeout,
         "SOCKS5 listening"
     );

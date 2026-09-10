@@ -406,6 +406,31 @@ write_toml_key() {
   rm -f "$tmp"
 }
 
+# 把 [section] 内的某个 key 整行注释掉，并在其上方留一行说明。
+# 与 write_toml_key 一样用 awk + cat 写回原文件，保留权限、属主与 SELinux 上下文。
+comment_out_toml_key() {
+  local file="$1" section="$2" key="$3" note="$4" tmp
+  tmp="$(mktemp)"
+  awk -v sect="$section" -v key="$key" -v note="$note" '
+    BEGIN { inside=0 }
+    {
+      if ($0 ~ "^[[:space:]]*\\[" sect "\\][[:space:]]*(#.*)?$") { inside=1; print; next }
+      if (inside && $0 ~ /^[[:space:]]*\[/) { inside=0; print; next }
+      if (inside) {
+        line=$0; sub(/#.*/, "", line)
+        if (line ~ "^[[:space:]]*" key "[[:space:]]*=") {
+          print "# " note
+          print "# " $0
+          next
+        }
+      }
+      print
+    }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 # v0.4.7：把存量配置里**仍等于旧默认值**的并发限流项升级到新默认值。
 #
 # 为什么必须这么做：`max_concurrent_connections` 等值是 install.sh **写死**在生成
@@ -421,7 +446,6 @@ retune_legacy_limits() {
 
   # (section key 旧默认值 新值) 四元组
   local -a tuning=(
-    "limits max_concurrent_connections 1024 4096"
     "limits max_pending_dials 128 512"
     "limits relay_buffer_size 65536 32768"
     "warp tcp_buffer_size 262144 131072"
@@ -442,6 +466,26 @@ retune_legacy_limits() {
       echo "    [$1] $2: $3 → $4"
     fi
   done
+
+  # max_concurrent_connections 单独处理：v0.4.8 起它按物理内存自适应，
+  # 配置里写死反而会让小内存机器超预算、大内存机器浪费容量。所以只要它还是
+  # 历史写死的默认值（1024 = v0.4.6 之前，4096 = v0.4.7），就注释掉交还给
+  # 自适应；用户自己设过的其它值一概保留。
+  cur="$(read_toml_key "$file" limits max_concurrent_connections || true)"
+  if [ "$cur" = "1024" ] || [ "$cur" = "4096" ]; then
+    if [ "$changed" -eq 0 ]; then
+      backup="${file}.pre-v047.$(date +%Y%m%d-%H%M%S)"
+      cp -a "$file" "$backup"
+      warn "检测到旧版写死的并发限流默认值，正在升级（已备份到 $backup）"
+      changed=1
+    fi
+    # 注释掉而不是删除：保留痕迹，用户一眼能看出这里发生过什么。
+    # 不用 `sed -i`——它会重建文件，可能连带改掉属主/权限（配置是
+    # 0640 root:warp-rust，服务以非 root 运行，权限一变就读不了）。
+    comment_out_toml_key "$file" limits max_concurrent_connections \
+      "max_concurrent_connections 已交还给按物理内存自适应（v0.4.8）；如需钉死请取消下一行注释"
+    echo "    [limits] max_concurrent_connections: ${cur} → 按物理内存自适应"
+  fi
 
   # connect_timeout 是带引号的字符串，单独处理
   cur="$(read_toml_key "$file" limits connect_timeout || true)"
@@ -654,7 +698,10 @@ bind = "127.0.0.1:9090"
 enabled = false
 
 [limits]
-max_concurrent_connections = 4096
+# max_concurrent_connections 不写死：留空时 warp-rust 按物理内存自适应
+# （约 内存×50% ÷ 每连接 320KiB，范围 1024..16384），换机器/加内存自动跟上。
+# 想钉死某个值就取消下面这行的注释：
+# max_concurrent_connections = 8192
 max_pending_dials = 512
 handshake_timeout = "10s"
 connect_timeout = "8s"
