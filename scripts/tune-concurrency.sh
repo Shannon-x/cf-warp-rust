@@ -117,7 +117,14 @@ set_toml() {
       else if (!done)    { print key " = " val }
     }
   ' "$file" > "$tmp"
-  mv "$tmp" "$file"
+  # 关键：用 cat 写回**原文件**，而不是 mv 覆盖。
+  # mv 会把 mktemp 生成的 0600 root:root 权限与属主一并带到配置文件上，而
+  # /etc/warp-rust/config.toml 是 0640 root:warp-rust —— 服务以非 root 的
+  # warp-rust 用户运行，权限一变就再也读不了配置，启动直接
+  # `fatal: figment: Permission denied (os error 13)`。
+  # cat 重定向保留原 inode、权限、属主、ACL 与 SELinux 上下文。
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
 }
 
 CUR_MAX="$(read_toml "$CONF_FILE" limits max_concurrent_connections)"
@@ -212,6 +219,18 @@ ok "配置已更新"
 if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
   warn "未检测到 systemd 服务 ${SERVICE_NAME}；配置已改，请自行重启进程"
   exit 0
+fi
+
+# 重启前先自检：服务以非 root 用户运行，配置必须对它可读。
+# v0.4.7 早期版本就是在这里栽过——改写落盘丢了属主/权限，systemd 起不来才发现。
+SVC_USER="$(systemctl show "$SERVICE_NAME" -p User --value 2>/dev/null || true)"
+if [ -n "$SVC_USER" ] && [ "$SVC_USER" != "root" ] && command -v runuser >/dev/null 2>&1; then
+  if ! runuser -u "$SVC_USER" -- test -r "$CONF_FILE" 2>/dev/null; then
+    warn "服务用户 $SVC_USER 读不了 $CONF_FILE，立即回滚"
+    cp -a "$BACKUP" "$CONF_FILE"
+    die "已回滚（配置权限异常）。请检查：ls -l $CONF_FILE"
+  fi
+  ok "服务用户 $SVC_USER 可读配置"
 fi
 
 info "重启服务..."

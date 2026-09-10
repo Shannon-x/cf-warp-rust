@@ -396,7 +396,14 @@ write_toml_key() {
     }
     END { if (inside && !done) print key " = " val }
   ' "$file" > "$tmp"
-  mv "$tmp" "$file"
+  # 关键：用 cat 写回**原文件**，而不是 mv 覆盖。
+  # mv 会把 mktemp 生成的 0600 root:root 权限与属主一并带到配置文件上，而
+  # /etc/warp-rust/config.toml 是 0640 root:warp-rust —— 服务以非 root 的
+  # warp-rust 用户运行，权限一变就再也读不了配置，启动直接
+  # `fatal: figment: Permission denied (os error 13)`。
+  # cat 重定向保留原 inode、权限、属主、ACL 与 SELinux 上下文。
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
 }
 
 # v0.4.7：把存量配置里**仍等于旧默认值**的并发限流项升级到新默认值。
