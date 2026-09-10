@@ -216,7 +216,21 @@ set_toml "$CONF_FILE" limits connect_timeout            "$NEW_CTO"
 set_toml "$CONF_FILE" warp   tcp_buffer_size            "$NEW_TCPBUF"
 ok "配置已更新"
 
-if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+# 判断 systemd 服务是否存在。
+#
+# 不能只用 `list-unit-files | grep "^name.service"`：不同 systemd 版本的输出
+# 格式与列宽并不一致，现场遇到过服务明明 `active running`、`list-units` 里
+# 看得见，却匹配不上 `list-unit-files` 的情况，于是脚本误判成「没装服务」、
+# 改完配置就退出，用户拿到一份改好却没生效的配置。
+# `systemctl show -p LoadState` 是稳定的程序化接口，作为首选；仍保留旧判据
+# 作为兜底，两者任一成立即认为服务存在。
+service_unit_exists() {
+  [ "$(systemctl show "$SERVICE_NAME" -p LoadState --value 2>/dev/null)" = "loaded" ] && return 0
+  systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}\.service" && return 0
+  return 1
+}
+
+if ! service_unit_exists; then
   warn "未检测到 systemd 服务 ${SERVICE_NAME}；配置已改，请自行重启进程"
   exit 0
 fi
