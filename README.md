@@ -53,6 +53,54 @@ v0.4.0 的重点是解决“DNS 已经解析成功，但新连接仍然反复 TC
 
 ---
 
+## 高并发部署（机场 / 多用户节点）
+
+默认配置面向个人使用。多用户场景下 `max_concurrent_connections` 会成为瓶颈，
+表现为节点超时、测速失败、日志里大量「连接被拒绝：达到 max_concurrent_connections」。
+
+```bash
+# 按物理内存自动计算并应用（先看会改什么）
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/scripts/tune-concurrency.sh \
+  | sudo bash -s -- --dry-run
+
+# 确认后实跑
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/scripts/tune-concurrency.sh \
+  | sudo bash
+
+# 榨到最大并发（每连接内存再减半，单连接吞吐相应减半）
+curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/scripts/tune-concurrency.sh \
+  | sudo bash -s -- --profile max-conn
+```
+
+### 容量怎么算
+
+每条**已建立**连接实打实占用 `2 × tcp_buffer_size + 2 × relay_buffer_size` 物理内存
+（smoltcp 的 buffer 在 socket 创建时就 `vec![0u8; N]` 预分配，不是按需增长）：
+
+| 档位 | 每连接 | 4 GiB 机器可支撑 | 单连接吞吐 @150ms RTT |
+| --- | --- | --- | --- |
+| balanced（默认） | 320 KiB | ~6100 | ~7 Mbps |
+| max-conn | 160 KiB | ~12200 | ~3.5 Mbps |
+
+测速看的是多线程总带宽（通常 8-16 线程），所以 `max-conn` 对测速成绩的影响远小于
+连接被拒。
+
+### 硬上限：单实例 32768 条
+
+netstack 的 ephemeral 端口池固定 **32768** 个，这是单实例并发 TCP 连接的架构天花板，
+配置调不动。而且 netstack 是一把全局锁 + 单线程 poll loop，实测锁内耗时随连接数
+线性增长：
+
+| 并发连接 | 单轮锁内耗时 |
+| --- | --- |
+| 1024 | 35 µs |
+| 4096 | 58 µs |
+| 8192 | 118 µs |
+
+**几万并发的正解是多实例**：单机跑多个 warp-rust，各自监听不同端口、各自独立的
+WARP 隧道，前面用 V2bX 多 outbound 或 nginx stream 做负载均衡。每实例 6000-8000 条，
+锁竞争分散到多个进程。盯 `warp_rust_ephemeral_port_exhausted_total`，非零就说明该拆了。
+
 ## ⚡️ 一行命令安装（Linux + systemd 服务器，最推荐）
 
 不用 git clone、不用装 cargo、不用编译——脚本自动检测 x86_64 / aarch64，从 GitHub Release 下载预编译二进制，装 systemd 服务，开机自启。**默认绑 `127.0.0.1` 不需要密码**。
@@ -471,6 +519,7 @@ curl -f http://127.0.0.1:9090/livez
 | `warp_rust_probe_success_total` / `probe_failure_total` | counter | 健康探针成败数 |
 | `warp_rust_dial_attempt_total` / `dial_failure_total` / `dial_timeout_total` | counter | 多候选拨号尝试、失败与整体超时 |
 | `warp_rust_tunnel_rebuild_total` | counter | 隧道重建数（自愈触发） |
+| `warp_rust_ephemeral_port_exhausted_total{proto}` | counter | netstack ephemeral 端口池耗尽次数。端口池固定 32768，是**单实例并发 TCP 连接的架构天花板**；这个指标非零说明调大 `max_concurrent_connections` 已无济于事，需要拆多实例 |
 | `warp_rust_handshake_stale_total` | counter | WireGuard 会话超过 180s 未成功握手、被判定不健康的次数。活跃会话每 ~120s 重握手，持续增长说明隧道会话反复失效 |
 | `warp_rust_egress_degraded_total` | counter | 「拨号探针通过、但业务出口成功率低于 20%」这类选择性故障被判定的次数。**持续增长意味着探针目标可达而业务目标不可达**——要么出口被对端选择性屏蔽，要么 `health.targets` 选得不能代表业务路径 |
 | `warp_rust_conns_rejected_log_suppressed_total` | counter | 达到连接上限被拒的连接中，因日志限速未单独打印的条数。与 `conns_rejected_total` 一起看可还原真实过载规模 |

@@ -71,6 +71,11 @@ pub const M_CONTAINER_OPEN_PROXY_WARN: &str = "warp_rust_container_open_proxy_wa
 // 单条 Prometheus 告警 `increase(warp_rust_open_proxy_allowed_total[5m]) > 0`
 // 即可监听全部高风险放行姿势。
 pub const M_OPEN_PROXY_ALLOWED: &str = "warp_rust_open_proxy_allowed_total";
+// `warp_rust_ephemeral_port_exhausted_total{proto}` 由 vendored
+// wireguard-netstack 直接发出（那一层引用不到本 crate 的常量），所以这里不定义
+// 常量，只登记一笔免得有人以为漏了。含义：netstack ephemeral 端口池耗尽——
+// 端口池固定 32768 个，是**单实例的架构天花板**，该指标非零说明并发 TCP 连接
+// 已顶到上限，调大 max_concurrent_connections 无济于事，需要横向拆成多实例。
 pub const M_DIAL_ATTEMPT: &str = "warp_rust_dial_attempt_total";
 pub const M_DIAL_FAILURE: &str = "warp_rust_dial_failure_total";
 pub const M_DIAL_TIMEOUT: &str = "warp_rust_dial_timeout_total";

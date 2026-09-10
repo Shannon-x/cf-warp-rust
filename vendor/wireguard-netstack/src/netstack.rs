@@ -381,10 +381,25 @@ impl NetStack {
     }
 
     fn allocate_tcp_port(&self) -> Result<u16> {
-        self.tcp_ports
-            .lock()
-            .allocate()
-            .ok_or_else(|| Error::TcpConnectGeneric("TCP ephemeral port range exhausted".into()))
+        match self.tcp_ports.lock().allocate() {
+            Some(port) => Ok(port),
+            None => {
+                // 这是单实例的架构天花板，不是配置能调大的东西：端口池固定
+                // 32768 个。撞上它说明并发 TCP 连接已接近该上限，唯一的出路是
+                // 横向拆分（多实例 + 上游负载均衡），所以错误信息必须说清楚，
+                // 不能让运维以为再调大 max_concurrent_connections 就行。
+                metrics::counter!(
+                    "warp_rust_ephemeral_port_exhausted_total",
+                    "proto" => "tcp"
+                )
+                .increment(1);
+                Err(Error::TcpConnectGeneric(format!(
+                    "TCP ephemeral port range exhausted ({EPHEMERAL_PORT_COUNT} ports); \
+                     this is the per-instance architectural ceiling — run multiple \
+                     instances behind a load balancer instead of raising limits"
+                )))
+            }
+        }
     }
 
     fn release_tcp_port(&self, port: u16) {
