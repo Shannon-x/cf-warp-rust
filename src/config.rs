@@ -136,6 +136,41 @@ fn default_mtu() -> u16 {
 /// 只实现 Linux（/proc/meminfo）——生产部署形态就是 Linux + systemd 或容器；
 /// 其它平台按「未知」处理，不做猜测。注意容器里 /proc/meminfo 显示的是宿主机
 /// 内存，cgroup 限额更小，所以这里的判断偏乐观，容器部署仍需自行核对 limit。
+/// 默认并发上限：**按物理内存自适应**，而不是一个写死的数字。
+///
+/// v0.4.7 把它从 1024 提到固定的 4096，结果 1 GiB 的机器算出来要 1.38 GiB
+/// 连接缓冲（占 138%），被内存护栏直接拒绝启动——小内存 VPS 升级即挂。
+/// 而反过来，对 8 GiB 以上的机器，4096 又白白浪费了容量。
+///
+/// 每条已建立连接实打实占用 `2×tcp_buffer_size + 2×relay_buffer_size`
+/// （smoltcp 的 buffer 是 socket 创建时预分配、不按需增长），默认配置下是
+/// 320KiB。这里按「连接缓冲不超过物理内存 50%」推算，留一半给页缓存、
+/// 其它服务和突发：
+///
+/// | 物理内存 | 默认并发 |
+/// |---|---|
+/// | 1 GiB | 1638 |
+/// | 2 GiB | 3276 |
+/// | 4 GiB | 6553 |
+/// | 8 GiB | 13107 |
+/// | 16 GiB+ | 16384（配置层上限）|
+///
+/// 下限 1024 保证行为不弱于历史默认；上限 16384 是 `validate` 的硬校验值，
+/// 再往上还有 netstack 32768 个 ephemeral 端口这个架构天花板，那时应当
+/// 横向拆多实例而不是继续加数字。
+///
+/// 读不到 `/proc/meminfo`（非 Linux）时回退到保守的 2048——宁可少也不要在
+/// 未知环境上把内存吃光。
+pub fn default_max_concurrent_connections() -> usize {
+    const PER_CONN_BYTES: usize = 2 * DEFAULT_TCP_BUFFER_BYTES + 2 * DEFAULT_RELAY_BUFFER_BYTES;
+    const FLOOR: usize = 1024;
+    const CEILING: usize = 16_384;
+    match total_system_memory_bytes() {
+        Some(total) => ((total / 2) / PER_CONN_BYTES).clamp(FLOOR, CEILING),
+        None => 2048,
+    }
+}
+
 fn total_system_memory_bytes() -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -147,8 +182,10 @@ fn total_system_memory_bytes() -> Option<usize> {
     None
 }
 
+pub(crate) const DEFAULT_TCP_BUFFER_BYTES: usize = 128 * 1024;
+
 fn default_tcp_buffer_size() -> usize {
-    128 * 1024
+    DEFAULT_TCP_BUFFER_BYTES
 }
 
 impl Default for WarpConfig {
@@ -252,6 +289,7 @@ pub struct HotReloadConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitsConfig {
     /// 同时在飞 SOCKS5 连接上限；满后新连接立刻关闭并记 metric
+    #[serde(default = "default_max_concurrent_connections")]
     pub max_concurrent_connections: usize,
     /// 同时处于 DNS/上游 TCP 建连阶段的请求上限。失败线路上的拨号会持有
     /// smoltcp socket RX/TX buffer，必须单独限流，避免重试风暴放大内存占用。
@@ -288,8 +326,10 @@ pub struct LimitsConfig {
 }
 
 /// v0.4.7：64KiB → 32KiB。relay 每条连接分配上下行各一块。
+pub(crate) const DEFAULT_RELAY_BUFFER_BYTES: usize = 32 * 1024;
+
 fn default_relay_buffer_size() -> usize {
-    32 * 1024
+    DEFAULT_RELAY_BUFFER_BYTES
 }
 
 /// v0.4.7：128 → 512。
@@ -331,10 +371,7 @@ fn default_relay_close_grace() -> Duration {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            // v0.4.7：1024 → 4096。配合每连接内存减半（640KiB → 320KiB），
-            // 理论上界约 1.25GiB。上限仍是 16384，但注意 netstack 的 TCP
-            // ephemeral 端口池只有 32768 个，那是单实例的架构天花板。
-            max_concurrent_connections: 4096,
+            max_concurrent_connections: default_max_concurrent_connections(),
             max_pending_dials: default_max_pending_dials(),
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: default_connect_timeout(),
@@ -828,5 +865,65 @@ mod container_tests {
         // 容器例外仅覆盖 IPv4 0.0.0.0；:: 仍走原策略，即便 trusted=true 也拒
         let err = cfg("[::]:1080").validate_with(true, true).unwrap_err();
         assert!(err.contains("拒绝启动"));
+    }
+}
+
+#[cfg(test)]
+mod adaptive_concurrency_tests {
+    use super::*;
+
+    /// 自适应默认值必须始终落在 validate() 接受的区间内，否则「用默认配置
+    /// 启动」会被自己的校验拒绝——v0.4.7 的固定 4096 就是这么把 1GiB 机器
+    /// 挡在门外的。
+    #[test]
+    fn adaptive_default_is_always_within_validated_range() {
+        let value = default_max_concurrent_connections();
+        assert!(
+            (1..=16_384).contains(&value),
+            "自适应默认值 {value} 落在 validate 的 1..=16384 之外"
+        );
+        assert!(value >= 1024, "不应弱于历史默认 1024，实际 {value}");
+    }
+
+    /// 默认配置在**任何**内存规模下都必须能通过 validate。
+    ///
+    /// 这是 v0.4.7 回归的直接回归测试：那一版默认 4096 × 320KiB = 1.38GiB，
+    /// 在 1GiB 机器上占 138%，被内存护栏判为「极可能 OOM」而拒绝启动。
+    #[test]
+    fn default_config_passes_its_own_memory_guard() {
+        let cfg = Config::default();
+        let per_conn = cfg.warp.tcp_buffer_size * 2 + cfg.limits.relay_buffer_size * 2;
+        let established = per_conn * cfg.limits.max_concurrent_connections;
+        let extra_dial = cfg.warp.tcp_buffer_size
+            * 2
+            * cfg.limits.max_parallel_dials.saturating_sub(1)
+            * cfg.limits.max_pending_dials;
+        let capacity = established + extra_dial;
+
+        if let Some(total) = total_system_memory_bytes() {
+            let ratio = capacity as f64 / total as f64;
+            assert!(
+                ratio < 0.8,
+                "默认配置的连接缓冲占物理内存 {:.0}%，会被自身的内存护栏拒绝启动\
+                 （每连接 {}KiB × {} 并发）",
+                ratio * 100.0,
+                per_conn / 1024,
+                cfg.limits.max_concurrent_connections
+            );
+        }
+    }
+
+    /// 推算用的每连接尺寸必须与实际默认 buffer 一致，否则自适应算出来的
+    /// 并发数会系统性偏大或偏小。
+    #[test]
+    fn per_connection_estimate_matches_actual_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.warp.tcp_buffer_size, DEFAULT_TCP_BUFFER_BYTES);
+        assert_eq!(cfg.limits.relay_buffer_size, DEFAULT_RELAY_BUFFER_BYTES);
+        assert_eq!(
+            2 * DEFAULT_TCP_BUFFER_BYTES + 2 * DEFAULT_RELAY_BUFFER_BYTES,
+            320 * 1024,
+            "每连接 320KiB 是文档与脚本里到处引用的数字，改动必须同步"
+        );
     }
 }

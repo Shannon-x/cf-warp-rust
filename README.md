@@ -72,6 +72,23 @@ curl -fsSL https://raw.githubusercontent.com/Shannon-x/cf-warp-rust/main/scripts
   | sudo bash -s -- --profile max-conn
 ```
 
+### 默认值已按内存自适应
+
+v0.4.8 起 `max_concurrent_connections` 不写死：留空时按「连接缓冲不超过物理内存
+50%」推算，范围 1024..16384。
+
+| 物理内存 | 默认并发 | 备注 |
+| --- | --- | --- |
+| 1 GiB | 1638 | |
+| 2 GiB | 3276 | |
+| 4 GiB | 6553 | |
+| 8 GiB | 13107 | 默认即超过 1 万 |
+| 16 GiB+ | 16384 | 配置层上限 |
+
+启动日志的 `SOCKS5 listening` 那行会打印实际生效的值。想钉死就在
+`[limits]` 里显式写一个数。下面的脚本用于**超出自适应值**的场景（用更小的
+buffer 换更高并发）。
+
 ### 容量怎么算
 
 每条**已建立**连接实打实占用 `2 × tcp_buffer_size + 2 × relay_buffer_size` 物理内存
